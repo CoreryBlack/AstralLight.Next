@@ -12,11 +12,23 @@
 //! watermark. It remains a local durable-prefix proof: adoption, root atomic
 //! publication, audit completeness, and physical power-loss guarantees are
 //! separate contracts.
+//!
+//! memory—v1: When a checkpoint sidecar is attached, the default group commit
+//! additionally persists one independent local checkpoint record after every
+//! successful journal flush (see [`checkpoint`]). A receipt is issued only
+//! when that group's checkpoint is durably recorded; a flush or checkpoint
+//! failure fences the owner (sticky unknown). Ordinary startup reopens the
+//! journal through [`MemoryV1DurableJournal::open_checkpointed`], which
+//! requires the sidecar's newest record to exactly cover the verified journal
+//! tail (clean cut); a missing sidecar is bootstrapped explicitly, and no
+//! path ever rebuilds history or auto-creates a store after a disaster.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -29,7 +41,15 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use astral_trustgraph::service::memory_v1_mutation_coordinator::{
-    decode_deny_journal_payload, decode_journal_payload, JournalIdentity, MutationRequest,
+    decode_deny_journal_payload, decode_deny_journal_payload_with_origin, decode_journal_payload,
+    JournalIdentity, MutationRequest,
+};
+
+pub mod checkpoint;
+
+pub use checkpoint::{
+    CheckpointError, CheckpointInstallId, CheckpointOpenStatus, LocalCheckpointCoverage,
+    LocalCheckpointRecord, LocalCheckpointStore,
 };
 
 const MAX_OPERATION_ID_BYTES: usize = 64;
@@ -125,6 +145,8 @@ pub enum DurableJournalError {
     FileChanged,
     #[error("durable journal frame validation failed: {0:?}")]
     Frame(JournalError),
+    #[error("durable journal checkpoint owner refused: {0:?}")]
+    CheckpointOwner(CheckpointError),
     #[error("durable journal I/O failed during {operation:?}: {kind:?}")]
     Io {
         operation: IoOperation,
@@ -265,6 +287,29 @@ struct StoredOperation {
     tail_hash: [u8; 32],
 }
 
+/// The decoded mutation envelope facts shared by the admission checks and the
+/// write core: the two value digests and the envelope's origin boot.
+struct MutationPayloadDigests {
+    mutation_digest: [u8; 32],
+    audit_digest: [u8; 32],
+    origin_boot_id: Option<MemoryId>,
+}
+
+/// The outcome of the shared mutation admission checks.
+enum MutationAdmission {
+    /// The operation is already journaled with matching bindings.
+    Replay { existing: Box<StoredOperation> },
+    /// A new frame may be appended with these facts.
+    Fresh { frame: Vec<u8> },
+}
+
+/// memory—v1: The per-flush-group checkpoint driver. Present only after a
+/// sidecar was explicitly attached or opened through `open_checkpointed`;
+/// without it the durability coordinator behaves exactly as before.
+struct CheckpointDriver {
+    store: LocalCheckpointStore,
+}
+
 /// memory—v1: The durability coordinator for one opened journal file.
 ///
 /// The file and directory entry are synced at creation. Appends extend that
@@ -275,6 +320,11 @@ struct StoredOperation {
 /// share its result; if appends accumulated beyond the captured prefix, one
 /// uncovered waiter is signalled to drain the newly written prefix. There is
 /// no batching timer: grouping comes from writes that overlap an active flush.
+///
+/// With an attached checkpoint sidecar, every completed flush additionally
+/// persists one independent local checkpoint record for the flushed group
+/// before `durable_end` advances, so a receipt always implies the group's
+/// checkpoint. A checkpoint failure fences the owner like a sync failure.
 pub struct JournalDurability {
     file: File,
     state: Mutex<SyncState>,
@@ -283,6 +333,8 @@ pub struct JournalDurability {
     sync_calls: AtomicU64,
     #[cfg(test)]
     sync_events: Option<std::sync::mpsc::Sender<SyncTestEvent>>,
+    #[cfg(test)]
+    inject_checkpoint_failure: AtomicBool,
 }
 
 #[derive(Default)]
@@ -296,6 +348,13 @@ struct SyncState {
     /// Shared by requests for the same end. Separates covered waiters (all
     /// complete) from the uncovered backlog (only one needs to run next).
     waiters: BTreeMap<u64, Arc<Condvar>>,
+    /// The attached checkpoint sidecar, when checkpointing is enabled.
+    checkpoint: Option<Arc<CheckpointDriver>>,
+    /// Written-but-uncheckpointed offsets mapped to the verified anchor of the
+    /// frame ending there. Populated only while a sidecar is attached; the
+    /// write path registers an entry before publishing the offset, and a
+    /// successful group checkpoint removes every entry at or below its target.
+    pending_anchors: BTreeMap<u64, LocalCheckpointCoverage>,
 }
 
 #[cfg(test)]
@@ -323,13 +382,34 @@ impl JournalDurability {
             sync_calls: AtomicU64::new(0),
             #[cfg(test)]
             sync_events: None,
+            #[cfg(test)]
+            inject_checkpoint_failure: AtomicBool::new(false),
         })
     }
 
     /// Record that bytes up to `end` have been written (called by the write
-    /// path while holding the writer lock).
-    fn mark_written(&self, end: u64) {
+    /// path while holding the writer lease). With a sidecar attached, the
+    /// verified coverage of `end` is registered under the state lock before
+    /// the offset is published, so a flush leader can never snapshot a target
+    /// without it.
+    fn mark_written(&self, end: u64, coverage: LocalCheckpointCoverage) {
+        let mut state = self.state.lock().unwrap();
+        if state.checkpoint.is_some() {
+            state.pending_anchors.insert(end, coverage);
+        }
+        drop(state);
         self.latest_written.fetch_max(end, Ordering::AcqRel);
+    }
+
+    /// memory—v1: The newest persisted checkpoint record when a sidecar is
+    /// attached. Observability for wiring and tests; never a durability proof
+    /// by itself.
+    pub fn checkpoint_latest(&self) -> Option<LocalCheckpointRecord> {
+        let state = self.state.lock().unwrap();
+        state
+            .checkpoint
+            .as_ref()
+            .map(|driver| driver.store.latest_record())
     }
 
     /// Whether a synchronization failure has poisoned the journal.
@@ -374,13 +454,25 @@ impl JournalDurability {
             }
 
             state.in_flight = true;
+            // Capture the driver and the exact verified coverage of the flush
+            // target while the pending map is still exclusively visible; the
+            // write path registers the entry before publishing the offset.
+            let driver = state.checkpoint.clone();
+            let coverage = state.pending_anchors.get(&target).copied();
             drop(state);
-            let result = self.flush_upto(target);
+            let result = self
+                .flush_upto(target)
+                .and_then(|()| match (&driver, coverage) {
+                    (Some(driver), Some(coverage)) => self.record_group(driver, coverage),
+                    (Some(_), None) => Err(DurableJournalError::InvalidRecord),
+                    (None, _) => Ok(()),
+                });
             state = self.state.lock().unwrap();
             state.in_flight = false;
             match result {
                 Ok(()) => {
                     state.durable_end = target;
+                    state.pending_anchors.retain(|&offset, _| offset > target);
                     while state
                         .waiters
                         .first_key_value()
@@ -402,6 +494,26 @@ impl JournalDurability {
                 }
             }
         }
+    }
+
+    // memory—v1: Persist the independent checkpoint for one flushed group. A
+    // failure here fences the journal exactly like a failed sync: the journal
+    // flush succeeded, but a receipt would claim a group the sidecar never
+    // recorded, so the owner reports sticky unknown instead of success.
+    fn record_group(
+        &self,
+        driver: &CheckpointDriver,
+        coverage: LocalCheckpointCoverage,
+    ) -> Result<(), DurableJournalError> {
+        #[cfg(test)]
+        if self.inject_checkpoint_failure.load(Ordering::SeqCst) {
+            return Err(DurableJournalError::UnknownAfterIo);
+        }
+        driver
+            .store
+            .append(coverage)
+            .map(|_| ())
+            .map_err(DurableJournalError::CheckpointOwner)
     }
 
     // memory—v1: One sync_data followed by a length floor check. No locks are
@@ -560,7 +672,13 @@ impl MemoryV1DurableJournal {
     }
 
     /// Reopen only after a complete bounded scan and exact external-tail check.
-    /// No truncation, repair, or automatic replay is performed.
+    ///
+    /// Before the scanned prefix is claimed as confirmed, the verified retained
+    /// file is synchronized through the coordinator's own flush, so the
+    /// confirmed end only covers bytes this machine made durable (d <= S);
+    /// failure refuses the reopen and drops the handles, so a retry re-verifies
+    /// with a fresh handle. No truncation, repair, or automatic replay is
+    /// performed.
     pub fn open(
         path: &Path,
         stream_id: MemoryId,
@@ -629,9 +747,19 @@ impl MemoryV1DurableJournal {
             return Err(DurableJournalError::FileChanged);
         }
         let durability = JournalDurability::new(&file)?;
+        #[cfg(test)]
+        let mut durability = durability;
+        #[cfg(test)]
+        install_open_sync_events(&mut durability);
         durability
             .latest_written
             .store(scan.file_position, Ordering::Release);
+        // memory—v1: Recover step — the scan proved the history and the
+        // external-tail check bound its anchor; this one flush makes that
+        // prefix durable before any receipt covers it, and the length floor
+        // catches bytes lost after the scan. Appends keep the group commit
+        // and replays ride the confirmed prefix without syncing again.
+        durability.flush_upto(scan.file_position)?;
         durability.state.lock().unwrap().durable_end = scan.file_position;
         Ok((
             Self {
@@ -686,6 +814,12 @@ impl MemoryV1DurableJournal {
         self.file_position
     }
 
+    /// memory—v1: The verified coverage of the current written tail: the
+    /// anchor of the frame that ends at `file_position`.
+    fn coverage_now(&self) -> LocalCheckpointCoverage {
+        LocalCheckpointCoverage::from_anchor(self.position, self.file_position)
+    }
+
     /// The journaled records in append order, for the recovery owner only.
     /// The list is the scan snapshot taken at open; it does not include
     /// records appended afterwards.
@@ -693,14 +827,15 @@ impl MemoryV1DurableJournal {
         &self.recovery
     }
 
-    /// memory—v1: Phase 1 of the mutation append: write and register the
-    /// frame, but leave durability to [`JournalDurability::ensure_durable`].
-    /// A known coordinator failure refuses even replays.
-    pub fn prepare_mutation(
-        &mut self,
+    /// memory—v1: The shared admission checks for one mutation: coordinator
+    /// payload binding, duplicate/operation identity, sequence identity, and
+    /// capacity. No write, no durability effect, no state change. The encoded
+    /// frame is produced here so capacity is measured on the exact bytes.
+    fn admit_mutation(
+        &self,
         request: &MutationRequest,
         durability: &JournalDurability,
-    ) -> Result<PreparedAppend, DurableJournalError> {
+    ) -> Result<MutationAdmission, DurableJournalError> {
         self.ensure_ready(durability)?;
         let payload = request
             .journal_payload()
@@ -717,7 +852,11 @@ impl MemoryV1DurableJournal {
         }
         let identity = request.journal();
 
-        if let Some(existing) = self.operations.get(request.operation_id()).copied() {
+        if let Some(existing) = self
+            .operations
+            .get(request.operation_id())
+            .map(|existing| Box::new(*existing))
+        {
             if existing.kind != RecordKind::Mutation {
                 return Err(DurableJournalError::OperationConflict);
             }
@@ -731,24 +870,7 @@ impl MemoryV1DurableJournal {
             if existing.identity.mutation_identity()? != identity {
                 return Err(DurableJournalError::ExistingOperation);
             }
-            // A replayed record is durable only when the whole written prefix
-            // is; the coordinator coalesces this with any in-flight flush.
-            durability.mark_written(self.file_position);
-            return Ok(PreparedAppend {
-                operation_id: request.operation_id().to_owned(),
-                request_fingerprint: *request.request_fingerprint(),
-                mutation_digest: existing
-                    .mutation_digest
-                    .ok_or(DurableJournalError::InvalidRecord)?,
-                audit_digest: existing
-                    .audit_digest
-                    .ok_or(DurableJournalError::InvalidRecord)?,
-                identity,
-                tail_hash: existing.tail_hash,
-                disposition: JournalAppendDisposition::Replayed,
-                start_offset: 0,
-                durable_end: self.file_position,
-            });
+            return Ok(MutationAdmission::Replay { existing });
         }
 
         self.validate_request_identity(request, identity)?;
@@ -776,45 +898,185 @@ impl MemoryV1DurableJournal {
         {
             return Err(DurableJournalError::CapacityExceeded);
         }
+        Ok(MutationAdmission::Fresh { frame })
+    }
+
+    /// memory—v1: Read-only admission probe for a reserve-then-CAS commit
+    /// flow. It runs exactly the admission checks of `prepare_mutation` with
+    /// no side effect, so the caller may reserve capacity in memory and CAS
+    /// the root before the real append; the append re-runs every check under
+    /// the writer lease and remains the only write point.
+    pub fn probe_mutation(
+        &self,
+        request: &MutationRequest,
+        durability: &JournalDurability,
+    ) -> Result<(), DurableJournalError> {
+        self.admit_mutation(request, durability).map(|_| ())
+    }
+
+    /// The finite capacity limits this owner enforces.
+    pub const fn limits(&self) -> DurableJournalLimits {
+        self.limits
+    }
+
+    /// memory—v1: Whether `operation_id` is already indexed by this owner's
+    /// replay map. O(log n) over the in-memory index built at open and
+    /// extended by every append; no history scan and no file read.
+    pub fn has_operation(&self, operation_id: &str) -> bool {
+        self.operations.contains_key(operation_id)
+    }
+
+    /// memory—v1: Phase 1 of the mutation append: write and register the
+    /// frame, but leave durability to [`JournalDurability::ensure_durable`].
+    /// A known coordinator failure refuses even replays.
+    pub fn prepare_mutation(
+        &mut self,
+        request: &MutationRequest,
+        durability: &JournalDurability,
+    ) -> Result<PreparedAppend, DurableJournalError> {
+        match self.admit_mutation(request, durability)? {
+            MutationAdmission::Replay { existing } => {
+                let identity = existing.identity.mutation_identity()?;
+                // A replayed record is durable only when the whole written
+                // prefix is; the coordinator coalesces this with any in-flight
+                // flush.
+                durability.mark_written(self.file_position, self.coverage_now());
+                Ok(PreparedAppend {
+                    operation_id: request.operation_id().to_owned(),
+                    request_fingerprint: *request.request_fingerprint(),
+                    mutation_digest: existing
+                        .mutation_digest
+                        .ok_or(DurableJournalError::InvalidRecord)?,
+                    audit_digest: existing
+                        .audit_digest
+                        .ok_or(DurableJournalError::InvalidRecord)?,
+                    identity,
+                    tail_hash: existing.tail_hash,
+                    disposition: JournalAppendDisposition::Replayed,
+                    start_offset: 0,
+                    durable_end: self.file_position,
+                })
+            }
+            MutationAdmission::Fresh { frame, .. } => self.write_mutation_frame(&frame, durability),
+        }
+    }
+
+    /// memory—v1: The shared write-and-register core for one verified
+    /// mutation frame, used by `prepare_mutation` and
+    /// `prepare_reserved_frame` alike: the frame bytes are written verbatim,
+    /// the payload envelope is decoded and bound to the frame fields, the
+    /// operation is registered, the position advances to the frame's own
+    /// digest, and the written prefix is handed to the durability
+    /// coordinator for the group-commit checkpoint.
+    fn write_mutation_frame(
+        &mut self,
+        frame: &[u8],
+        durability: &JournalDurability,
+    ) -> Result<PreparedAppend, DurableJournalError> {
+        let decoded = decode_record(frame).map_err(DurableJournalError::Frame)?;
+        if decoded.record.kind != RecordKind::Mutation {
+            return Err(DurableJournalError::InvalidRecord);
+        }
+        let digests = decode_mutation_payload(
+            decoded.record.payload,
+            decoded.record.operation_id,
+            &decoded.record.request_fingerprint,
+        )?;
+        let payload_digest = payload_digest(decoded.record.payload);
         let start = self.file_position;
         let end = start
             .checked_add(frame.len() as u64)
             .ok_or(DurableJournalError::CapacityExceeded)?;
-        self.append_frame(&frame, start, end)?;
-        let decoded = decode_record(&frame).map_err(DurableJournalError::Frame)?;
+        self.append_frame(frame, start, end)?;
         let tail_hash = decoded.digest;
         let stored = StoredOperation {
-            fingerprint: *request.request_fingerprint(),
+            fingerprint: decoded.record.request_fingerprint,
             payload_digest,
-            mutation_digest: Some(decoded_payload.mutation_digest()),
-            audit_digest: Some(decoded_payload.audit_digest()),
+            mutation_digest: Some(digests.mutation_digest),
+            audit_digest: Some(digests.audit_digest),
             identity: StoredIdentity::from_record(&decoded.record, self.epoch_id),
             kind: RecordKind::Mutation,
             tail_hash,
         };
         self.operations
-            .insert(request.operation_id().to_owned(), stored);
+            .insert(decoded.record.operation_id.to_owned(), stored);
         self.position = JournalAnchor::new(
             self.stream_id,
-            identity.journal_sequence(),
-            identity.mutation_sequence(),
+            decoded.record.journal_sequence,
+            decoded.record.mutation_sequence,
             tail_hash,
         )
         .map_err(DurableJournalError::Frame)?;
         self.last_mutation = self.position;
         self.record_count += 1;
-        durability.mark_written(end);
+        durability.mark_written(end, self.coverage_now());
         Ok(PreparedAppend {
-            operation_id: request.operation_id().to_owned(),
-            request_fingerprint: *request.request_fingerprint(),
-            mutation_digest: request.mutation_digest(),
-            audit_digest: request.audit_digest(),
-            identity,
+            operation_id: decoded.record.operation_id.to_owned(),
+            request_fingerprint: decoded.record.request_fingerprint,
+            mutation_digest: digests.mutation_digest,
+            audit_digest: digests.audit_digest,
+            identity: stored.identity.mutation_identity()?,
             tail_hash,
             disposition: JournalAppendDisposition::Appended,
             start_offset: start,
             durable_end: end,
         })
+    }
+
+    /// memory—v1: Reserved-frame append for the root owner's reserve-then-CAS
+    /// flow. The caller supplies the exact canonical frame bytes held in the
+    /// published root record; this owner validates and writes them verbatim —
+    /// no re-encoding. Validation shares the `prepare_mutation` admission
+    /// semantics: frame digest and framing, stream/epoch binding, chained
+    /// predecessor hash, contiguous sequences, operation uniqueness, payload
+    /// completeness, and capacity. An operation that is already present is
+    /// refused here; recovery owns any reconciliation of a recorded identity.
+    /// Durability and the per-group checkpoint follow the same write path.
+    pub(crate) fn prepare_reserved_frame(
+        &mut self,
+        frame: &[u8],
+        durability: &JournalDurability,
+    ) -> Result<PreparedAppend, DurableJournalError> {
+        self.ensure_ready(durability)?;
+        let decoded = decode_record(frame).map_err(DurableJournalError::Frame)?;
+        if decoded.record.kind != RecordKind::Mutation {
+            return Err(DurableJournalError::InvalidRecord);
+        }
+        let operation_id = decoded.record.operation_id;
+        if operation_id.is_empty() || operation_id.len() > MAX_OPERATION_ID_BYTES {
+            return Err(DurableJournalError::InvalidRecord);
+        }
+        // A retained operation identity is refused before any other check, so
+        // a re-delivered reservation never rewrites or replays here; recovery
+        // owns any reconciliation of a recorded identity.
+        if self.operations.contains_key(operation_id) {
+            return Err(DurableJournalError::ExistingOperation);
+        }
+        // Chain validation against the current position without committing:
+        // stream binding, contiguous sequence, predecessor hash, and the
+        // mutation sequence rule.
+        JournalVerifier::new(
+            self.position,
+            self.limits.max_records,
+            self.limits.max_bytes,
+        )
+        .and_then(|mut verifier| verifier.advance(frame))
+        .map_err(DurableJournalError::Frame)?;
+        if decoded.record.stream_id != self.stream_id || decoded.record.epoch_id != self.epoch_id {
+            return Err(DurableJournalError::SequenceMismatch);
+        }
+        if self.record_count >= self.limits.max_records
+            || frame.len() as u64 > self.limits.max_frame_bytes
+            || self
+                .file_position
+                .checked_add(frame.len() as u64)
+                .is_none_or(|end| end > self.limits.max_bytes)
+        {
+            return Err(DurableJournalError::CapacityExceeded);
+        }
+        // The payload envelope is validated inside the shared write core
+        // against the frame's own fields before any byte is written.
+        self.write_mutation_frame(frame, durability)
     }
 
     /// memory—v1: Write one DENY observation unless the coordinator is fenced.
@@ -866,7 +1128,7 @@ impl MemoryV1DurableJournal {
                 .identity
                 .mutation_identity_deny()
                 .ok_or(DurableJournalError::InvalidRecord)?;
-            durability.mark_written(self.file_position);
+            durability.mark_written(self.file_position, self.coverage_now());
             return Ok(PreparedAppend {
                 operation_id: request.operation_id().to_owned(),
                 request_fingerprint: request.request_fingerprint(),
@@ -894,7 +1156,7 @@ impl MemoryV1DurableJournal {
             kind: RecordKind::Deny,
             // A DENY records the mutation sequence it observed; the frame
             // itself does not advance that sequence.
-            mutation_sequence: self.position.mutation_sequence(),
+            mutation_sequence: identity.mutation_sequence(),
             prev_hash: *self.position.frame_hash(),
             payload: &payload,
         })
@@ -928,12 +1190,12 @@ impl MemoryV1DurableJournal {
         self.position = JournalAnchor::new(
             self.stream_id,
             identity.journal_sequence(),
-            identity.mutation_sequence(),
+            self.position.mutation_sequence(),
             tail_hash,
         )
         .map_err(DurableJournalError::Frame)?;
         self.record_count += 1;
-        durability.mark_written(end);
+        durability.mark_written(end, self.coverage_now());
         Ok(PreparedAppend {
             operation_id: request.operation_id().to_owned(),
             request_fingerprint: request.request_fingerprint(),
@@ -962,7 +1224,7 @@ impl MemoryV1DurableJournal {
                     .journal_sequence()
                     .checked_add(1)
                     .ok_or(DurableJournalError::CapacityExceeded)?
-            || identity.mutation_sequence() != self.position.mutation_sequence()
+            || identity.mutation_sequence() > self.position.mutation_sequence()
             || request.payload_bytes() > astral_types::memory_v1_journal::MAX_PAYLOAD_BYTES
         {
             return Err(DurableJournalError::SequenceMismatch);
@@ -1054,6 +1316,328 @@ impl MemoryV1DurableJournal {
             Ok(())
         }
     }
+
+    /// memory—v1: Attach an explicitly opened sidecar for fixture and
+    /// bootstrap flows; ordinary startup uses `open_checkpointed`.
+    ///
+    /// The sidecar's newest record must exactly cover this journal's verified
+    /// tail (clean cut): same stream/epoch, same journal and mutation
+    /// sequences, same frame hash, same file offset. A missing, foreign,
+    /// unclear, or behind sidecar is refused and the journal stays usable for
+    /// the caller to resolve by an explicit bootstrap or reconciliation; the
+    /// caller must not serve mutations until the refusal is resolved.
+    pub fn attach_checkpoint(
+        &self,
+        durability: &JournalDurability,
+        store: LocalCheckpointStore,
+    ) -> Result<CheckpointAttachReport, DurableJournalError> {
+        self.ensure_ready(durability)?;
+        let record = store.latest_record();
+        if record.stream_id() != self.stream_id || record.epoch_id() != self.epoch_id {
+            return Err(DurableJournalError::CheckpointOwner(
+                CheckpointError::BindingMismatch,
+            ));
+        }
+        if !record.covers(self.file_position, self.position) {
+            let refusal = if record.journal_offset() > self.file_position {
+                CheckpointError::CoverageAhead
+            } else if record.journal_offset() < self.file_position {
+                CheckpointError::CoverageBehind {
+                    record_offset: record.journal_offset(),
+                    journal_offset: self.file_position,
+                }
+            } else {
+                CheckpointError::CoverageMismatch
+            };
+            return Err(DurableJournalError::CheckpointOwner(refusal));
+        }
+        let latest = self.install_checkpoint_driver(durability, store)?;
+        Ok(CheckpointAttachReport { latest })
+    }
+
+    /// memory—v1: Install the sidecar as the group-commit checkpoint driver
+    /// and seed the pending coverage map with the verified tail.
+    fn install_checkpoint_driver(
+        &self,
+        durability: &JournalDurability,
+        store: LocalCheckpointStore,
+    ) -> Result<LocalCheckpointRecord, DurableJournalError> {
+        let latest = store.latest_record();
+        let mut state = durability.state.lock().unwrap();
+        if state.checkpoint.is_some() {
+            return Err(DurableJournalError::CheckpointOwner(
+                CheckpointError::AlreadyAttached,
+            ));
+        }
+        // Seed the pending map so a flush leader can never snapshot the
+        // current written end without verified coverage.
+        state
+            .pending_anchors
+            .insert(self.file_position, self.coverage_now());
+        state.checkpoint = Some(Arc::new(CheckpointDriver { store }));
+        Ok(latest)
+    }
+
+    /// memory—v1: Ordinary startup: reopen the journal only after the
+    /// independent checkpoint sidecar exactly covers the verified tail.
+    ///
+    /// The sidecar is opened and locked first; its newest record supplies the
+    /// expected tail, and the journal scan must end exactly at that record's
+    /// anchor and file offset. An empty journal file is accepted only against
+    /// a genesis record that covers the baseline anchor at offset 0. There is
+    /// no catch-up, replay, truncation, or history rebuild: a missing sidecar
+    /// must be bootstrapped explicitly, any mismatch is refused before the
+    /// owner becomes usable, and an unclear newest slot refuses conservatively.
+    /// The returned durability already carries the sidecar, so the default
+    /// group commit persists one checkpoint per flush group.
+    pub fn open_checkpointed(
+        path: &Path,
+        checkpoint_base: &Path,
+        install: CheckpointInstallId,
+        stream: MemoryId,
+        epoch: MemoryId,
+        baseline: JournalAnchor,
+        limits: DurableJournalLimits,
+    ) -> Result<(Self, JournalDurability), DurableJournalError> {
+        let (store, record, _status) =
+            LocalCheckpointStore::open(checkpoint_base, install, stream, epoch, baseline, limits)
+                .map_err(DurableJournalError::CheckpointOwner)?;
+        let record_anchor =
+            record
+                .coverage_anchor()
+                .ok_or(DurableJournalError::CheckpointOwner(
+                    CheckpointError::CoverageMismatch,
+                ))?;
+        let journal_is_empty = fs::symlink_metadata(path)
+            .map(|metadata| metadata.is_file() && metadata.len() == 0)
+            .unwrap_or(false);
+        let (journal, durability) = if journal_is_empty {
+            // A genesis record must cover exactly the zero-progress baseline;
+            // anything else claims progress an empty file cannot contain.
+            if !record.covers(0, baseline) {
+                return Err(DurableJournalError::CheckpointOwner(
+                    CheckpointError::CoverageAhead,
+                ));
+            }
+            Self::open_empty_genesis(path, stream, epoch, baseline, limits)?
+        } else {
+            // Precise refusal before any scan: the record must claim exactly
+            // the on-disk length it will be verified against. A longer journal
+            // means flushed groups the sidecar never recorded; a shorter one
+            // means coverage the file cannot contain.
+            let length = fs::symlink_metadata(path)
+                .map_err(|_| DurableJournalError::InvalidTarget)?
+                .len();
+            if length != record.journal_offset() {
+                let refusal = if length > record.journal_offset() {
+                    CheckpointError::CoverageBehind {
+                        record_offset: record.journal_offset(),
+                        journal_offset: length,
+                    }
+                } else {
+                    CheckpointError::CoverageAhead
+                };
+                return Err(DurableJournalError::CheckpointOwner(refusal));
+            }
+            Self::open(path, stream, epoch, baseline, record_anchor, limits)?
+        };
+        if journal.file_position != record.journal_offset() {
+            let refusal = if journal.file_position > record.journal_offset() {
+                CheckpointError::CoverageBehind {
+                    record_offset: record.journal_offset(),
+                    journal_offset: journal.file_position,
+                }
+            } else {
+                CheckpointError::CoverageAhead
+            };
+            return Err(DurableJournalError::CheckpointOwner(refusal));
+        }
+        journal.install_checkpoint_driver(&durability, store)?;
+        Ok((journal, durability))
+    }
+
+    /// memory—v1: Open an empty, already durable journal file as the
+    /// zero-progress owner. Only `open_checkpointed` uses this, when the
+    /// genesis checkpoint independently covers the baseline at offset 0. The
+    /// file is never created, truncated, or appended here; it is verified,
+    /// locked, and returned ready.
+    fn open_empty_genesis(
+        path: &Path,
+        stream_id: MemoryId,
+        epoch_id: MemoryId,
+        anchor: JournalAnchor,
+        limits: DurableJournalLimits,
+    ) -> Result<(Self, JournalDurability), DurableJournalError> {
+        validate_stream_epoch(stream_id, epoch_id, anchor)?;
+        validate_limits(limits)?;
+        let resolved = resolve_path(path)?;
+        inspect_target(&resolved.target)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&resolved.target)
+            .map_err(|error| DurableJournalError::Io {
+                operation: IoOperation::OpenTarget,
+                kind: error.kind(),
+            })?;
+        ensure_private_regular_file(&file)?;
+        lock_file(&file)?;
+        if file_length(&file)? != 0 {
+            return Err(DurableJournalError::FileChanged);
+        }
+        let durability = JournalDurability::new(&file)?;
+        // The directory entry and the empty file were made durable at
+        // creation; there is no written prefix to re-synchronize.
+        Ok((
+            Self {
+                file,
+                stream_id,
+                epoch_id,
+                limits,
+                position: anchor,
+                last_mutation: anchor,
+                record_count: 0,
+                file_position: 0,
+                operations: BTreeMap::new(),
+                recovery: Vec::new(),
+                state: DurableJournalState::Ready,
+            },
+            durability,
+        ))
+    }
+
+    /// memory—v1: Verify one checkpoint record against the journal file with
+    /// a single bounded scan. This is the reusable service-side cross-check of
+    /// the independent anchor: the store never reads the journal, and this
+    /// verifier never trusts the record — the installation identity is checked
+    /// first, the chain is re-derived from the external baseline, and the
+    /// record's claimed coverage must match the verified history at its offset.
+    pub fn verify_checkpoint(
+        path: &Path,
+        install: &CheckpointInstallId,
+        stream_id: MemoryId,
+        epoch_id: MemoryId,
+        baseline: JournalAnchor,
+        record: &LocalCheckpointRecord,
+        limits: DurableJournalLimits,
+    ) -> Result<CheckpointScanOutcome, DurableJournalError> {
+        validate_stream_epoch(stream_id, epoch_id, baseline)?;
+        if record.install_id_bytes() != install.as_bytes() {
+            return Err(DurableJournalError::CheckpointOwner(
+                CheckpointError::InstallMismatch,
+            ));
+        }
+        if record.stream_id() != stream_id
+            || record.epoch_id() != epoch_id
+            || record.baseline() != baseline
+        {
+            return Err(DurableJournalError::CheckpointOwner(
+                CheckpointError::BindingMismatch,
+            ));
+        }
+        let resolved = resolve_path(path)?;
+        inspect_target(&resolved.target)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&resolved.target)
+            .map_err(|error| DurableJournalError::Io {
+                operation: IoOperation::OpenTarget,
+                kind: error.kind(),
+            })?;
+        ensure_private_regular_file(&file)?;
+        if file_length(&file)? == 0 {
+            // Only a genesis record can be clean against an empty journal.
+            if record.covers(0, baseline) {
+                return Ok(CheckpointScanOutcome::CleanCut);
+            }
+            return Err(DurableJournalError::CheckpointOwner(
+                CheckpointError::CoverageAhead,
+            ));
+        }
+        let verifier = JournalVerifier::new(baseline, limits.max_records, limits.max_bytes)
+            .map_err(DurableJournalError::Frame)?;
+        let scan = scan_file(file, verifier, stream_id, epoch_id, limits)?;
+        verify_coverage_against_history(baseline, record.coverage(), &scan.recovery)?;
+        if scan.file_position == record.journal_offset() {
+            Ok(CheckpointScanOutcome::CleanCut)
+        } else if scan.file_position > record.journal_offset() {
+            Ok(CheckpointScanOutcome::TailLonger {
+                journal_tail: scan.position,
+                journal_offset: scan.file_position,
+            })
+        } else {
+            Err(DurableJournalError::CheckpointOwner(
+                CheckpointError::CoverageAhead,
+            ))
+        }
+    }
+}
+
+/// The outcome of the single-scan checkpoint verification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointScanOutcome {
+    /// The verified journal tail exactly matches the record's coverage.
+    CleanCut,
+    /// The journal extends beyond the record's coverage. Facts are reported
+    /// only — the record is never adopted as proof of the later groups.
+    TailLonger {
+        journal_tail: JournalAnchor,
+        journal_offset: u64,
+    },
+}
+
+/// The sidecar record that is current after an attach.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointAttachReport {
+    pub latest: LocalCheckpointRecord,
+}
+
+/// memory—v1: Check a record's claimed coverage against the verified frame
+/// history of one scan. Offset 0 may only claim the external baseline; any
+/// other offset must name an existing frame's exact sequence, hash, mutation
+/// sequence, and end offset.
+fn verify_coverage_against_history(
+    baseline: JournalAnchor,
+    coverage: LocalCheckpointCoverage,
+    recovery: &[RecoveryRecord],
+) -> Result<(), DurableJournalError> {
+    if coverage.journal_offset() == 0 {
+        if coverage.journal_sequence() != baseline.journal_sequence()
+            || coverage.mutation_sequence() != baseline.mutation_sequence()
+            || coverage.frame_hash() != baseline.frame_hash()
+        {
+            return Err(DurableJournalError::CheckpointOwner(
+                CheckpointError::CoverageMismatch,
+            ));
+        }
+        return Ok(());
+    }
+    let Some(first) = recovery.first() else {
+        return Err(DurableJournalError::CheckpointOwner(
+            CheckpointError::CoverageMismatch,
+        ));
+    };
+    let index = coverage
+        .journal_sequence()
+        .checked_sub(first.journal_sequence)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or(DurableJournalError::CheckpointOwner(
+            CheckpointError::CoverageMismatch,
+        ))?;
+    let Some(entry) = recovery.get(index) else {
+        return Err(DurableJournalError::CheckpointOwner(
+            CheckpointError::CoverageMismatch,
+        ));
+    };
+    if entry.end_offset != coverage.journal_offset()
+        || entry.frame_hash != *coverage.frame_hash()
+        || entry.applied_mutation_sequence() != coverage.mutation_sequence()
+    {
+        return Err(DurableJournalError::CheckpointOwner(
+            CheckpointError::CoverageMismatch,
+        ));
+    }
+    Ok(())
 }
 
 struct ResolvedPath {
@@ -1235,6 +1819,12 @@ struct ScanResult {
 ///
 /// `payload` is the exact encoded envelope bytes (mutation or deny); the
 /// caller re-derives both value digests through the coordinator's decoders.
+/// The retained frame fields let recovery reconcile the record against the
+/// root's published reservation and the message's original producer without
+/// re-decoding the envelope: message identity, request fingerprint, the
+/// chained predecessor hash, the production boot that produced the payload,
+/// and the canonical payload digest this owner computes for the operation
+/// index.
 #[derive(Clone, Debug)]
 pub struct RecoveryRecord {
     pub operation_id: String,
@@ -1243,8 +1833,38 @@ pub struct RecoveryRecord {
     /// For a Mutation: the new mutation sequence it produced. For a Deny:
     /// the mutation sequence observed at the denial.
     pub mutation_sequence: u64,
+    /// The verified tail immediately before the frame. A DENY can observe an
+    /// older state, while its database transaction preserves this tail.
+    pub prev_mutation_sequence: u64,
+    /// The file offset just past this frame; the end of the journal prefix
+    /// this record's anchor describes. Checkpoint coverage is cross-checked
+    /// against these offsets.
+    pub end_offset: u64,
+    /// The frame's message identity, exactly as written.
+    pub message_id: MemoryId,
+    /// The frame's request fingerprint, exactly as written.
+    pub request_fingerprint: [u8; 32],
+    /// The predecessor frame hash this frame chained to, exactly as written.
+    pub prev_hash: [u8; 32],
+    /// The production boot that produced the payload: the mutation
+    /// envelope's origin boot for mutations, the observation's origin boot
+    /// for denials; `None` when the envelope predates origin binding.
+    pub origin_boot_id: Option<MemoryId>,
+    /// The canonical payload digest over the encoded envelope, computed with
+    /// this owner's payload digest domain.
+    pub payload_digest: [u8; 32],
     pub payload: Vec<u8>,
     pub(crate) frame_hash: [u8; 32],
+}
+
+impl RecoveryRecord {
+    /// memory—v1: A DENY retains its read position in the receipt and leaves the tail unchanged.
+    pub(crate) fn applied_mutation_sequence(&self) -> u64 {
+        match self.kind {
+            RecordKind::Mutation => self.mutation_sequence,
+            RecordKind::Deny => self.prev_mutation_sequence,
+        }
+    }
 }
 
 /// A written-but-not-yet-confirmed-durable journal record. The receipt is
@@ -1340,6 +1960,9 @@ fn scan_file(
                     }
                 }
             })?;
+        // The predecessor mutation sequence is the DB predecessor a recovery
+        // owner reconciles a denial against; capture it before the advance.
+        let prev_mutation_sequence = verifier.position().mutation_sequence();
         let decoded = verifier
             .advance(&frame)
             .map_err(DurableJournalError::Frame)?;
@@ -1350,30 +1973,30 @@ fn scan_file(
         if operation_id.is_empty() || operation_id.len() > MAX_OPERATION_ID_BYTES {
             return Err(DurableJournalError::InvalidRecord);
         }
-        let (mutation_digest, audit_digest) = match decoded.record.kind {
+        let (mutation_digest, audit_digest, origin_boot_id) = match decoded.record.kind {
             RecordKind::Mutation => {
-                let decoded_payload = decode_journal_payload(decoded.record.payload)
-                    .map_err(|_| DurableJournalError::InvalidRecord)?;
-                if decoded_payload.operation_id() != operation_id
-                    || decoded_payload.request_fingerprint() != &decoded.record.request_fingerprint
-                {
-                    return Err(DurableJournalError::OperationConflict);
-                }
+                let digests = decode_mutation_payload(
+                    decoded.record.payload,
+                    &operation_id,
+                    &decoded.record.request_fingerprint,
+                )?;
                 (
-                    Some(decoded_payload.mutation_digest()),
-                    Some(decoded_payload.audit_digest()),
+                    Some(digests.mutation_digest),
+                    Some(digests.audit_digest),
+                    digests.origin_boot_id,
                 )
             }
             RecordKind::Deny => {
-                let decoded_observation = decode_deny_journal_payload(decoded.record.payload)
-                    .map_err(|_| DurableJournalError::InvalidRecord)?;
+                let (origin_boot_id, decoded_observation) =
+                    decode_deny_journal_payload_with_origin(decoded.record.payload)
+                        .map_err(|_| DurableJournalError::InvalidRecord)?;
                 if decoded_observation.operation_id() != decoded.record.operation_id.as_bytes()
                     || decoded_observation.operation_fingerprint()
                         != decoded.record.request_fingerprint.as_slice()
                 {
                     return Err(DurableJournalError::OperationConflict);
                 }
-                (None, None)
+                (None, None, origin_boot_id)
             }
         };
         if operations
@@ -1398,6 +2021,13 @@ fn scan_file(
             kind: decoded.record.kind,
             journal_sequence: decoded.record.journal_sequence,
             mutation_sequence: decoded.record.mutation_sequence,
+            prev_mutation_sequence,
+            end_offset: next_position,
+            message_id: decoded.record.message_id,
+            request_fingerprint: decoded.record.request_fingerprint,
+            prev_hash: decoded.record.prev_hash,
+            origin_boot_id,
+            payload_digest: payload_digest(decoded.record.payload),
             payload: decoded.record.payload.to_vec(),
             frame_hash: decoded.digest,
         });
@@ -1459,8 +2089,50 @@ fn payload_digest(payload: &[u8]) -> [u8; 32] {
     hash.finalize().into()
 }
 
+/// Decode and bind one mutation envelope against its frame fields: the
+/// envelope's operation id and request fingerprint must match the frame
+/// exactly. Returns the value digests and the envelope's origin boot.
+fn decode_mutation_payload(
+    payload: &[u8],
+    operation_id: &str,
+    request_fingerprint: &[u8; 32],
+) -> Result<MutationPayloadDigests, DurableJournalError> {
+    let decoded_payload =
+        decode_journal_payload(payload).map_err(|_| DurableJournalError::InvalidRecord)?;
+    if decoded_payload.operation_id() != operation_id
+        || decoded_payload.request_fingerprint() != request_fingerprint
+    {
+        return Err(DurableJournalError::OperationConflict);
+    }
+    Ok(MutationPayloadDigests {
+        mutation_digest: decoded_payload.mutation_digest(),
+        audit_digest: decoded_payload.audit_digest(),
+        origin_boot_id: decoded_payload.origin_boot_id(),
+    })
+}
+
+// memory—v1: Test-only one-shot injection for the open-time synchronization.
+// A test stores a `SyncTestEvent` sender here before calling `open` on the same
+// thread; `open` moves it into the coordinator just before the recover flush,
+// which then reports `Flushing` and waits for the test's resume verdict.
+#[cfg(test)]
+thread_local! {
+    static OPEN_SYNC_EVENTS: std::cell::RefCell<Option<std::sync::mpsc::Sender<SyncTestEvent>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn install_open_sync_events(durability: &mut JournalDurability) {
+    OPEN_SYNC_EVENTS.with(|slot| {
+        if let Some(events) = slot.borrow_mut().take() {
+            durability.sync_events = Some(events);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
+    mod checkpoint_tests;
     mod scheduling;
 
     use super::*;

@@ -93,6 +93,37 @@ fn split_collapse_and_restore_match_full_depth_at_checkpoint_edges() {
 }
 
 #[test]
+// memory—v1: Both schedules must reject a collision in either arm without publishing the other.
+fn joined_arms_match_reference_and_never_commit_a_partial_tree() {
+    let leaf = |n: u8| ([n; 32], Key::row(Table::User, [n; 16]), [255 - n; 32]);
+    let old = [leaf(0), leaf(255)];
+    let tree = build(&old, 0);
+    let (left, right) = tree.as_ref().unwrap().root_children();
+    let delta: Vec<_> = (1..255).map(leaf).collect();
+    let (a, b) = delta.split_at(127);
+    let parallel = add_root_halves(left, right, a, b).unwrap();
+    let all: Vec<_> = (0..=255).map(leaf).collect();
+    assert_eq!(root_hash(&build_root(&all)), reference(&all, 0));
+    // A cold root whose paths all share the first bit must not acquire a spurious fork at zero.
+    assert_eq!(
+        root_hash(&build_root(&all[..128])),
+        reference(&all[..128], 0)
+    );
+    assert_eq!(root_hash(&parallel), reference(&all, 0));
+    assert_eq!(
+        root_hash(&parallel),
+        root_hash(&add_at(tree.as_ref(), &delta, 0).unwrap())
+    );
+    for bad in [
+        add_root_halves(left, right, &old[..1], b),
+        add_root_halves(left, right, a, &old[1..]),
+    ] {
+        assert!(matches!(bad, Err(DigestError::PathCollision)));
+    }
+    assert_eq!(root_hash(&tree), reference(&old, 0));
+}
+
+#[test]
 fn sorted_batch_splits_both_sides_without_replacing_existing_leaves() {
     let leaves = [
         leaf_with_bit(None, 1),

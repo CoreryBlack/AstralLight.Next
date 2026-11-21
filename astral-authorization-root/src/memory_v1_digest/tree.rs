@@ -175,8 +175,80 @@ pub(super) fn build(leaves: &[Leaf], depth: usize) -> Tree {
     ))
 }
 
+// memory—v1: At most one scoped helper, and only for two substantial root arms.
+fn parallel_split(leaves: &[Leaf]) -> Option<usize> {
+    const MIN_ARM: usize = 64;
+    if leaves.len() < 2 * MIN_ARM {
+        return None;
+    }
+    let mid = leaves.partition_point(|entry| !bit(&entry.0, 0));
+    (mid.min(leaves.len() - mid) >= MIN_ARM
+        && std::thread::available_parallelism().is_ok_and(|n| n.get() >= 2))
+    .then_some(mid)
+}
+
+// memory—v1: Cold construction and additions use the same left/right ordering and
+// join discipline. A failed spawn falls back to the caller, not to a partial tree.
+fn joined_halves<T: Send>(
+    left: impl FnOnce() -> T + Send + Copy,
+    right: impl FnOnce() -> T,
+) -> (T, T) {
+    std::thread::scope(|scope| {
+        match std::thread::Builder::new()
+            .name("digest-half".into())
+            .spawn_scoped(scope, left)
+        {
+            Ok(worker) => {
+                let right = right();
+                (
+                    worker
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                    right,
+                )
+            }
+            Err(_) => (left(), right()),
+        }
+    })
+}
+
+// memory—v1: Split only at the root. All recursive calls use the serial builder.
+pub(super) fn build_root(leaves: &[Leaf]) -> Tree {
+    let Some(mid) = parallel_split(leaves) else {
+        return build(leaves, 0);
+    };
+    let (left, right) = joined_halves(|| build(&leaves[..mid], 1), || build(&leaves[mid..], 1));
+    Some(Node::fork(
+        0,
+        0,
+        left.expect("nonempty left arm"),
+        right.expect("nonempty right arm"),
+    ))
+}
+fn add_root_halves(
+    left: &Arc<Node>,
+    right: &Arc<Node>,
+    a: &[Leaf],
+    b: &[Leaf],
+) -> Result<Tree, DigestError> {
+    let (left, right) = joined_halves(|| add_at(Some(left), a, 1), || add_at(Some(right), b, 1));
+    Ok(Some(Node::fork(
+        0,
+        0,
+        left?.expect("existing left arm"),
+        right?.expect("existing right arm"),
+    )))
+}
+
 // memory—v1: Reuse untouched branches and reject a path already in the tree.
 pub(super) fn add(tree: &Tree, leaves: &[Leaf]) -> Result<Tree, DigestError> {
+    if let Some(node) = tree.as_ref().filter(|n| n.terminal.depth == 0) {
+        if let (Kind::Fork { left, right }, Some(mid)) =
+            (&node.terminal.kind, parallel_split(leaves))
+        {
+            return add_root_halves(left, right, &leaves[..mid], &leaves[mid..]);
+        }
+    }
     add_at(tree.as_ref(), leaves, 0)
 }
 
@@ -286,19 +358,3 @@ fn update_at(
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-pub(super) fn build_with_two_workers(leaves: &[Leaf]) -> Tree {
-    let mid = leaves.partition_point(|entry| !bit(&entry.0, 0));
-    assert!(
-        mid > 0 && mid < leaves.len(),
-        "profile requires two root branches"
-    );
-    std::thread::scope(|scope| {
-        let left = std::thread::Builder::new()
-            .spawn_scoped(scope, || build(&leaves[..mid], 1))
-            .expect("profile starts one extra worker");
-        let right = build(&leaves[mid..], 1).unwrap();
-        Some(Node::fork(0, 0, left.join().unwrap().unwrap(), right))
-    })
-}

@@ -3403,10 +3403,6 @@ mod tests {
                         3600,
                     )
                     .unwrap();
-                let session = authority
-                    .verifier()
-                    .verify_and_bind(issued.credential(), now.as_secs() as i64, &root)
-                    .unwrap();
                 let mut config = AppConfig::default();
                 config.gateway.hmac_secret = "isolated-test-secret".into();
                 let state = crate::memory_v1_state::build_memory_v1_offline_app_state(
@@ -3458,7 +3454,11 @@ mod tests {
                         in_process_gateway_signature_middleware,
                     ));
                 let path = "/governance/bindings";
-                let send = || {
+                let send = |root: &RequestRootExtension| {
+                    let session = authority
+                        .verifier()
+                        .verify_and_bind(issued.credential(), now.as_secs() as i64, root)
+                        .unwrap();
                     let timestamp = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
@@ -3508,13 +3508,13 @@ mod tests {
                 owner
                     .begin_modification_fence(id(32), &declaration)
                     .unwrap();
-                assert_eq!(send().await.unwrap().status(), StatusCode::NO_CONTENT);
+                assert_eq!(send(&root).await.unwrap().status(), StatusCode::NO_CONTENT);
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
                 owner.abort_modification_fence(id(32)).unwrap();
                 owner
                     .begin_modification_fence(id(31), &declaration)
                     .unwrap();
-                let response = send().await.unwrap();
+                let response = send(&root).await.unwrap();
                 assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
                 let body = to_bytes(response.into_body(), 4096).await.unwrap();
                 let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -3522,7 +3522,16 @@ mod tests {
                 assert_eq!(body["decision"], "AUTHORIZATION_PENDING");
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
                 owner.abort_modification_fence(id(31)).unwrap();
-                assert_eq!(send().await.unwrap().status(), StatusCode::NO_CONTENT);
+                assert_eq!(
+                    send(&root).await.unwrap().status(),
+                    StatusCode::SERVICE_UNAVAILABLE
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                let fresh = RequestRootScope::new(owner.handle(), uuid::Uuid::new_v4());
+                assert_eq!(
+                    send(&fresh.extension()).await.unwrap().status(),
+                    StatusCode::NO_CONTENT
+                );
                 assert_eq!(calls.load(Ordering::SeqCst), 2);
             });
     }

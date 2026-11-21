@@ -1,5 +1,8 @@
 use std::path::PathBuf;
-use test_harness::campaign::{parse_options, run_options, run_paper_options, PAPER_USAGE};
+use test_harness::campaign::{
+    parse_options, run_darkstar_options, run_options, run_paper_options, DARKSTAR_USAGE,
+    PAPER_USAGE,
+};
 
 const USAGE: &str = "test-campaign — Rust campaign runner\n\nUsage:\n  cargo run -p test-harness --bin test-campaign -- [--list|--run] [--verify-items] [--profile ID] [--series ID] [--suite ID] [--all-profiles] [--json] [--run-id ID] [--artifact-root PATH]\n";
 
@@ -15,8 +18,18 @@ fn main() {
             }
         }
     }
+    if args.first().is_some_and(|arg| arg == "--darkstar") {
+        let result = run_darkstar_options(&root, &args[1..]);
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("{error}\n{DARKSTAR_USAGE}");
+                std::process::exit(2);
+            }
+        }
+    }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        print!("{USAGE}\n{PAPER_USAGE}");
+        print!("{USAGE}\n{PAPER_USAGE}\n{DARKSTAR_USAGE}");
         return;
     }
     let options = match parse_options(&args) {

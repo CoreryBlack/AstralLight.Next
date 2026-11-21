@@ -41,7 +41,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
-use super::{install_rows, readiness_line, registry_declarations, sealed_production_input, serve};
+use super::{production_fixture, readiness_line, registry_declarations, serve};
 use crate::memory_v1_composition::full_path_tests::{
     fixture, ALICE, BOB, CARD_ALLOW, CARD_BOB, CARD_OVERLAY_DENY, REGISTRY,
 };
@@ -372,9 +372,9 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
             });
         let journal_dir = credentials_file.dir.join("journal");
         std::fs::create_dir(&journal_dir).unwrap();
-        let journal = super::open_durable_journal(&journal_dir).unwrap();
+        let journal = production_fixture::journal(&journal_dir);
         let (owner, admission) = {
-            let owner = install_rows(rows).unwrap();
+            let owner = production_fixture::owner(rows);
             let mut declarations = registry_declarations();
             for index in 0..read_curve.unwrap_or(0) {
                 declarations.push(
@@ -385,7 +385,7 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
                 );
             }
             owner.install_registry(&declarations).unwrap();
-            let input = sealed_production_input(&facts).unwrap();
+            let input = production_fixture::input(facts.captured_at_unix_seconds);
             let (metadata, admission) = owner
                 .adopt_with_production_evidence(&facts, &input)
                 .expect("production adoption");
@@ -456,6 +456,7 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
         let allow_200 = StdArc::new(AtomicU64::new(0));
         let deny_403 = StdArc::new(AtomicU64::new(0));
         let login_200 = StdArc::new(AtomicU64::new(0));
+        let read_refusals = StdArc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
 
         for concurrency in CONCURRENCY_LADDER {
             let mut handles = Vec::new();
@@ -466,23 +467,26 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
                 let overload_503 = StdArc::clone(&overload_503);
                 let allow_200 = StdArc::clone(&allow_200);
                 let login_200 = StdArc::clone(&login_200);
+                let read_refusals = StdArc::clone(&read_refusals);
                 handles.push(tokio::spawn(async move {
                 for _round in 0..8 {
                     // ALLOW read: login first, then a registry read.
                     let card = if worker % 2 == 0 { CARD_ALLOW } else { CARD_BOB };
                     let token = login(addr, card).await;
                     let started = Instant::now();
-                    let (status, _) =
+                    let (status, body) =
                         raw_request(addr, "GET", REGISTRY, Some(&token), None).await;
                     let rtt = started.elapsed();
                     allow_rtt.lock().unwrap().push(rtt.as_micros() as u64);
                     if status == 200 {
                         allow_200.fetch_add(1, Ordering::Relaxed);
-                    } else if status >= 500 {
-                        // Fail-closed 503s under overload are recorded as
-                        // measured availability, not silent failures.
-                        server_errors.fetch_add(1, Ordering::Relaxed);
-                        overload_503.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        let reason = body["reasonCode"].as_str().unwrap_or("UNCLASSIFIED");
+                        *read_refusals.lock().unwrap().entry((status, reason.to_owned())).or_insert(0) += 1;
+                        if status >= 500 {
+                            server_errors.fetch_add(1, Ordering::Relaxed);
+                            overload_503.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     // Login timing itself (authn + session issuance).
                     let started = Instant::now();
@@ -655,8 +659,10 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
         let soak_started = Instant::now();
         let mut soak_handles = Vec::new();
         let soak_errors = StdArc::new(AtomicU64::new(0));
+        let soak_refusals = StdArc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
         for worker in 0..SOAK_CONCURRENCY {
             let soak_errors = StdArc::clone(&soak_errors);
+            let soak_refusals = StdArc::clone(&soak_refusals);
             soak_handles.push(tokio::spawn(async move {
                 let token = if worker % 2 == 0 {
                     login(addr, CARD_ALLOW).await
@@ -664,8 +670,15 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
                     login(addr, CARD_BOB).await
                 };
                 for _ in 0..SOAK_REQUESTS_PER_WORKER {
-                    let (status, _) = raw_request(addr, "GET", REGISTRY, Some(&token), None).await;
+                    let (status, body) =
+                        raw_request(addr, "GET", REGISTRY, Some(&token), None).await;
                     if status != 200 {
+                        let reason = body["reasonCode"].as_str().unwrap_or("UNCLASSIFIED");
+                        *soak_refusals
+                            .lock()
+                            .unwrap()
+                            .entry((status, reason.to_owned()))
+                            .or_insert(0) += 1;
                         soak_errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -677,6 +690,11 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
         let soak_elapsed = soak_started.elapsed();
         let soak_total = (SOAK_CONCURRENCY * SOAK_REQUESTS_PER_WORKER) as u64;
         let soak_failures = soak_errors.load(Ordering::Relaxed);
+        eprintln!(
+            "unexpected ALLOW-path responses: ladder={:?} soak={:?}",
+            *read_refusals.lock().unwrap(),
+            *soak_refusals.lock().unwrap(),
+        );
         // Availability floor under full load: fail-closed 503s under worker
         // saturation are recorded availability, not hidden failures.
         let soak_availability = ((soak_total - soak_failures) as f64) / (soak_total as f64) * 100.0;

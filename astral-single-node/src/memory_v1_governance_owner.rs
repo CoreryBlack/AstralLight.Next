@@ -7,14 +7,38 @@
 //! 1. value-level audit binding (`request.validate()`), which checks the
 //!    complete T2 candidate against the operation, fingerprint, root
 //!    observation, actor, target, tenant, trusted time and mutation summary;
-//! 2. reserve the exact authorized root and prepare its successor, without
-//!    modifying the serving snapshot or writing a journal record;
-//! 3. allocate the journal identity, claim the operation and sync its record;
-//! 4. publish that same prepared successor before releasing the reservation.
+//! 2. reserve the exact authorized root and prepare its successor, and
+//!    reserve the complete immutable journal payload in memory — the
+//!    journal's read-only admission probe reuses its bounded operations
+//!    index and runs exactly the write-path checks, then the canonical
+//!    frame bytes, chain digest and offset span are fixed. Nothing is
+//!    written and nothing is published yet;
+//! 3. publish the authorization facts, the governance position and the
+//!    reserved record under one CAS: the record rides inside the published
+//!    snapshot's governance prefix and is taken from that snapshot after the
+//!    CAS. The journal is not written before the publication;
+//! 4. write exactly the published reservation, verify it byte-for-byte
+//!    against the reservation, flush it, and confirm the contiguous durable
+//!    prefix through this record before the success response.
 //!
-//! An uncertain append or publication must be reconciled before any later
-//! mutation or DENY proof. No repository fallback, automatic retry or
-//! synchronous MySQL apply is part of this path.
+//! No byte is written or flushed before its facts are published, and a
+//! flushed byte always belongs to a published record: a refusal before the
+//! CAS leaves no record anywhere, and every failure after the publication
+//! leaves the published facts unverifiable against the durable prefix, so
+//! both owners require reconciliation before any later mutation or DENY
+//! proof. No repository fallback, automatic retry or synchronous MySQL apply
+//! is part of this path.
+//!
+//! A recorded operation identity is never written twice: the reservation
+//! probe refuses identity conflicts before the publication, for retained
+//! records and same-boot records of either kind alike. The commit owner
+//! reports that refusal with one fixed, non-leaking PENDING reason; uncertain
+//! I/O still requires reconciliation.
+//!
+//! The DENY proof issuer shares the same journal lock discipline: the commit
+//! holds the lock from the reservation through the write and its flush, so a
+//! DENY can never observe a published governance position whose record is
+//! not yet durable, and cannot disguise a new in-memory prefix as durable.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -32,13 +56,16 @@ use astral_trustgraph::service::memory_v1_mutation_coordinator::{
     UnknownReason,
 };
 use astral_types::memory_v1::MemoryId;
+use astral_types::memory_v1_journal::JournalAnchor;
 use astral_types::AstralError;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::memory_v1_durable_journal::{
-    DurableJournalState, JournalAppendDisposition, JournalDurability, MemoryV1DurableJournal,
+    DurableJournalError, DurableJournalState, JournalAppendDisposition, JournalDurability,
+    MemoryV1DurableJournal,
 };
+use crate::memory_v1_governance_payload::ReservedGovernancePayload;
 use crate::memory_v1_root_writer::RootMutationWriter;
 
 /// The journal identity range assigned by this process at runtime.
@@ -168,6 +195,20 @@ impl MemoryV1DurableCommitOwner {
     }
 }
 
+struct JournalLockTiming {
+    waiting: Duration,
+    acquired: Instant,
+}
+
+impl Drop for JournalLockTiming {
+    // memory—v1: Measure first, then update the recorder after the guard drops.
+    fn drop(&mut self) {
+        let held = self.acquired.elapsed();
+        record_memory_v1_commit_phase(MemoryV1CommitPhase::JournalLockHeld, held);
+        record_memory_v1_commit_phase(MemoryV1CommitPhase::JournalLockWait, self.waiting);
+    }
+}
+
 impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
     fn commit(
         &self,
@@ -181,18 +222,28 @@ impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
         })?;
         record_memory_v1_commit_phase(MemoryV1CommitPhase::Binding, binding_started.elapsed());
 
-        let (admission, publication) = self
-            .writer
-            .prepare(&request.root, &request.mutation)
-            .map_err(|error| {
-                pending_error(format!("root mutation preparation refused: {error}"))
-            })?;
+        let writer_started = Instant::now();
+        let prepared = self.writer.prepare(&request.root, &request.mutation);
+        record_memory_v1_commit_phase(MemoryV1CommitPhase::Prepare, writer_started.elapsed());
+        let (admission, publication) = prepared.map_err(|error| {
+            pending_error(format!("root mutation preparation refused: {error}"))
+        })?;
 
-        // Keep the journal prefix and the reserved root in the same order.
-        // Readers never take the reservation or the journal lock for ALLOW.
-        let Ok(mut journal) = self.journal.lock() else {
+        // The journal lock pins the position from the reservation through the
+        // post-publication write: the reserved record occupies exactly the
+        // offset observed here, and no reader takes this lock for ALLOW.
+        let _journal_timing;
+        let journal_wait = Instant::now();
+        let locked = self.journal.lock();
+        let acquired = Instant::now();
+        let Ok(mut journal) = locked else {
             publication.require_reconciliation();
             return Err(pending_error("journal owner is unavailable"));
+        };
+        // Declared before the guard so metrics dispatch does not extend its hold.
+        _journal_timing = JournalLockTiming {
+            waiting: acquired.duration_since(journal_wait),
+            acquired,
         };
         if journal.state() != DurableJournalState::Ready || self.durability.is_failed() {
             publication.require_reconciliation();
@@ -228,6 +279,16 @@ impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
             identity,
         )
         .map_err(|error| pending_error(format!("coordinator request binding rejected: {error}")))?;
+
+        // 2. Reserve the complete immutable journal payload in memory. The
+        //    journal's read-only admission probe reuses its bounded operations
+        //    index and runs exactly the write-path checks; the canonical frame
+        //    bytes, their chain digest and the offset span are fixed here.
+        //    Nothing is written and nothing is published yet.
+        let reserved =
+            ReservedGovernancePayload::reserve(&journal, &coordinator_request, &self.durability)
+                .map_err(reservation_refusal_reason)?;
+
         let mut ledger = self
             .ledger
             .lock()
@@ -242,69 +303,151 @@ impl MemoryV1GovernanceCommitPort for MemoryV1DurableCommitOwner {
         if let Some(hook) = &self.before_append {
             hook();
         }
-        let journal_io_started = Instant::now();
-        let before_append = journal.position();
-        let before_offset = journal.file_position();
-        let receipt = journal
-            .prepare_mutation(&coordinator_request, &self.durability)
-            .and_then(|record| record.into_durable_receipt(&self.durability));
-        record_memory_v1_commit_phase(MemoryV1CommitPhase::JournalIo, journal_io_started.elapsed());
-        let receipt = receipt.map_err(|error| {
-            if journal.position() != before_append
-                || journal.file_position() != before_offset
-                || journal.state() != DurableJournalState::Ready
-                || self.durability.is_failed()
-            {
-                publication.require_reconciliation();
-                journal.require_reconciliation();
-                let _ = ledger.mark_unknown(&claim);
-            }
-            pending_error(format!(
-                "durable journal append is unavailable or unknown: {error:?}"
-            ))
-        })?;
-        if receipt.disposition() != JournalAppendDisposition::Appended
-            || receipt.identity() != identity
-            || receipt.tail_hash() != journal.position().frame_hash()
-            || receipt.start_offset() != before_offset
-            || receipt.end_offset() != journal.file_position()
-            || receipt.operation_id() != coordinator_request.operation_id()
-            || receipt.request_fingerprint() != coordinator_request.request_fingerprint()
-            || receipt.mutation_digest() != coordinator_request.mutation_digest()
-            || receipt.audit_digest() != coordinator_request.audit_digest()
-        {
-            publication.require_reconciliation();
-            journal.require_reconciliation();
-            let _ = ledger.mark_unknown(&claim);
-            return Err(pending_error(
-                "durable journal replay requires reconciliation",
-            ));
-        }
 
+        // 3. Publish the authorization facts, the governance position and the
+        //    reserved record under one CAS. The journal is not written here:
+        //    the reserved frame and its offset are pinned by this lock, so the
+        //    write after this publication can only materialize exactly the
+        //    published reservation.
         let cas_started = Instant::now();
-        let after = GovernancePrefix::new(journal.last_mutation(), journal.epoch_id())
-            .ok_or("invalid journal boundary")
-            .and_then(|prefix| {
-                publication
-                    .publish_with_prefix(prefix)
-                    .map_err(|_| "root CAS refused")
-            })
+        let prefix = GovernancePrefix::new(journal_boundary(&reserved), journal.epoch_id())
+            .ok_or_else(|| pending_error("reserved governance anchor is invalid"))?;
+        let published = publication
+            .publish_with_reserved_record(prefix, reserved.record())
             .map_err(|error| {
+                // Refused before the journal was touched: nothing was
+                // published and no byte exists to flush. Both owners are
+                // reconciled because their correspondence can no longer be
+                // trusted.
                 publication.require_reconciliation();
                 journal.require_reconciliation();
                 let _ = ledger.mark_unknown(&claim);
-                pending_error(format!(
-                    "durable mutation requires root reconciliation: {error}"
-                ))
+                pending_error(format!("governance publication was refused: {error:?}"))
             })?;
         record_memory_v1_commit_phase(MemoryV1CommitPhase::RootCas, cas_started.elapsed());
+
+        // 4. Take the reserved record from the published snapshot itself, so
+        //    the record written below is the one the published state claims.
+        let reserved_record = match self.writer.published_record(&published) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                publication.require_reconciliation();
+                journal.require_reconciliation();
+                let _ = ledger.mark_unknown(&claim);
+                return Err(pending_error(
+                    "the published snapshot carries no reserved record; reconciliation required",
+                ));
+            }
+            Err(error) => {
+                publication.require_reconciliation();
+                journal.require_reconciliation();
+                let _ = ledger.mark_unknown(&claim);
+                return Err(pending_error(format!(
+                    "the published governance record is not retrievable: {error:?}"
+                )));
+            }
+        };
+
+        // 5. Append exactly the frame bytes held by the published record —
+        //    not a re-encoding of the request — and verify the written
+        //    record against the reservation. A refusal here leaves the
+        //    published facts unverifiable against the durable prefix, so
+        //    both owners require reconciliation before any later mutation
+        //    or DENY proof.
+        let journal_io_started = Instant::now();
+        let prepared =
+            match journal.prepare_reserved_frame(reserved_record.frame(), &self.durability) {
+                Ok(prepared) if reserved.matches_written(&prepared) => prepared,
+                Ok(_) => {
+                    publication.require_reconciliation();
+                    journal.require_reconciliation();
+                    let _ = ledger.mark_unknown(&claim);
+                    return Err(pending_error(
+                        "the written journal record does not match the published reservation; \
+                     reconciliation required",
+                    ));
+                }
+                Err(error) => {
+                    publication.require_reconciliation();
+                    journal.require_reconciliation();
+                    let _ = ledger.mark_unknown(&claim);
+                    return Err(pending_error(format!(
+                        "the published reservation could not be written to the durable journal: \
+                     {error:?}"
+                    )));
+                }
+            };
+
+        // 6. Flush only this published record and confirm the contiguous
+        //    durable prefix through it from the record's own receipt.
+        let durability_started = Instant::now();
+        let receipt = prepared.into_durable_receipt(&self.durability);
+        record_memory_v1_commit_phase(
+            MemoryV1CommitPhase::JournalDurability,
+            durability_started.elapsed(),
+        );
+        let _confirmed = match receipt {
+            Ok(receipt)
+                if receipt.disposition() == JournalAppendDisposition::Appended
+                    && receipt.identity().stream_id() == reserved_record.stream_id()
+                    && receipt.identity().epoch_id() == reserved_record.epoch_id()
+                    && receipt.identity().journal_sequence()
+                        == reserved_record.journal_sequence()
+                    && receipt.identity().mutation_sequence()
+                        == reserved_record.mutation_sequence()
+                    && receipt.identity().message_id() == reserved_record.message_id()
+                    && *receipt.tail_hash() == reserved_record.tail_hash()
+                    && receipt.start_offset() == reserved_record.start_offset()
+                    && receipt.end_offset() == reserved_record.end_offset()
+                    && receipt.end_offset() == journal.file_position()
+                    && receipt.operation_id() == coordinator_request.operation_id()
+                    && receipt.request_fingerprint()
+                        == coordinator_request.request_fingerprint()
+                    && receipt.mutation_digest() == coordinator_request.mutation_digest()
+                    && receipt.audit_digest() == coordinator_request.audit_digest() =>
+            {
+                receipt
+            }
+            Ok(_) => {
+                publication.require_reconciliation();
+                journal.require_reconciliation();
+                let _ = ledger.mark_unknown(&claim);
+                return Err(pending_error(
+                    "durable journal replay requires reconciliation",
+                ));
+            }
+            Err(error) => {
+                publication.require_reconciliation();
+                journal.require_reconciliation();
+                let _ = ledger.mark_unknown(&claim);
+                return Err(pending_error(format!(
+                    "the durable prefix confirmation failed after publication: {error:?}"
+                )));
+            }
+        };
+        record_memory_v1_commit_phase(MemoryV1CommitPhase::JournalIo, journal_io_started.elapsed());
 
         record_memory_v1_commit_phase(MemoryV1CommitPhase::Total, commit_started.elapsed());
         Ok(MemoryV1GovernanceCommitResponse {
             operation_id: request.operation_id.clone(),
-            root: after,
+            root: published,
         })
     }
+}
+
+// memory—v1: The governance position of one reserved record: the anchor of
+// its own journal frame, which the published snapshot claims as its boundary.
+fn journal_boundary(reserved: &ReservedGovernancePayload) -> JournalAnchor {
+    let record = reserved.record();
+    // The record was constructed from a decoded canonical frame, so every
+    // field is valid; the constructor cannot fail here.
+    JournalAnchor::new(
+        record.stream_id(),
+        record.journal_sequence(),
+        record.mutation_sequence(),
+        record.tail_hash(),
+    )
+    .expect("reserved record fields are validated at construction")
 }
 
 // memory—v1: A DENY-only tail may be ahead of this exact mutation boundary.
@@ -323,6 +466,42 @@ fn frontier_matches_journal(
         GovernanceFrontier::Unproven => false,
     }
 }
+
+// memory—v1: The reservation refusal happens before anything is written or
+// published, so every variant is a definite refusal with the journal
+// position, offsets and state unchanged. A recorded operation identity is
+// reported with one fixed, non-leaking reason: it does not echo the ID,
+// claim when or by which record kind it was retained, or assert any outcome;
+// it states only that the retained journal already uses the identity, this
+// request wrote nothing, and the recorded result requires reconciliation.
+fn reservation_refusal_reason(error: DurableJournalError) -> AstralError {
+    if matches!(
+        error,
+        DurableJournalError::ExistingOperation | DurableJournalError::OperationConflict
+    ) {
+        return pending_error(OPERATION_IDENTITY_RECORDED_REASON);
+    }
+    match error {
+        DurableJournalError::CapacityExceeded => pending_error(
+            "durable journal capacity is exhausted before the publication (CapacityExceeded)",
+        ),
+        DurableJournalError::StickyUnknown | DurableJournalError::UnknownAfterIo => {
+            pending_error("durable journal owner requires reconciliation before the reservation")
+        }
+        other => pending_error(format!(
+            "the reserved journal payload was refused before the publication: {other:?}"
+        )),
+    }
+}
+
+// memory—v1: Fixed, non-leaking PENDING reason for a recorded operation
+// identity: it does not echo the ID, claim when or by which record kind it
+// was retained, or assert any outcome; it states only that the retained
+// journal already uses the identity, this request wrote nothing, and the
+// recorded result requires reconciliation.
+const OPERATION_IDENTITY_RECORDED_REASON: &str = "governance operation identity is already \
+     recorded in the retained durable journal; no record was written for this request and the \
+     recorded result requires reconciliation";
 
 fn decode_fingerprint(value: &str) -> Result<[u8; 32], AstralError> {
     let bytes = hex::decode(value).map_err(|_| pending_error("request fingerprint is invalid"))?;

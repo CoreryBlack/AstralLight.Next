@@ -19,21 +19,30 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use toml::Value as TomlValue;
 use url::Url;
 
+#[path = "campaign/darkstar.rs"]
+mod darkstar;
 #[path = "campaign/paper.rs"]
 mod paper;
 #[path = "campaign/process_group.rs"]
 mod process_group;
 
+pub use darkstar::{run_darkstar_options, DARKSTAR_USAGE};
 pub use paper::{run_paper_options, PAPER_USAGE};
 use process_group::{wait_child, OwnedProcess};
 
 pub const STATUSES: [&str; 6] = ["FAIL", "UNKNOWN", "BLOCKED", "PENDING", "SKIP", "PASS"];
 const LOG_LIMIT: u64 = 64 * 1024 * 1024;
 const DEFAULT_PROFILES: [&str; 3] = ["native-kernel", "offline-validation", "performance-kernel"];
-const CLEAR_ENV: [&str; 22] = [
+const CLEAR_ENV: [&str; 26] = [
     paper::mysql_scope::URL_ENV,
     paper::mysql_scope::APPROVAL_ENV,
     paper::mysql_scope::RUN_ENV,
+    // DarkStar fixture credentials; the darkstar MySQL approval is not secret
+    // and RUST_INTEGRATION_REQUIRED is already listed below.
+    "ASTRAL_MEMORY_V1_APPLY_TEST_MYSQL_URL",
+    "ASTRAL_MEMORY_V1_E2E_ADMIN_URL",
+    "ASTRAL_DARKSTAR_MYSQL_APPROVED_RUN",
+    "ASTRAL_DARKSTAR_COLD_MYSQL_URL",
     "DATABASE_URL",
     "REDIS_URL",
     "RABBITMQ_URL",
@@ -448,6 +457,11 @@ pub fn prepare_environment(
     suite: &TomlValue,
     original: &[(OsString, OsString)],
 ) -> (BTreeMap<OsString, OsString>, Option<String>) {
+    if darkstar::is_suite(suite) {
+        // The darkstar runner assembles and validates the private MySQL env in
+        // the original it passes, so extra cases verify again per dispatch.
+        return darkstar::environment(suite, original);
+    }
     if paper::is_paper_suite(suite) {
         return paper::environment(suite, original);
     }
@@ -626,6 +640,9 @@ pub fn classify_output(
             interrupted,
             allow_outside_selection_ignored: allow_ignored,
         });
+        if let Some(result) = darkstar::check_evidence(suite, &combined, &result) {
+            return result;
+        }
         if result["status"] != "PASS" {
             return result;
         }
@@ -789,6 +806,9 @@ pub fn scrub_log(text: &str, env: &[(OsString, OsString)]) -> String {
         "PRIVATE_KEY",
         "CREDENTIAL",
         "ASTRAL_PAPER_MYSQL_URL",
+        "ASTRAL_DARKSTAR_COLD_MYSQL_URL",
+        "ASTRAL_MEMORY_V1_APPLY_TEST_MYSQL_URL",
+        "ASTRAL_MEMORY_V1_E2E_ADMIN_URL",
         "DATABASE_URL",
         "REDIS_URL",
         "RABBITMQ_URL",
@@ -802,6 +822,24 @@ pub fn scrub_log(text: &str, env: &[(OsString, OsString)]) -> String {
                 .then_some(value)
         })
         .collect::<Vec<_>>();
+    // Children may log the password of a fixture DSN on its own, in either its
+    // percent-encoded or decoded form; redact both shapes beyond the full URL.
+    let passwords = values
+        .iter()
+        .filter_map(|value| {
+            let parsed = Url::parse(value).ok()?;
+            let password = parsed
+                .password()
+                .filter(|password| !password.is_empty())?
+                .to_owned();
+            match percent_decode(&password) {
+                Some(decoded) if decoded != password => Some(vec![password, decoded]),
+                _ => Some(vec![password]),
+            }
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    values.extend(passwords);
     values.sort_by_key(|value| std::cmp::Reverse(value.len()));
     let mut result = text.to_owned();
     for value in values {
@@ -810,6 +848,29 @@ pub fn scrub_log(text: &str, env: &[(OsString, OsString)]) -> String {
     let url_re =
         regex::Regex::new(r#"[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>]+"#).expect("constant regex");
     url_re.replace_all(&result, "[redacted-url]").into_owned()
+}
+
+/// Minimal percent-decoding for credential fragments; returns `None` on
+/// malformed escapes or non-UTF-8 output so the encoded form stays redacted.
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let hex = bytes.get(index + 1..index + 3)?;
+                let byte = u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+                decoded.push(byte);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 #[cfg(unix)]
@@ -1322,6 +1383,7 @@ struct SelectedRuntime<'a, F, E> {
     snapshot: F,
     execute_command: E,
     paper: Option<Value>,
+    darkstar: Option<Value>,
 }
 
 fn run_selected(
@@ -1343,6 +1405,7 @@ fn run_selected(
             snapshot: snapshot_hash,
             execute_command: execute,
             paper: None,
+            darkstar: None,
         },
     )
 }
@@ -1364,7 +1427,9 @@ where
         mut snapshot,
         mut execute_command,
         paper: paper_plan,
+        darkstar: darkstar_plan,
     } = runtime;
+    let darkstar_mode = darkstar_plan.is_some();
     if !safe_id(run_id) {
         return Err("invalid run id".into());
     }
@@ -1372,13 +1437,29 @@ where
     fs::create_dir_all(&parent).map_err(|error| format!("create artifact root: {error}"))?;
     let parent = validate_artifact_root(&manifest.root, &parent)?;
     let directory = parent.join(run_id);
-    fs::create_dir(&directory).map_err(|error| format!("create run directory: {error}"))?;
+    // A darkstar run directory keeps temporary raw logs during execution and is
+    // archived afterwards, so it is restricted to the operator; paper and
+    // generic runs keep their plain creation.
+    #[cfg(unix)]
+    let created = if darkstar_mode {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(&directory)
+    } else {
+        fs::create_dir(&directory)
+    };
+    #[cfg(not(unix))]
+    let created = fs::create_dir(&directory);
+    created.map_err(|error| format!("create run directory: {error}"))?;
     let directory = validate_artifact_root(&manifest.root, &directory)?;
     let frozen = snapshot(&manifest.root)?;
     let mut report = json!({"schema_version":2,"taskId":run_id,"run_id":run_id,"delegated":false,"responsible_agent":"test-harness","cwd":manifest.root,"started_at":utc_now(),"source_sha256":frozen,"status":"PENDING","retries":0,"provisioning":"none; pre-migrated approved dependencies only","selection":suites.iter().map(suite_id).collect::<Vec<_>>(),"results":[],"item_results":[],"verify_items":verify_items,"phase_timing_seconds":[],"rerun_policy":"fix or reconcile the first non-PASS target; rerun the full original selection with a new run id; no cached PASS reuse"});
     let paper_mysql = suites.iter().any(paper::is_mysql_suite);
     let mysql_env = if paper_mysql {
-        paper::mysql_environment(environment, run_id, paper_plan.is_some() && !verify_items)
+        paper::mysql_environment(
+            environment,
+            run_id,
+            (paper_plan.is_some() || darkstar_plan.is_some()) && !verify_items,
+        )
     } else {
         Ok(BTreeMap::new())
     };
@@ -1389,6 +1470,23 @@ where
         } else {
             json!("locked offline Cargo build; only opt-in ephemeral loopback fixtures; no database or external services")
         };
+    }
+    if let Some(mut plan) = darkstar_plan {
+        // DarkStar reports carry their own provisioning and rerun policy and
+        // disclose, inside the frozen plan, the ambient environment names
+        // (never values) the run began with; per-suite child environment names
+        // stay in every record and suite args stay in the plan items.
+        report["provisioning"] = if paper_mysql {
+            json!("operator-approved pre-migrated or operator-prepared loopback MySQL fixtures; the runner never provisions, migrates or targets production")
+        } else {
+            json!("locked offline Cargo build; only opt-in ephemeral loopback fixtures; no database or external services")
+        };
+        report["rerun_policy"] = json!("independent suites continue after FAIL, BLOCKED or SKIP; dispatch stops after an UNKNOWN or PENDING outcome until it is reconciled; rerun the full original selection with a new run id; no cached PASS reuse");
+        plan["begin_environment_names"] = json!(environment
+            .iter()
+            .filter_map(|(name, _)| name.to_str())
+            .collect::<BTreeSet<_>>());
+        report["darkstar"] = plan;
     }
     let report_path = directory.join("result.json");
     write_report(&report_path, &report)?;
@@ -1407,7 +1505,8 @@ where
             };
             problem = environment_problem
                 .or(mysql_problem)
-                .or_else(|| paper::loopback_preflight(suite));
+                .or_else(|| paper::loopback_preflight(suite))
+                .or_else(|| darkstar::loopback_preflight(suite));
             if problem.is_none() {
                 let argv = string_array(suite, "argv")?;
                 if resolve_executable(&argv[0], &env::var("PATH").unwrap_or_default()).is_none() {
@@ -1443,12 +1542,19 @@ where
         for suite in suites {
             let id = suite_id(suite);
             let mut record = json!({"taskId":format!("{run_id}:{phase}:{id}"),"id":id,"phase":phase,"profile":suite_profile(suite),"series":suite_labels(suite),"scope":suite.get("scope"),"owner":suite.get("owner"),"production_services":registered_services(&suite_profile(suite)).unwrap_or_default(),"test_services":string_array(suite,"test_services")?,"boundary":suite.get("boundary"),"argv":suite.get("argv"),"cwd":manifest.root,"started_at":Value::Null,"retries":0,"expected_postcondition":suite.get("acceptance").and_then(TomlValue::as_str).unwrap_or("live evidence"),"exit_code":Value::Null,"stdout":Value::Null,"stderr":Value::Null,"log_integrity":"not started","stream_disconnect":false});
-            if preflight_failed {
-                let reason = report["preflight"]["issues"]
-                    .as_array()
-                    .and_then(|items| items.iter().find(|item| item["id"] == id))
-                    .and_then(|item| item["reason"].as_str())
-                    .unwrap_or("collection preflight failed; no suites dispatched");
+            let preflight_issue = report["preflight"]["issues"]
+                .as_array()
+                .and_then(|items| items.iter().find(|item| item["id"] == id))
+                .and_then(|item| item["reason"].as_str())
+                .map(str::to_owned);
+            if preflight_failed && !darkstar_mode {
+                record["status"] = json!("BLOCKED");
+                record["reason"] = json!(preflight_issue.unwrap_or_else(|| {
+                    "collection preflight failed; no suites dispatched".to_owned()
+                }));
+            } else if let Some(reason) = preflight_issue {
+                // DarkStar preflight blocks only the affected suite; the issues
+                // array above still reports every suite that has a problem.
                 record["status"] = json!("BLOCKED");
                 record["reason"] = json!(reason);
             } else if let Some((stop_id, stop_status, _)) = &stopped {
@@ -1481,6 +1587,8 @@ where
                             paper::mysql_scope::URL_ENV,
                             paper::mysql_scope::APPROVAL_ENV,
                             paper::mysql_scope::RUN_ENV,
+                            "ASTRAL_MEMORY_V1_APPLY_TEST_MYSQL_URL",
+                            "ASTRAL_MEMORY_V1_E2E_ADMIN_URL",
                             "DATABASE_URL",
                             "RABBITMQ_URL",
                             "REDIS_URL",
@@ -1506,7 +1614,7 @@ where
                     record["status"] = json!("BLOCKED");
                     record["reason"] = json!(format!("required tool unavailable: {}", argv[0]));
                 } else {
-                    let scratch = if paper::is_paper_suite(suite) {
+                    let scratch = if paper::is_paper_suite(suite) || darkstar::is_suite(suite) {
                         paper::Scratch::new(&phase_directory, &id).map(Some)
                     } else {
                         Ok(None)
@@ -1517,8 +1625,13 @@ where
                         if let Some(scratch) = &scratch {
                             scratch.bind(&mut child_env);
                             record["scratch"] = json!(scratch.path());
-                            record["paper_fixture_env"] =
-                                json!(paper::fixture_settings(&child_env));
+                            if darkstar::is_suite(suite) {
+                                record["darkstar_fixture_env"] =
+                                    json!(darkstar::fixture_settings(&child_env));
+                            } else {
+                                record["paper_fixture_env"] =
+                                    json!(paper::fixture_settings(&child_env));
+                            }
                         }
                         record["status"] = json!("PENDING");
                         record["reason"] = json!("command dispatched; result not yet proven");
@@ -1533,7 +1646,7 @@ where
                             .push(record.clone());
                         report["status"] = json!("PENDING");
                         write_report(&report_path, &report)?;
-                        if paper::is_paper_suite(suite) {
+                        if paper::is_paper_suite(suite) || darkstar::is_suite(suite) {
                             println!("[START] {id}");
                         }
                         match execute_command(suite, &child_env, &manifest.root, &phase_directory) {
@@ -1581,6 +1694,15 @@ where
                     }
                 }
             }
+            // A darkstar PENDING outcome is an unproven durable operation that
+            // may have partially applied: promote it to UNKNOWN so dispatch
+            // stops and reconciliation is required before any rerun.
+            if darkstar_mode && record["status"] == "PENDING" {
+                record["status"] = json!("UNKNOWN");
+                record["reason"] = json!(
+                    "explicit PENDING outcome stopped the campaign; reconcile the durable operation before a fresh full run"
+                );
+            }
             record["finished_at"] = json!(utc_now());
             record["actual_postcondition"] = record
                 .get("verified_postcondition")
@@ -1588,7 +1710,14 @@ where
                 .unwrap_or_else(|| record.get("reason").cloned().unwrap_or(Value::Null));
             report["phase_timing_seconds"].as_array_mut().unwrap().push(json!({"id":id,"phase":phase,"finished_at_monotonic_offset":(campaign_started.elapsed().as_secs_f64()*1000.0).round()/1000.0}));
             let status = record["status"].as_str().unwrap_or("UNKNOWN").to_owned();
-            if status != "PASS" && stopped.is_none() {
+            let dispatch_stops = if darkstar_mode {
+                // Independent suites keep dispatching past FAIL/BLOCKED/SKIP;
+                // only an unproven outcome stops dispatch until reconciled.
+                status == "UNKNOWN"
+            } else {
+                status != "PASS"
+            };
+            if dispatch_stops && stopped.is_none() {
                 stopped = Some((id.clone(), status.clone(), phase.to_string()));
                 report["stopped_at"] = json!({"id":id,"status":status,"phase":phase});
             }
@@ -1617,17 +1746,27 @@ where
     report["finished_at"] = json!(utc_now());
     report["elapsed_seconds"] =
         json!((campaign_started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0);
-    let status = stopped
-        .as_ref()
-        .map(|(_, status, _)| status.as_str())
-        .unwrap_or_else(|| {
-            let mut all = report["item_results"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            all.extend(report["results"].as_array().cloned().unwrap_or_default());
+    let mut all = report["item_results"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    all.extend(report["results"].as_array().cloned().unwrap_or_default());
+    let status = if darkstar_mode {
+        // The final verdict folds every record, including suites blocked by
+        // their own preflight row, so the campaign can never fold into a
+        // false overall PASS. UNKNOWN keeps precedence even over a prior FAIL:
+        // an unproven durable outcome must be reconciled before re-judging.
+        if all.iter().any(|record| record["status"] == "UNKNOWN") {
+            "UNKNOWN"
+        } else {
             fold_status(&all)
-        });
+        }
+    } else {
+        stopped
+            .as_ref()
+            .map(|(_, status, _)| status.as_str())
+            .unwrap_or_else(|| fold_status(&all))
+    };
     report["status"] = json!(status);
     report["series_results"] = Value::Array(manifest.series.keys().filter_map(|label| {
         let selected = report["results"].as_array()?.iter().filter(|record| record["series"].as_array().is_some_and(|series| series.iter().any(|value| value.as_str()==Some(label)))).cloned().collect::<Vec<_>>();
@@ -4148,6 +4287,24 @@ exit "${FAKE_CARGO_EXIT:-0}"
             "UNKNOWN"
         );
         assert_eq!(fold_status(&[]), "BLOCKED");
+    }
+
+    #[test]
+    fn scrub_log_redacts_darkstar_fixture_urls_and_password_shapes() {
+        let env = vec![(
+            "ASTRAL_MEMORY_V1_APPLY_TEST_MYSQL_URL".into(),
+            "mysql://darkstar_apply:fixture%40pass@127.0.0.1:3308/astral_rehearsal_apply_run"
+                .into(),
+        )];
+        let scrubbed = scrub_log(
+            "full=mysql://darkstar_apply:fixture%40pass@127.0.0.1:3308/astral_rehearsal_apply_run \
+             encoded=fixture%40pass decoded=fixture@pass done",
+            &env,
+        );
+        for secret in ["fixture%40pass", "fixture@pass", "mysql://"] {
+            assert!(!scrubbed.contains(secret), "{secret}");
+        }
+        assert!(scrubbed.contains("done"));
     }
 
     #[test]

@@ -660,17 +660,20 @@ fn j2_governance_fill_refuses_deny_with_a_pending_error() {
     assert_eq!(owner.journal_sync_calls(), 2);
 }
 
-// memory—v1: J2 witness. A capacity refusal happens after the operation ledger
-// claim, so the claim is kept with no frame behind it. The retry is refused by
-// the ledger, not by the journal, which is the observable difference.
-// asserts current behaviour that is a known gap; update when fixed.
+// memory—v1: J2 witness, updated for the reserve-then-CAS contract
+// (Rust 规范 §15.10.4: 管理变更提交前必须预留有界待持久记录空间). The capacity
+// refusal now happens at the in-memory reservation, before the operation
+// ledger claim, so the claim is not retained and a retry is refused by the
+// reservation again with the same precise reason. Nothing is published, no
+// byte is written, and no sync is spent on either refusal.
 #[test]
-fn witness_j2_capacity_refusal_retains_the_operation_claim() {
+fn j2_capacity_refusal_happens_before_the_operation_claim() {
     let root = production_root("j2-claim");
     let owner = owner_with_records(&root, 1);
     let first = root.owner.handle().metadata().unwrap();
     owner.commit(default_enable(first, "cap-g1")).unwrap();
     let before = root.owner.handle().metadata().unwrap();
+    let length = file_len(&journal_path(&root));
 
     let refused = owner.commit(default_enable(before, "cap-g2")).unwrap_err();
     assert!(
@@ -679,10 +682,16 @@ fn witness_j2_capacity_refusal_retains_the_operation_claim() {
     );
     let retry = owner.commit(default_enable(before, "cap-g2")).unwrap_err();
     assert!(
-        pending_reason(&retry).contains("operation ledger refused"),
+        pending_reason(&retry).contains("CapacityExceeded"),
         "{retry:?}"
     );
     assert_eq!(root.owner.handle().metadata().unwrap(), before);
+    assert_eq!(
+        file_len(&journal_path(&root)),
+        length,
+        "no byte was written"
+    );
+    assert_eq!(owner.journal_sync_calls(), 1, "the refusals never synced");
 }
 
 // memory—v1: G1 regression. The reserved predecessor is carried into publication;
@@ -1209,12 +1218,14 @@ fn j3_recovery_reports_sequence_gap_for_a_nonzero_baseline() {
     assert_eq!(error, RecoveryError::SequenceGap);
 }
 
-// memory—v1: J5 witness at the owner. The operation ledger is keyed by the
-// client-chosen identifier alone. A second actor that reuses an identifier is
-// refused by the ledger before its own frame is written.
-// asserts current behaviour that is a known gap; update when fixed.
+// memory—v1: J5 witness, updated for the reserve-then-CAS contract. The
+// reservation reuses the journal's bounded operations index before the
+// ledger claim, so a second actor reusing an identifier is refused by the
+// recorded-identity gate with the fixed non-leaking reason before any frame
+// write, publication or sync; the ledger remains the same-boot claim gate
+// behind it. (The old witness pinned the ledger-first refusal order.)
 #[test]
-fn witness_j5_cross_actor_operation_id_is_refused_by_the_global_ledger() {
+fn witness_j5_cross_actor_operation_id_is_refused_before_any_frame_write() {
     let root = production_root("j5-actor");
     let owner = assembled_owner(&root);
     let first = root.owner.handle().metadata().unwrap();
@@ -1228,6 +1239,7 @@ fn witness_j5_cross_actor_operation_id_is_refused_by_the_global_ledger() {
         ))
         .unwrap();
     let second = root.owner.handle().metadata().unwrap();
+    let length = file_len(&journal_path(&root));
 
     let refused = owner
         .commit(enable_request(
@@ -1239,71 +1251,33 @@ fn witness_j5_cross_actor_operation_id_is_refused_by_the_global_ledger() {
         ))
         .unwrap_err();
     assert!(
-        pending_reason(&refused).contains("operation ledger refused"),
+        pending_reason(&refused).contains("governance operation identity is already recorded"),
         "{refused:?}"
     );
     assert_eq!(root.owner.handle().metadata().unwrap(), second);
+    assert_eq!(
+        file_len(&journal_path(&root)),
+        length,
+        "no byte was written"
+    );
     assert_eq!(owner.journal_sync_calls(), 1);
 }
 
-// memory—v1: J1 witness (source-shape presence pin, not behavioural evidence). The
-// service's missing-journal branch is the else of the existence test, and it calls
-// create with no refusal in between. The check reads the production region of the
-// service source, which only the binary compiles. It does not detect a refusal
-// inserted before the existence test. The behavioural evidence for the journal
-// owner's refusal of a missing file is j1_missing_file_is_refused_by_the_journal_owner.
-// asserts current behaviour that is a known gap; update when fixed.
+// memory—v1: Pin the binary's recovery entry. Behavioural coverage for a lost
+// acknowledged tail lives in the loopback service lifecycle test.
 #[test]
-fn witness_j1_missing_journal_file_is_created_as_genesis_by_the_service() {
+fn witness_j1_startup_uses_the_installation_checkpoint() {
     let source = include_str!("memory_v1_service.rs");
-    let production = &source[..source
-        .find("#[cfg(test)]")
-        .expect("the service keeps its tests after production code")];
-    let function = production
-        .find("pub(crate) fn open_durable_journal(")
-        .expect("open_durable_journal exists in the production region");
-    let body = &production[function..];
-    let existing = body
-        .find("if target.exists()")
-        .expect("the existing-file branch is present");
-    let create = body
-        .find("MemoryV1DurableJournal::create(")
-        .expect("the missing-file branch creates the journal");
-    assert!(
-        existing < create,
-        "create is the fallback of the existence test"
-    );
-    let else_at = body[existing..]
-        .find("} else {")
-        .map(|offset| existing + offset)
-        .expect("the missing-file branch is an else branch");
-    let fallback = &body[else_at..create];
-    assert!(
-        !fallback.contains("bail!") && !fallback.contains("return") && !fallback.contains("Err("),
-        "the missing-file fallback must not refuse before create"
-    );
-    assert!(body.contains("journal_genesis_anchor()"));
-}
-
-// memory—v1: J1 witness (source-shape presence pin, not behavioural evidence). The
-// external baseline the service reopens against is a constant derived from a fixed
-// string (memory_v1_service.rs:160-166). It is not a checkpoint bound to the
-// database, so a reconciled MySQL checkpoint does not supply it. The pin shows the
-// constant text only. The 04 section states the related limit that an external
-// tail cannot exclude a missing suffix on its own (04-implementation.tex line 55).
-// asserts current behaviour that is a known gap; update when fixed.
-#[test]
-fn witness_j1_journal_genesis_anchor_is_a_constant_not_a_checkpoint() {
-    let source = include_str!("memory_v1_service.rs");
-    let production = &source[..source
-        .find("#[cfg(test)]")
-        .expect("the service keeps its tests after production code")];
-    let function = production
-        .find("fn journal_genesis_anchor()")
-        .expect("the genesis anchor function exists");
-    let body = &production[function..];
-    assert!(body.contains(r#"Sha256::digest(b"astrallight/memory-v1/journal-genesis/1\0")"#));
-    assert!(body.contains("JournalAnchor::new(stream, 0, 0, genesis)"));
+    let opener = source
+        .split_once("pub(crate) fn open_durable_journal(")
+        .unwrap()
+        .1
+        .split_once("pub(crate) async fn capture_from_database(")
+        .unwrap()
+        .0;
+    assert!(opener.contains("MemoryV1DurableJournal::open_checkpointed("));
+    assert!(!opener.contains("::scan_tail("));
+    assert!(!opener.contains("::bootstrap("));
 }
 
 // memory—v1: Append raw bytes to the journal file through a second handle, as a

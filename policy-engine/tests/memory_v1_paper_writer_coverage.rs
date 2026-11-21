@@ -636,11 +636,8 @@ const FENCE_ROOT_TEST: &str = "paper_open_fence_at_the_final_check_refuses_and_c
 
 /// memory—v1 (V5, root level): A modification fence that is open on the rule set of the subject's
 /// active binding when the final check starts makes both the ordinary and the exact-root check refuse.
-/// Closing the fence without publishing, so that no identity changed, makes the same request admit
-/// again. The cases hold the record, the constraints, the clock and the request snapshot fixed. The
-/// fence is opened outside every final-check callback, so it is already open when the check starts
-/// and only the closed-key requirement can refuse. This controlled window is independent of the
-/// production commit and does not change the policy snapshot.
+/// Closing without publication restores availability for a fresh request, not for the phase that
+/// overlapped the window. Both checks use the same policy snapshot and clock sample.
 #[test]
 fn paper_open_fence_at_the_final_check_refuses_and_close_restores() {
     if std::env::var(CHILD_ENV).as_deref() != Ok("fence-root") {
@@ -666,18 +663,18 @@ fn paper_open_fence_at_the_final_check_refuses_and_close_restores() {
         .with_authoritative_context(&root, |_, reader, _| reader.metadata())
         .expect("the request reads its snapshot");
 
-    let ordinary = || {
+    let ordinary = |root: &RequestRootExtension, session: &RequestSessionExtension| {
         session
-            .with_authoritative_context(&root, |_, reader, final_check| {
+            .with_authoritative_context(root, |_, reader, final_check| {
                 final_check
                     .expect("the bound session carries a final check")
                     .try_final_time_for_test(&subject_record(reader), &constraints, || Some(sample))
             })
             .expect("the request scope matches the session")
     };
-    let exact = || {
+    let exact = |root: &RequestRootExtension, session: &RequestSessionExtension| {
         session
-            .with_authoritative_context(&root, |_, reader, final_check| {
+            .with_authoritative_context(root, |_, reader, final_check| {
                 final_check
                     .expect("the bound session carries a final check")
                     .try_final_time_exact_root_for_test(
@@ -691,8 +688,16 @@ fn paper_open_fence_at_the_final_check_refuses_and_close_restores() {
             .expect("the request scope matches the session")
     };
 
-    assert_eq!(ordinary(), Some(sample), "control: no fence is open");
-    assert_eq!(exact(), Some(sample), "control: no fence is open");
+    assert_eq!(
+        ordinary(&root, &session),
+        Some(sample),
+        "control: no fence is open"
+    );
+    assert_eq!(
+        exact(&root, &session),
+        Some(sample),
+        "control: no fence is open"
+    );
 
     let declaration = FenceDeclaration {
         rule_set_version: vec![1],
@@ -703,12 +708,12 @@ fn paper_open_fence_at_the_final_check_refuses_and_close_restores() {
         .begin_modification_fence(id(10), &declaration)
         .expect("the fence opens against the live premise");
     assert_eq!(
-        ordinary(),
+        ordinary(&root, &session),
         None,
         "an open fence on the card's rule set refuses the ordinary check"
     );
     assert_eq!(
-        exact(),
+        exact(&root, &session),
         None,
         "an open fence on the target rule set refuses the exact-root check"
     );
@@ -716,16 +721,13 @@ fn paper_open_fence_at_the_final_check_refuses_and_close_restores() {
     owner
         .abort_modification_fence(id(10))
         .expect("the fence closes without publishing");
-    assert_eq!(
-        ordinary(),
-        Some(sample),
-        "closing the fence without a publication restores the same request"
-    );
-    assert_eq!(
-        exact(),
-        Some(sample),
-        "closing the fence without a publication restores the same request"
-    );
+    assert_eq!(ordinary(&root, &session), None);
+    assert_eq!(exact(&root, &session), None);
+    let fresh_scope = RequestRootScope::new(owner.handle(), Default::default());
+    let fresh = fresh_scope.extension();
+    let fresh_session = subject_session(&authority, &fresh);
+    assert_eq!(ordinary(&fresh, &fresh_session), Some(sample));
+    assert_eq!(exact(&fresh, &fresh_session), Some(sample));
     println!("fence root: version={}", metadata.version);
 }
 

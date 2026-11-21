@@ -23,6 +23,7 @@ const TARGET: [u8; 16] = [5; 16];
 const UNRELATED: [u8; 16] = [15; 16];
 const UNRELATED_CARD: [u8; 16] = [14; 16];
 const CONFIRMATION: [u8; 16] = [9; 16];
+const SHARED_CARD: [u8; 16] = [21; 16];
 
 fn two_rule_sets() -> TestRoot {
     let (mut rows, mut selections) = fixture_rows();
@@ -45,6 +46,20 @@ fn two_rule_sets() -> TestRoot {
     binding_confirmation.binding_id = [16; 16];
     binding_confirmation.rule_set_id = UNRELATED;
     rows.binding_confirmations.push(binding_confirmation);
+    // memory—v1: A second card uses TARGET as OVERLAY; both bindings follow
+    // the same source slot even though they were confirmed separately at V1.
+    let mut card = rows.user_cards[0].clone();
+    card.user_card_id = SHARED_CARD;
+    rows.user_cards.push(card);
+    let mut binding = rows.bindings[0].clone();
+    binding.binding_id = [22; 16];
+    binding.user_card_id = SHARED_CARD;
+    binding.binding_layer = BindingLayer::Overlay;
+    rows.bindings.push(binding);
+    let mut confirmation = rows.binding_confirmations[0].clone();
+    confirmation.confirmation_id = [23; 16];
+    confirmation.binding_id = [22; 16];
+    rows.binding_confirmations.push(confirmation);
     let mut change_confirmation = rows.rule_set_change_confirmations[0].clone();
     change_confirmation.confirmation_id = [18; 16];
     change_confirmation.rule_set_id = UNRELATED;
@@ -194,7 +209,7 @@ fn commit_fence_blocks_only_dependent_reads_and_refuses_competing_writer() {
             )
             .unwrap()
     };
-    let affected = issue(CARD);
+    let affected = [issue(CARD), issue(SHARED_CARD)];
     let unrelated = issue(UNRELATED_CARD);
     let engine = PolicyEngine::new();
     let evaluate = |credential| {
@@ -218,10 +233,12 @@ fn commit_fence_blocks_only_dependent_reads_and_refuses_competing_writer() {
             },
         )
     };
-    assert_eq!(
-        evaluate(affected.credential()).decision,
-        MemoryV1Decision::Allow
-    );
+    for session in &affected {
+        assert_eq!(
+            evaluate(session.credential()).decision,
+            MemoryV1Decision::Allow
+        );
+    }
     assert_eq!(
         evaluate(unrelated.credential()).decision,
         MemoryV1Decision::Allow
@@ -244,13 +261,15 @@ fn commit_fence_blocks_only_dependent_reads_and_refuses_competing_writer() {
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(handle.metadata().unwrap(), before);
         assert_eq!(file_len(&journal_path(&root)), 0);
-        let active = evaluate(affected.credential());
-        assert_eq!(active.decision, MemoryV1Decision::Pending);
-        assert_eq!(
-            active.pending_source,
-            Some(MemoryV1PendingSource::FenceActive)
-        );
-        assert!(active.admission.is_none());
+        for session in &affected {
+            let active = evaluate(session.credential());
+            assert_eq!(active.decision, MemoryV1Decision::Pending);
+            assert_eq!(
+                active.pending_source,
+                Some(MemoryV1PendingSource::FenceActive)
+            );
+            assert!(active.admission.is_none());
+        }
         assert_eq!(
             evaluate(unrelated.credential()).decision,
             MemoryV1Decision::Allow
@@ -269,10 +288,12 @@ fn commit_fence_blocks_only_dependent_reads_and_refuses_competing_writer() {
         .unwrap()
         .is_fenced(TARGET)
         .unwrap());
-    assert_eq!(
-        evaluate(affected.credential()).decision,
-        MemoryV1Decision::Deny
-    );
+    for session in &affected {
+        assert_eq!(
+            evaluate(session.credential()).decision,
+            MemoryV1Decision::Deny
+        );
+    }
     assert_eq!(
         evaluate(unrelated.credential()).decision,
         MemoryV1Decision::Allow

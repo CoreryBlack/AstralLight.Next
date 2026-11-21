@@ -28,15 +28,17 @@ use crate::memory_v1_adoption::{
 };
 use crate::memory_v1_db_rows::{binding_is_active, BinaryId, CandidateRows, CurrentSelection};
 use crate::memory_v1_digest::{ContentDigest, DigestIndex};
+#[cfg(test)]
+use crate::memory_v1_fence::FENCE_SAMPLE_WIDTH;
 use crate::memory_v1_fence::{
     FenceControlError, FenceDeclaration, FenceError, FenceGuard, FencePremise, FenceReadError,
-    FenceRegistry, MAX_FENCE_CHECK_OBJECTS,
+    FenceReadStamp, FenceRegistry,
 };
 use crate::memory_v1_hamt::{
     count_rows, CandidateBudget, CandidateError, CardCandidate, HamtCandidate,
     PublishableRetirement, RuleSetImpactCandidate,
 };
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 use crate::memory_v1_hamt_runtime::digest_candidate;
 use crate::memory_v1_hamt_runtime::{digest_rows, RuntimeCardContext, RuntimeError};
 use crate::memory_v1_registry::{
@@ -240,6 +242,120 @@ impl PublicationCandidate {
     }
 }
 
+/// memory—v1: The complete journal record one governed publication claims,
+/// reserved in memory before the CAS and written after it.
+///
+/// The value carries the complete canonical frame bytes, not just their
+/// digest: the published snapshot owns the exact record its governance
+/// position claims, and the composition writes, verifies and confirms
+/// exactly these bytes after the publication succeeds. The value itself
+/// proves no durability; the durable proof comes from the written record's
+/// own receipt.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ReservedGovernanceRecord {
+    stream_id: MemoryId,
+    epoch_id: MemoryId,
+    journal_sequence: u64,
+    mutation_sequence: u64,
+    message_id: MemoryId,
+    start_offset: u64,
+    end_offset: u64,
+    tail_hash: [u8; 32],
+    frame: Arc<[u8]>,
+}
+
+impl ReservedGovernanceRecord {
+    /// memory—v1: Fix one reserved record around its complete canonical
+    /// frame. Construction refuses zero identifiers, nonpositive sequences,
+    /// an empty frame, offset overflow, and a mutation sequence outside the
+    /// journal sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        stream_id: MemoryId,
+        epoch_id: MemoryId,
+        journal_sequence: u64,
+        mutation_sequence: u64,
+        message_id: MemoryId,
+        start_offset: u64,
+        tail_hash: [u8; 32],
+        frame: Arc<[u8]>,
+    ) -> Option<Self> {
+        let zero = MemoryId::from_bytes([0; 16]);
+        if frame.is_empty() || tail_hash == [0; 32] {
+            return None;
+        }
+        let end_offset = start_offset.checked_add(frame.len() as u64)?;
+        (stream_id != zero
+            && epoch_id != zero
+            && message_id != zero
+            && journal_sequence > 0
+            && mutation_sequence > 0
+            && mutation_sequence <= journal_sequence)
+            .then_some(Self {
+                stream_id,
+                epoch_id,
+                journal_sequence,
+                mutation_sequence,
+                message_id,
+                start_offset,
+                end_offset,
+                tail_hash,
+                frame,
+            })
+    }
+
+    pub const fn stream_id(&self) -> MemoryId {
+        self.stream_id
+    }
+
+    pub const fn epoch_id(&self) -> MemoryId {
+        self.epoch_id
+    }
+
+    pub const fn journal_sequence(&self) -> u64 {
+        self.journal_sequence
+    }
+
+    pub const fn mutation_sequence(&self) -> u64 {
+        self.mutation_sequence
+    }
+
+    pub const fn message_id(&self) -> MemoryId {
+        self.message_id
+    }
+
+    /// The file offset the reserved record occupies.
+    pub const fn start_offset(&self) -> u64 {
+        self.start_offset
+    }
+
+    /// The file offset just past the reserved record.
+    pub const fn end_offset(&self) -> u64 {
+        self.end_offset
+    }
+
+    /// The encoded frame length in bytes.
+    pub fn frame_bytes(&self) -> u64 {
+        self.frame.len() as u64
+    }
+
+    /// The complete canonical frame bytes of the reserved record.
+    pub fn frame(&self) -> &[u8] {
+        &self.frame
+    }
+
+    /// The chain digest the reserved frame contributes to the journal.
+    pub const fn tail_hash(&self) -> [u8; 32] {
+        self.tail_hash
+    }
+}
+
+impl std::fmt::Debug for ReservedGovernanceRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReservedGovernanceRecord([REDACTED])")
+    }
+}
+
 /// memory—v1: The journal boundary associated with a snapshot. This is
 /// handed in by the composition owner after local durability or verified replay.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -303,6 +419,11 @@ struct RootSnapshot {
     // memory—v1: Published with the initial serving snapshot; later snapshots
     // may retain this adoption history without proving their own freshness.
     adoption: Option<Arc<AdoptionRecord>>,
+    // memory—v1: The complete reserved journal record this exact snapshot's
+    // governance position claims. Only the governed publication path attaches
+    // one; every other snapshot publishes `None`, and an invalidated snapshot
+    // withdraws the claim with its positive availability.
+    reservation: Option<ReservedGovernanceRecord>,
 }
 
 // The private field prevents the parent module and its tests from manufacturing
@@ -322,7 +443,10 @@ mod validated_adoption_snapshot {
             // current pointer with the selected version. `validate_for_serving`
             // validates the selected object itself but intentionally does not treat
             // a caller-provided selection as proof that the row pointer agrees.
-            if !snapshot.objects.has_valid_current_pointers() {
+            if !snapshot.objects.has_valid_current_pointers()
+                || !snapshot.objects.uses_source_slots()
+                || !snapshot.objects.has_single_version_per_rule_set()
+            {
                 return Err(RootError::Candidate(CandidateError::InconsistentBinding));
             }
             snapshot
@@ -348,8 +472,18 @@ mod validated_adoption_snapshot {
 
 use validated_adoption_snapshot::ValidatedAdoptionSnapshot;
 
+mod capacity;
 mod governed;
+mod startup;
 pub use governed::PreparedGovernedMutation;
+// memory—v1: test-support-only lock-timing probes for the LOCAL ABC benchmark
+// (semantics, endpoints and overhead are documented in the leaf module).
+// Compiled out of ordinary production builds; records observations only and
+// grants no authority and no ability to mutate the root.
+#[cfg(feature = "test-support")]
+mod abc_lock_timing;
+#[cfg(feature = "test-support")]
+pub use abc_lock_timing::measure_abc_lock_for_test;
 
 struct PreparedSnapshot<'a> {
     snapshot: Arc<RootSnapshot>,
@@ -421,10 +555,17 @@ impl From<RequestRootFailure> for RootError {
 /// not the owner, alive. The request ID is only for correlation and is not an
 /// identity or authorization proof. This candidate has no refresh operation;
 /// a future controlled refill must first retire all users of the old phase.
+///
+/// memory—v1 §4.7: The read-phase fence stamp is captured once with the
+/// snapshot. The final ALLOW recheck uses it to prove that every touched rule
+/// set was not opened for modification during the read phase, including
+/// windows that opened and closed again (the begin->abort ABA), while
+/// unrelated modifications remain isolated.
 pub struct RequestRootReader {
     request_id: Uuid,
     snapshot: Arc<RootSnapshot>,
     observation: RootObservation,
+    fence_stamp: Option<FenceReadStamp>,
 }
 
 /// The non-cloneable lifetime owner of one installed root.
@@ -434,6 +575,8 @@ pub struct RequestRootReader {
 /// only the one-time installation marker and does not keep a second strong root.
 pub struct RootOwner {
     runtime: Arc<RootRuntime>,
+    // Set only by the private installer, never by an adoption caller.
+    isolated_fixture: bool,
 }
 
 /// Installation and lifetime owner for one root in one composition scope.
@@ -552,14 +695,64 @@ impl RootRegistry {
         budget: CandidateBudget,
         phase: &mut impl FnMut(&'static str),
     ) -> Result<RootOwner, RootError> {
+        self.install_with_capacity(
+            rows,
+            selections,
+            budget,
+            GovernanceFrontier::Baseline,
+            None,
+            phase,
+        )
+    }
+
+    // memory—v1: Share the same validation and one-shot slot for both budget policies.
+    // `frontier` is the governance position the candidate is installed with: the
+    // cold installer binds a reconciled journal's last mutation anchor here, so a
+    // candidate built from already-reconciled database facts starts at its exact
+    // recovered position instead of the baseline (Rust 规范 §15.10.4).
+    fn install_with_capacity(
+        &self,
+        rows: CandidateRows,
+        selections: Vec<CurrentSelection>,
+        budget: CandidateBudget,
+        frontier: GovernanceFrontier,
+        probe: Option<fn() -> Option<usize>>,
+        phase: &mut impl FnMut(&'static str),
+    ) -> Result<RootOwner, RootError> {
         count_rows(&rows, budget.max_table_rows).map_err(RootError::Candidate)?;
+        if let Some(probe) = probe {
+            capacity::rows_fit(probe, &rows, &selections).map_err(RootError::Candidate)?;
+        }
         phase("count");
-        let digest_index = digest_rows(&rows, &selections).map_err(RootError::Runtime)?;
+        // Keep the non-authorizing, selection-free diagnostic preflight. With
+        // live sources, validate every row before projecting the runtime digest.
+        let diagnostic_digest = if selections.is_empty() {
+            Some(digest_rows(&rows, &selections).map_err(RootError::Runtime)?)
+        } else {
+            if selections
+                .iter()
+                .any(|s| s.version_bytes.len() > crate::memory_v1_digest::MAX_VERSION_BYTES)
+            {
+                return Err(RootError::Runtime(RuntimeError::Digest(
+                    crate::memory_v1_digest::DigestError::LimitExceeded,
+                )));
+            }
+            HamtCandidate::check_source_capacity(&rows).map_err(RootError::Runtime)?;
+            None
+        };
+        let mut objects =
+            HamtCandidate::build(rows, selections, budget).map_err(RootError::Candidate)?;
+        objects.set_headroom(probe);
+        objects.project_sources().map_err(RootError::Candidate)?;
+        phase("index");
+        let digest_index = match diagnostic_digest {
+            Some(index) => index,
+            None => objects
+                .rebuild_source_digest()
+                .map_err(RootError::Runtime)?,
+        };
         let digest = digest_index.digest();
         phase("digest");
-        let objects =
-            HamtCandidate::build(rows, selections, budget).map_err(RootError::Candidate)?;
-        phase("index");
         let (actual_budget, row_count) = objects.budget_and_row_count();
         let metadata = RootMetadata {
             instance_id: RootInstanceId(Uuid::new_v4()),
@@ -575,7 +768,8 @@ impl RootRegistry {
                 objects,
                 digest_index,
                 adoption: None,
-                frontier: GovernanceFrontier::Baseline,
+                frontier,
+                reservation: None,
             }),
             serving_writer: Mutex::new(()),
             mutation_lock: RwLock::new(()),
@@ -587,7 +781,11 @@ impl RootRegistry {
             .set(Arc::downgrade(&runtime))
             .map_err(|_| RootError::AlreadyInstalled)?;
         phase("install");
-        Ok(RootOwner { runtime })
+        Ok(RootOwner {
+            runtime,
+            isolated_fixture: cfg!(any(test, feature = "test-support"))
+                && !std::ptr::eq(self, &PROCESS_ROOT),
+        })
     }
 
     /// memory—v1: Return a read handle for the already installed root.
@@ -617,6 +815,63 @@ pub fn install_process_root(
     budget: CandidateBudget,
 ) -> Result<RootOwner, RootError> {
     PROCESS_ROOT.install_candidate(rows, selections, budget)
+}
+
+/// memory—v1: Use measured process headroom instead of a fixed cardinality quota.
+/// The callback is supplied by the process owner and returns usable additional bytes.
+/// Unknown headroom refuses construction. The same one-shot installation slot is used.
+pub fn install_process_root_with_headroom(
+    rows: CandidateRows,
+    selections: Vec<CurrentSelection>,
+    probe: fn() -> Option<usize>,
+) -> Result<RootOwner, RootError> {
+    install_process_root_with_headroom_and_governance_prefix(rows, selections, None, probe)
+}
+
+/// memory—v1: Cold-install the one process-wide candidate root with the
+/// governance position already bound from the reconciled durable journal.
+///
+/// `prefix` is the anchor of the journal's last mutation itself (a pure DENY
+/// suffix does not advance governance); `None` installs the baseline for an
+/// unreconciled (genesis) candidate. The candidate carries no authorization
+/// yet — the production adoption gate still verifies the exact captured facts
+/// against this snapshot before `Serving`. The same one-shot slot is used.
+pub fn install_process_root_with_headroom_and_governance_prefix(
+    rows: CandidateRows,
+    selections: Vec<CurrentSelection>,
+    prefix: Option<GovernancePrefix>,
+    probe: fn() -> Option<usize>,
+) -> Result<RootOwner, RootError> {
+    let frontier = prefix.map_or(GovernanceFrontier::Baseline, GovernanceFrontier::Published);
+    PROCESS_ROOT.install_with_capacity(
+        rows,
+        selections,
+        CandidateBudget {
+            max_table_rows: usize::MAX,
+            max_bindings_per_read: usize::MAX,
+        },
+        frontier,
+        Some(probe),
+        &mut |_| {},
+    )
+}
+
+/// memory—v1: Install an isolated fixture candidate with an exact governance
+/// prefix, mirroring the process cold-install entry for offline tests.
+///
+/// This is not a production entry point: it never installs the process root
+/// and exists so a test binary can hold one candidate at a time without
+/// colliding with the process-wide installer.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn install_isolated_test_root_with_governance_prefix(
+    rows: CandidateRows,
+    selections: Vec<CurrentSelection>,
+    budget: CandidateBudget,
+    prefix: Option<GovernancePrefix>,
+) -> Result<RootOwner, RootError> {
+    let frontier = prefix.map_or(GovernanceFrontier::Baseline, GovernanceFrontier::Published);
+    RootRegistry::new().install_with_capacity(rows, selections, budget, frontier, None, &mut |_| {})
 }
 
 /// memory—v1: Obtain a handle to the process-wide root after installation.
@@ -675,24 +930,21 @@ impl RootOwner {
 
     /// memory—v1: The complete production adoption entry point.
     ///
-    /// The bundle must carry a sealed fact for every non-structural family;
-    /// the structural families are re-derived from this exact candidate. On
-    /// success the exact snapshot is published `Serving` at the production
-    /// grade and the root-owned [`ProductionAdmission`] capability is returned
-    /// from the winning CAS. Any gap, mismatch or concurrent publication
-    /// changes nothing and reports the failure.
+    /// Verify structural evidence on this exact candidate. Named family
+    /// declarations can exercise the verifier on isolated fixtures only.
+    /// A refusal does not publish Serving or return a capability.
     pub fn adopt_with_production_evidence(
         &self,
         facts: &crate::memory_v1_adoption::ColdLoadFacts,
         input: &crate::memory_v1_adoption::ProductionEvidenceInput,
     ) -> Result<(RootMetadata, ProductionAdmission), RootError> {
         let current = self.runtime.current.load_full();
-        let evidence = crate::memory_v1_adoption::AdoptionEvidence::production(
+        let evidence = input.production_evidence(
             current.metadata,
             current.objects.table_counts(),
             current.objects.has_valid_current_pointers(),
             facts,
-            input,
+            self.isolated_fixture,
         );
         self.adopt_with_evidence_and_admission(&evidence)
     }
@@ -736,6 +988,28 @@ impl RootOwner {
             return Err(RootError::ProductionAdmissionMismatch);
         }
         Ok(current.frontier)
+    }
+
+    /// memory—v1: Read the complete reserved journal record that the exact
+    /// live serving snapshot published, taken from that snapshot itself.
+    ///
+    /// The composition calls this after the governed publication succeeded,
+    /// with the returned metadata, and writes exactly the returned frame
+    /// before confirming the local durable prefix. A snapshot published
+    /// without a reservation (baseline, verified recovery replay, context
+    /// load) returns `None`; an observation that no longer matches the live
+    /// serving snapshot is an error, not a fallback.
+    pub fn published_governance_record(
+        &self,
+        admission: &ProductionAdmission,
+        expected: &RootMetadata,
+    ) -> Result<Option<ReservedGovernanceRecord>, RootError> {
+        self.validate_production_admission(admission)?;
+        let current = self.runtime.current.load_full();
+        if &current.metadata != expected || current.metadata.status != RootStatus::Serving {
+            return Err(RootError::ProductionAdmissionMismatch);
+        }
+        Ok(current.reservation.clone())
     }
 
     /// creates a record without schema, count or capture-time details; it is not
@@ -880,7 +1154,7 @@ impl RootOwner {
         certificate: &ServingAdoptionCertificate,
         record: AdoptionRecord,
     ) -> Result<RootMetadata, RootError> {
-        self.adopt_snapshot_internal(current, certificate, record, false)
+        self.adopt_snapshot_internal(current, certificate, record, false, None)
             .map(|(metadata, _)| metadata)
     }
 
@@ -894,7 +1168,7 @@ impl RootOwner {
         record: AdoptionRecord,
     ) -> Result<(RootMetadata, ProductionAdmission), RootError> {
         let (metadata, snapshot) =
-            self.adopt_snapshot_internal(current, certificate, record, true)?;
+            self.adopt_snapshot_internal(current, certificate, record, true, None)?;
         Ok((
             metadata,
             ProductionAdmission::for_published_snapshot(&self.runtime, &snapshot),
@@ -909,6 +1183,7 @@ impl RootOwner {
         certificate: &ServingAdoptionCertificate,
         record: AdoptionRecord,
         require_production_admission: bool,
+        startup_check: Option<startup::StartupPublicationCheck<'_>>,
     ) -> Result<(RootMetadata, Arc<RootSnapshot>), RootError> {
         let source_matches_grade = match (certificate.source, record.grade) {
             (AdoptionCertificateSource::Production, AdoptionGrade::Production)
@@ -957,6 +1232,9 @@ impl RootOwner {
             .objects
             .validate_current_registry(&registry)
             .map_err(RootError::Candidate)?;
+        if let Some(check) = startup_check {
+            check.verify(registry.version())?;
+        }
         let published = self.publish_adopted_snapshot_and_snapshot(&validated, record);
         drop(registry);
         published
@@ -994,6 +1272,7 @@ impl RootOwner {
             digest_index: validated.digest_index.clone(),
             adoption: Some(Arc::new(record)),
             frontier: validated.frontier,
+            reservation: None,
         });
         let previous = self
             .runtime
@@ -1020,6 +1299,7 @@ impl RootOwner {
             digest_index: current.digest_index.clone(),
             adoption: current.adoption.clone(),
             frontier: current.frontier,
+            reservation: None,
         }));
     }
     // memory—v1: Read-side exhaustion refuses immediately. Publish Invalid only
@@ -1269,10 +1549,21 @@ impl RootOwner {
             .serving_writer
             .try_lock()
             .map_err(|_| MutationError::ConcurrentModification)?;
+        // memory—v1: test-support-only LOCAL ABC probe. Captures the native
+        // wait start only when this thread is armed; no timing otherwise.
+        #[cfg(feature = "test-support")]
+        let abc_mutation_wait_started = abc_lock_timing::wait_probe_start();
         let _mutation_guard = runtime
             .mutation_lock
             .write()
             .map_err(|_| MutationError::Runtime(RuntimeError::Poisoned))?;
+        // memory—v1: probe shadow binding (test-support only). Wraps the
+        // native write guard so `wait_ns` ends at acquisition and `held_ns`
+        // ends at the actual guard drop, covering every early return below.
+        // Purely observational; no logic or authorization change.
+        #[cfg(feature = "test-support")]
+        let _mutation_guard =
+            abc_lock_timing::TimedGuard::wrap(_mutation_guard, abc_mutation_wait_started);
         let current = runtime.current.load_full();
         if current.metadata.version == u64::MAX {
             // memory—v1 §15.10.3: no candidate construction may run after the
@@ -1400,6 +1691,7 @@ impl RootOwner {
         mutation: &ManagementMutationV2,
     ) -> Result<PreparedSnapshot<'a>, MutationError> {
         let candidate = &current.objects;
+        capacity::mutation_fits(candidate, mutation).map_err(MutationError::Candidate)?;
         let old_version = current.metadata.version;
         // The retirement result is sealed around its exact candidate after the
         // current binding indexes are checked. Other mutations still validate
@@ -1412,7 +1704,7 @@ impl RootOwner {
                     .map_err(MutationError::Candidate)?,
             )
         } else {
-            let next = match mutation {
+            let mut next = match mutation {
                 ManagementMutationV2::BindingCreate { row, confirmation } => {
                     if confirmation.binding_id != row.binding_id
                         || confirmation.rule_set_id != row.rule_set_id
@@ -1522,7 +1814,8 @@ impl RootOwner {
                     candidate
                         .append_version(version_row.clone())
                         .and_then(|c| c.with_current_version(*rule_set_id, new_current_version))
-                        .and_then(|c| {
+                        .and_then(|mut c| {
+                            c.compact_source(*rule_set_id)?;
                             c.with_change_confirmation_insert(change_confirmation.clone())
                         })
                         .map_err(MutationError::Candidate)?
@@ -1532,9 +1825,11 @@ impl RootOwner {
                 }
             };
             // Index coverage is verified independently of the content digest before CAS.
-            next.validate_binding_indexes()
-                .and_then(|()| next.validate_confirmation_indexes())
-                .map_err(MutationError::Candidate)?;
+            next.check_publication_indexes(matches!(
+                mutation,
+                ManagementMutationV2::VersionPublish { .. }
+            ))
+            .map_err(MutationError::Candidate)?;
             PublicationCandidate::Checked(next)
         };
         // Prepare the changed digest rows privately against this exact snapshot.
@@ -1578,6 +1873,7 @@ impl RootOwner {
                 digest_index,
                 adoption: current.adoption.clone(),
                 frontier: GovernanceFrontier::Unproven,
+                reservation: None,
             }),
             _registry: registry,
         })
@@ -1837,8 +2133,10 @@ pub enum MutationError {
 fn digest_candidate_from_candidate(
     candidate: &HamtCandidate,
 ) -> Result<ContentDigest, MutationError> {
-    let (rows, selections) = candidate.digest_inputs();
-    digest_candidate(&rows, &selections).map_err(MutationError::Runtime)
+    candidate
+        .rebuild_source_digest()
+        .map(|index| index.digest())
+        .map_err(MutationError::Runtime)
 }
 
 impl Drop for RootOwner {
@@ -1858,6 +2156,7 @@ impl Drop for RootOwner {
             digest_index: current.digest_index.clone(),
             adoption: current.adoption.clone(),
             frontier: current.frontier,
+            reservation: None,
         }));
     }
 }
@@ -1944,9 +2243,14 @@ impl RootHandle {
     /// memory—v1: Capture one immutable read phase for a request.
     ///
     /// Create this once at the request's first root read and borrow it across
-    /// participating modules. The identifier is diagnostic only.
+    /// participating modules. The identifier is diagnostic only. The read-phase
+    /// fence stamp is captured strictly before the request snapshot so no
+    /// begin->abort window on a touched rule set can hide between the two; a
+    /// poisoned fence table leaves the stamp absent and the phase cannot
+    /// produce a final ALLOW.
     pub fn begin_request(&self, request_id: Uuid) -> Result<RequestRootReader, RootError> {
         let runtime = self.runtime()?;
+        let fence_stamp = runtime.fences.try_capture_read_stamp().ok();
         let snapshot = runtime.current.load_full();
         match snapshot.metadata.status {
             RootStatus::Serving if snapshot.metadata.version == u64::MAX => {
@@ -1958,6 +2262,7 @@ impl RootHandle {
                     owner: Arc::downgrade(&runtime),
                     metadata: snapshot.metadata,
                 },
+                fence_stamp,
                 snapshot,
             }),
             status => Err(RootError::Unavailable(status)),
@@ -2306,6 +2611,15 @@ impl RequestRootReader {
         runtime.registry.validate_prepared_with_version(plan)
     }
 
+    /// memory—v1 §4.7: Return the read-phase fence stamp of this reader.
+    ///
+    /// `None` means the stamp could not be captured (poisoned fence table);
+    /// the final ALLOW recheck must then refuse the phase instead of trusting
+    /// the read stage.
+    pub(crate) fn read_fence_stamp(&self) -> Option<&FenceReadStamp> {
+        self.fence_stamp.as_ref()
+    }
+
     /// memory—v1 §4.6: Read a modification fence without waiting. An unavailable
     /// table is an error, never proof that the rule set is unfenced.
     pub fn is_fenced(&self, rule_set_id: BinaryId) -> Result<bool, RootError> {
@@ -2359,8 +2673,12 @@ impl RequestRootReader {
             .map_err(RootError::Candidate)?;
         let validation_ns = started.elapsed().as_nanos();
         let started = std::time::Instant::now();
-        let (rows, selections) = self.snapshot.objects.digest_inputs();
-        let digest = digest_candidate(&rows, &selections).map_err(RootError::Runtime)?;
+        let digest = self
+            .snapshot
+            .objects
+            .rebuild_source_digest()
+            .map_err(RootError::Runtime)?
+            .digest();
         let digest_ns = started.elapsed().as_nanos();
         if digest != self.snapshot.metadata.digest {
             return Err(RootError::InconsistentCandidate);
@@ -2446,9 +2764,20 @@ impl RequestRootReader {
             .owner
             .upgrade()
             .ok_or(RootError::OwnerGone)?;
+        // memory—v1: test-support-only LOCAL ABC probe. Captures the native
+        // attempt start only when this thread is armed; a failed `try_read`
+        // (normal run contention) records no sample.
+        #[cfg(feature = "test-support")]
+        let abc_read_wait_started = abc_lock_timing::wait_probe_start();
         let Ok(guard) = runtime.mutation_lock.try_read() else {
             return Ok(None);
         };
+        // memory—v1: probe shadow binding (test-support only). Wraps the
+        // native read guard so timing ends at the actual guard drop — the
+        // explicit early `drop(guard)` below and normal scope exit included.
+        // Purely observational; no logic or authorization change.
+        #[cfg(feature = "test-support")]
+        let guard = abc_lock_timing::TimedGuard::wrap(guard, abc_read_wait_started);
         let current = runtime.current.load_full();
         if current.metadata.status == RootStatus::Serving && current.metadata.version == u64::MAX {
             drop(guard);
@@ -2467,18 +2796,26 @@ impl RequestRootReader {
         let targets = exact_target.map_or(&[][..], |(_, targets)| targets);
         // The public dependency record is not a proof of complete coverage. Read
         // the actor card once and include every applicable binding independently.
-        if record.bindings.len() > MAX_FENCE_CHECK_OBJECTS
-            || targets.len() > MAX_FENCE_CHECK_OBJECTS
-        {
-            return Ok(None);
-        }
         let actor_card = self
             .snapshot
             .objects
             .unremoved_card_candidate(record.card_id)
             .map_err(RootError::Candidate)?
             .0;
+        let Some(items) = actor_card
+            .bindings
+            .len()
+            .checked_add(record.bindings.len())
+            .and_then(|n| n.checked_add(targets.len()))
+        else {
+            return Ok(None);
+        };
         let mut fence_dependencies = Vec::new();
+        if self.snapshot.objects.check_read_workspace(items).is_err()
+            || fence_dependencies.try_reserve_exact(items).is_err()
+        {
+            return Ok(None);
+        }
         fence_dependencies.extend(
             actor_card
                 .bindings
@@ -2495,15 +2832,19 @@ impl RequestRootReader {
         );
         fence_dependencies.sort_unstable();
         fence_dependencies.dedup();
-        if fence_dependencies.len() > MAX_FENCE_CHECK_OBJECTS {
+        // memory—v1 §4.7: the read-phase stamp is mandatory at the single
+        // ALLOW decision point. A reader without a stamp (poisoned fence
+        // table at capture time) can never pass the final recheck.
+        let Some(stamp) = self.read_fence_stamp() else {
             return Ok(None);
-        }
+        };
         let result = runtime
             .registry
             .try_with_active_version(record.registry_version, || {
-                runtime
-                    .fences
-                    .try_with_unfenced(&fence_dependencies, |unfenced| {
+                runtime.fences.try_with_unfenced_since_stamp(
+                    stamp,
+                    &fence_dependencies,
+                    |unfenced| {
                         let current = runtime.current.load_full();
                         if authority_id.is_some_and(|authority_id| {
                             !runtime
@@ -2634,6 +2975,9 @@ impl RequestRootReader {
                                     self.snapshot.objects.rule_set(*target),
                                     current.objects.rule_set(*target),
                                 ) {
+                                    // A created rule set has no served facts, but a
+                                    // fence opened on it during the read phase is
+                                    // still a touched modification window.
                                     (None, None) => {}
                                     (Some(_), Some(_)) => {
                                         let Some(generation) = self
@@ -2706,7 +3050,8 @@ impl RequestRootReader {
                             }
                         }
                         Ok(Some(f()))
-                    })
+                    },
+                )
             })
             .flatten()
             .unwrap_or(Ok(None));
@@ -3137,7 +3482,12 @@ impl RequestRootReader {
 }
 
 #[cfg(test)]
+mod source_slot_tests;
+
+#[cfg(test)]
 mod tests {
+    mod startup_tests;
+
     use super::*;
     use crate::memory_v1_db_rows::UserCardStatus;
     use crate::memory_v1_db_rows::{
@@ -3148,8 +3498,7 @@ mod tests {
 
     // memory—v1: Build an index from the exact rows in a synthetic snapshot.
     fn fixture_digest_index(objects: &HamtCandidate) -> DigestIndex {
-        let (rows, selections) = objects.digest_inputs();
-        digest_rows(&rows, &selections).unwrap()
+        objects.rebuild_source_digest().unwrap()
     }
 
     fn id(value: u8) -> BinaryId {
@@ -3212,7 +3561,7 @@ mod tests {
 
     // memory—v1: A candidate that passes the structural serving checks: a valid rule
     // body with its hash, one binding confirmation and one explicit selection.
-    fn serving_ready() -> (CandidateRows, Vec<CurrentSelection>) {
+    pub(super) fn serving_ready() -> (CandidateRows, Vec<CurrentSelection>) {
         use crate::memory_v1_rules::canonical_version_bytes;
         use sha2::{Digest, Sha256};
 
@@ -3262,7 +3611,7 @@ mod tests {
     }
 
     // memory—v1: Install the declarations used by the serving-ready fixture.
-    fn install_fixture_registry(owner: &RootOwner) {
+    pub(super) fn install_fixture_registry(owner: &RootOwner) {
         owner
             .install_registry(&[RegistryDeclaration {
                 resource: "document".to_owned(),
@@ -3537,6 +3886,7 @@ mod tests {
             digest_index: before.digest_index.clone(),
             adoption: None,
             frontier: GovernanceFrontier::Unproven,
+            reservation: None,
         });
         owner.runtime.current.store(Arc::clone(&corrupted));
         assert!(matches!(
@@ -3582,6 +3932,7 @@ mod tests {
             digest_index: before.digest_index.clone(),
             adoption: None,
             frontier: GovernanceFrontier::Unproven,
+            reservation: None,
         });
         owner.runtime.current.store(Arc::clone(&corrupted));
         assert!(matches!(
@@ -3635,6 +3986,7 @@ mod tests {
                 digest_index: before.digest_index.clone(),
                 adoption: None,
                 frontier: GovernanceFrontier::Unproven,
+                reservation: None,
             });
             owner.runtime.current.store(Arc::clone(&corrupted));
             assert!(matches!(
@@ -3745,6 +4097,7 @@ mod tests {
             digest_index: current.digest_index.clone(),
             adoption: current.adoption.clone(),
             frontier: current.frontier,
+            reservation: None,
         }));
         let limited = owner.handle().begin_request(Uuid::new_v4()).unwrap();
         assert!(matches!(
@@ -4016,6 +4369,7 @@ mod tests {
                     digest_index: before.digest_index.clone(),
                     adoption: before.adoption.clone(),
                     frontier: before.frontier,
+                    reservation: None,
                 });
                 owner.runtime.current.store(Arc::clone(&corrupted));
                 assert!(
@@ -4062,6 +4416,7 @@ mod tests {
                 digest_index: before.digest_index.clone(),
                 adoption: before.adoption.clone(),
                 frontier: before.frontier,
+                reservation: None,
             });
             owner.runtime.current.store(Arc::clone(&corrupted));
             assert!(matches!(
@@ -4096,6 +4451,7 @@ mod tests {
             objects,
             adoption: before.adoption.clone(),
             frontier: before.frontier,
+            reservation: None,
         }));
         let exhausted = owner.runtime.current.load_full();
         assert!(owner
@@ -4451,6 +4807,7 @@ mod tests {
             digest_index: original.digest_index.clone(),
             adoption: original.adoption.clone(),
             frontier: original.frontier,
+            reservation: None,
         });
         owner.runtime.current.store(Arc::clone(&limited));
         assert!(matches!(
@@ -4661,6 +5018,7 @@ mod tests {
                 digest_index: current.digest_index.clone(),
                 adoption: current.adoption.clone(),
                 frontier: current.frontier,
+                reservation: None,
             });
             owner.runtime.current.store(Arc::clone(&unavailable));
             let mutation = ManagementMutationV2::ConfirmationRevoke {
@@ -5044,19 +5402,9 @@ mod tests {
         };
         assert_eq!(reader.is_fenced(id(5)), Ok(false));
         assert_eq!(reader.recheck_dependencies(&record), Ok(true));
-        let metadata = owner.handle().metadata().unwrap();
-        let declaration = FenceDeclaration {
-            rule_set_version: vec![1],
-            root_version: metadata.version,
-            digest: metadata.digest,
-        };
-        owner.begin_modification_fence(id(5), &declaration).unwrap();
-        assert_eq!(reader.is_fenced(id(5)), Ok(true));
-        assert_eq!(reader.is_fenced(id(9)), Ok(false));
-        assert_eq!(reader.recheck_dependencies(&record), Ok(false));
-        owner.abort_modification_fence(id(5)).unwrap();
-        assert_eq!(reader.recheck_dependencies(&record), Ok(true));
 
+        // Contention semantics run before any window opens, so this read
+        // phase carries no fence history for its touched dependency.
         std::thread::scope(|threads| {
             let (held_tx, held_rx) = mpsc::channel();
             let (release_tx, release_rx) = mpsc::channel();
@@ -5088,6 +5436,23 @@ mod tests {
         assert_eq!(reader.is_fenced(id(5)), Ok(false));
         assert_eq!(reader.recheck_dependencies(&record), Ok(true));
 
+        // An observed live window refuses the touched dependency immediately
+        // and stays refused after release: the read-phase stamp records the
+        // opening even though nothing was published.
+        let metadata = owner.handle().metadata().unwrap();
+        let declaration = FenceDeclaration {
+            rule_set_version: vec![1],
+            root_version: metadata.version,
+            digest: metadata.digest,
+        };
+        owner.begin_modification_fence(id(5), &declaration).unwrap();
+        assert_eq!(reader.is_fenced(id(5)), Ok(true));
+        assert_eq!(reader.is_fenced(id(9)), Ok(false));
+        assert_eq!(reader.recheck_dependencies(&record), Ok(false));
+        owner.abort_modification_fence(id(5)).unwrap();
+        assert_eq!(reader.recheck_dependencies(&record), Ok(false));
+        assert_eq!(reader.is_fenced(id(5)), Ok(false));
+
         let runtime = Arc::clone(&owner.runtime);
         assert!(std::thread::spawn(move || {
             runtime.fences.with_table_lock_for_test(|| {
@@ -5100,6 +5465,8 @@ mod tests {
             reader.is_fenced(id(5)),
             Err(RootError::Runtime(RuntimeError::Poisoned))
         );
+        // The pre-poison reader also fails closed: its stamp can no longer be
+        // revalidated against a poisoned registry.
         assert_eq!(reader.recheck_dependencies(&record), Ok(false));
     }
 
@@ -5157,11 +5524,15 @@ mod tests {
         }));
         assert!(failure.is_err());
         owner.abort_modification_fence(ids.pop().unwrap()).unwrap();
+        // memory—v1 §4.7: this reader never declared a dependency on the
+        // released unrelated rule set, so the recovery remains available.
         assert_eq!(reader.recheck_dependencies(&record), Ok(true));
         owner.begin_modification_fence(id(5), &declaration).unwrap();
         assert_eq!(reader.recheck_dependencies(&record), Ok(false));
         owner.abort_modification_fence(id(5)).unwrap();
-        assert_eq!(reader.recheck_dependencies(&record), Ok(true));
+        // memory—v1 §4.7: the opened-and-released window on the same object
+        // stays refused for this read phase (begin->abort ABA).
+        assert_eq!(reader.recheck_dependencies(&record), Ok(false));
     }
 
     #[test]
@@ -5293,7 +5664,9 @@ mod tests {
         assert_eq!(reader.is_fenced(id(5)), Ok(true));
         assert_eq!(reader.recheck_dependencies(&record), Ok(false));
         owner.abort_modification_fence(id(5)).unwrap();
-        assert_eq!(reader.recheck_dependencies(&record), Ok(true));
+        // memory—v1 §4.7: the released window is still recorded against this
+        // reader's read-phase stamp; the same phase cannot re-allow id(5).
+        assert_eq!(reader.recheck_dependencies(&record), Ok(false));
 
         let stale = FenceDeclaration {
             root_version: metadata.version + 1,
@@ -5451,7 +5824,9 @@ mod tests {
         });
         assert_eq!(reader.recheck_dependencies(&record), Ok(false));
         owner.abort_modification_fence(id(5)).unwrap();
-        assert_eq!(reader.recheck_dependencies(&record), Ok(true));
+        // memory—v1 §4.7: opening during the final check already poisoned the
+        // phase; releasing the window does not revive the old ALLOW.
+        assert_eq!(reader.recheck_dependencies(&record), Ok(false));
     }
 
     #[test]
@@ -5538,6 +5913,7 @@ mod tests {
             digest_index: previous.digest_index.clone(),
             adoption: previous.adoption.clone(),
             frontier: previous.frontier,
+            reservation: None,
         }));
         let guard = owner.runtime.mutation_lock.read().unwrap();
         assert_eq!(reader.recheck_dependencies(&record), Ok(false));
@@ -5586,14 +5962,14 @@ mod tests {
             digest_index: current.digest_index.clone(),
             adoption: current.adoption.clone(),
             frontier: current.frontier,
+            reservation: None,
         }));
         assert_eq!(reader.recheck_dependencies(&unknown), Ok(false));
     }
 
     #[test]
-    // memory—v1: The capacity applies to distinct fence dependencies; target
-    // order and duplicates cannot hide an active fence or bypass the limit.
-    fn dependency_recheck_bounds_distinct_fence_targets() {
+    // memory—v1: Last-target windows invalidate a complete read even above the old ceiling.
+    fn dependency_recheck_covers_all_large_fence_targets() {
         let (input, selections) = serving_ready();
         let owner = RootRegistry::new()
             .install_candidate(input, selections, budget())
@@ -5616,7 +5992,7 @@ mod tests {
             id[15] = 200;
             id
         };
-        let mut targets: Vec<_> = (1..MAX_FENCE_CHECK_OBJECTS as u64)
+        let mut targets: Vec<_> = (1..FENCE_SAMPLE_WIDTH as u64)
             .rev()
             .map(target_id)
             .collect();
@@ -5630,22 +6006,39 @@ mod tests {
         };
         assert_eq!(check(&targets), Ok(Some(())));
 
-        let declaration = FenceDeclaration {
+        targets.push(targets[0]);
+        assert_eq!(check(&targets), Ok(Some(())));
+        *targets.last_mut().unwrap() = target_id(FENCE_SAMPLE_WIDTH as u64);
+        targets.push(targets[0]);
+        assert_eq!(check(&targets), Ok(Some(())));
+        // The actor already depends on id(5); a different target-only fence at the
+        // end must also be seen, including when it opens and closes mid-request.
+        let last = target_id(FENCE_SAMPLE_WIDTH as u64 + 1);
+        targets.push(last);
+        let d = FenceDeclaration {
             rule_set_version: vec![1],
             root_version: metadata.version,
             digest: metadata.digest,
         };
-        owner.begin_modification_fence(id(5), &declaration).unwrap();
+        let p = FencePremise {
+            selected_version: Some(vec![1]),
+            root_version: metadata.version,
+            digest: metadata.digest,
+        };
+        owner.runtime.fences.begin(last, &d, &p).unwrap();
         assert_eq!(check(&targets), Ok(None));
-        owner.abort_modification_fence(id(5)).unwrap();
-        assert_eq!(check(&targets), Ok(Some(())));
-
-        targets.push(targets[0]);
-        assert_eq!(check(&targets), Ok(Some(())));
-        *targets.last_mut().unwrap() = target_id(MAX_FENCE_CHECK_OBJECTS as u64);
+        owner.runtime.fences.abort(last).unwrap();
         assert_eq!(check(&targets), Ok(None));
-        targets.push(targets[0]);
-        assert_eq!(check(&targets), Ok(None));
+        let fresh = owner.handle().begin_request(Uuid::new_v4()).unwrap();
+        assert_eq!(
+            fresh.try_with_rechecked_dependencies_and_target(
+                &record,
+                Some((metadata, &targets)),
+                None,
+                || ()
+            ),
+            Ok(Some(()))
+        );
     }
 
     #[test]
@@ -5671,7 +6064,7 @@ mod tests {
             tenant_tree_version,
             registry_version,
         };
-        for count in [128, 1024, MAX_FENCE_CHECK_OBJECTS - 1] {
+        for count in [128, 1024, FENCE_SAMPLE_WIDTH - 1] {
             let targets: Vec<BinaryId> = (1..=count as u64)
                 .rev()
                 .map(|value| {
@@ -5783,6 +6176,7 @@ mod tests {
                 objects,
                 adoption: before.adoption.clone(),
                 frontier: before.frontier,
+                reservation: None,
             }));
             assert_eq!(
                 reader.recheck_dependencies(&record),
@@ -5832,6 +6226,7 @@ mod tests {
             objects,
             adoption: before.adoption.clone(),
             frontier: before.frontier,
+            reservation: None,
         }));
         assert_eq!(reader.recheck_dependencies(&record), Ok(false));
     }
@@ -5892,6 +6287,7 @@ mod tests {
             digest_index: original.digest_index.clone(),
             adoption: original.adoption.clone(),
             frontier: original.frontier,
+            reservation: None,
         }));
         assert_eq!(reader.recheck_dependencies(&record), Ok(true));
     }
@@ -5928,6 +6324,7 @@ mod tests {
             digest_index: previous.digest_index.clone(),
             adoption: previous.adoption.clone(),
             frontier: previous.frontier,
+            reservation: None,
         }));
         assert_eq!(
             owner.handle().metadata(),
@@ -5969,6 +6366,7 @@ mod tests {
             digest_index: previous.digest_index.clone(),
             adoption: previous.adoption.clone(),
             frontier: previous.frontier,
+            reservation: None,
         }));
         assert_eq!(owner.handle().metadata().unwrap(), metadata);
         let evidence = crate::memory_v1_adoption::AdoptionEvidence::complete_for_test(metadata);
@@ -6005,6 +6403,7 @@ mod tests {
             digest_index: previous.digest_index.clone(),
             adoption: previous.adoption.clone(),
             frontier: previous.frontier,
+            reservation: None,
         }));
         let evidence = crate::memory_v1_adoption::AdoptionEvidence::complete_for_test(metadata);
         owner.adopt_isolated_evidence(&evidence).unwrap();
@@ -6104,6 +6503,7 @@ mod tests {
                 digest_index: original.digest_index.clone(),
                 adoption: original.adoption.clone(),
                 frontier: original.frontier,
+                reservation: None,
             }));
             let reader = owner.handle().begin_request(Uuid::new_v4()).unwrap();
             let (tenant_tree_version, registry_version) = reader.dependency_versions().unwrap();
@@ -6237,6 +6637,7 @@ mod tests {
                 objects,
                 adoption: original.adoption.clone(),
                 frontier: original.frontier,
+                reservation: None,
             }));
             assert_eq!(reader.recheck_dependencies(&record), Ok(actor_result));
             assert_eq!(
@@ -6366,12 +6767,20 @@ mod tests {
                 objects = objects.append_version(historical).unwrap();
             }
             objects = objects.with_selection(id(5), selection).unwrap();
+            if selection.is_some() {
+                objects.compact_source(id(5)).unwrap();
+            }
+            let digest_index = fixture_digest_index(&objects);
             let malformed = Arc::new(RootSnapshot {
-                metadata: before.metadata,
-                digest_index: fixture_digest_index(&objects),
+                metadata: RootMetadata {
+                    digest: digest_index.digest(),
+                    ..before.metadata
+                },
+                digest_index,
                 objects,
                 adoption: before.adoption.clone(),
                 frontier: before.frontier,
+                reservation: None,
             });
             owner.runtime.current.store(Arc::clone(&malformed));
             (owner, malformed)
@@ -6422,6 +6831,40 @@ mod tests {
         );
         assert_eq!(metadata.status, RootStatus::Candidate);
     }
+    #[test]
+    // memory—v1: Repairing a diagnostic selection does not convert the archive digest.
+    fn repaired_diagnostic_candidate_requires_a_projected_cold_install() {
+        let (input, selections) = serving_ready();
+        let owner = RootRegistry::new()
+            .install_candidate(input, vec![], budget())
+            .unwrap();
+        install_fixture_registry(&owner);
+        let initial = owner.handle().metadata().unwrap();
+        let repaired = owner
+            .execute_mutation_with_precondition_for_isolated_tests(
+                &ManagementMutationV2::ContextLoad {
+                    rows: CandidateRows::default(),
+                    selections,
+                },
+                &MutationPrecondition {
+                    evaluated_root_version: initial.version,
+                },
+            )
+            .unwrap();
+        assert!(owner
+            .runtime
+            .current
+            .load()
+            .objects
+            .has_valid_current_pointers());
+        assert_eq!(
+            owner.adopt_serving_for_isolated_tests(),
+            Err(RootError::Candidate(CandidateError::InconsistentBinding))
+        );
+        assert_eq!(owner.handle().metadata().unwrap(), repaired);
+        assert_eq!(repaired.status, RootStatus::Candidate);
+    }
+
     #[test]
     // memory—v1: A serving snapshot cannot contain unregistered current rules.
     fn adoption_rechecks_registry_and_selected_history() {
@@ -7108,6 +7551,7 @@ mod tests {
             digest_index: candidate.digest_index.clone(),
             adoption: None,
             frontier: GovernanceFrontier::Unproven,
+            reservation: None,
         });
         owner.runtime.current.store(Arc::clone(&replacement));
 
@@ -7137,6 +7581,7 @@ mod tests {
             digest_index: candidate.digest_index.clone(),
             adoption: candidate.adoption.clone(),
             frontier: candidate.frontier,
+            reservation: None,
         });
         owner.runtime.current.store(Arc::clone(&replacement));
 
@@ -7167,6 +7612,7 @@ mod tests {
             digest_index: candidate.digest_index.clone(),
             adoption: None,
             frontier: GovernanceFrontier::Unproven,
+            reservation: None,
         }));
         let foreign = ServingAdoptionCertificate {
             instance_id: RootInstanceId(Uuid::new_v4()),
@@ -7253,6 +7699,7 @@ mod tests {
             objects,
             adoption: None,
             frontier: GovernanceFrontier::Unproven,
+            reservation: None,
         }));
         second
             .with_reader(|reader| {
@@ -7339,6 +7786,7 @@ mod tests {
             digest_index: previous.digest_index.clone(),
             adoption: None,
             frontier: GovernanceFrontier::Unproven,
+            reservation: None,
         }));
         drop(previous);
         let mut request = Box::pin(async move {
@@ -7394,6 +7842,7 @@ mod tests {
             digest_index: previous.digest_index.clone(),
             adoption: None,
             frontier: GovernanceFrontier::Unproven,
+            reservation: None,
         }));
         drop(previous);
         drop(scope);
@@ -7507,6 +7956,7 @@ mod tests {
             digest_index: stopped.digest_index.clone(),
             adoption: None,
             frontier: GovernanceFrontier::Unproven,
+            reservation: None,
         }));
         drop(stopped);
         let fresh = handle.begin_request(Uuid::new_v4()).unwrap();
@@ -7580,6 +8030,7 @@ mod tests {
             objects,
             adoption: None,
             frontier: GovernanceFrontier::Unproven,
+            reservation: None,
         }));
 
         let reader = context.reader().unwrap();
@@ -7631,6 +8082,7 @@ mod tests {
                     objects,
                     adoption: None,
                     frontier: GovernanceFrontier::Unproven,
+                    reservation: None,
                 }));
                 published.wait();
             });
@@ -7697,6 +8149,7 @@ mod tests {
             objects,
             adoption: before.adoption.clone(),
             frontier: before.frontier,
+            reservation: None,
         });
         let (locked_tx, locked_rx) = mpsc::channel();
         let (publish_tx, publish_rx) = mpsc::channel();
@@ -8425,9 +8878,8 @@ mod context_load_tests {
             Some(0)
         );
         assert!(reader.snapshot.objects.binding(id(20)).unwrap().is_none());
-        let (rows, selections) = fresh.objects.digest_inputs();
         assert_eq!(
-            digest_candidate(&rows, &selections).unwrap(),
+            fresh.objects.rebuild_source_digest().unwrap().digest(),
             fresh.metadata.digest
         );
     }
@@ -8486,8 +8938,10 @@ mod context_load_tests {
         assert_ne!(merged.digest, before.digest);
         assert_eq!(merged.row_count, before.row_count + 5);
         let live = owner.runtime.current.load_full();
-        let (rows, selections) = live.objects.digest_inputs();
-        assert_eq!(digest_candidate(&rows, &selections).unwrap(), merged.digest);
+        assert_eq!(
+            live.objects.rebuild_source_digest().unwrap().digest(),
+            merged.digest
+        );
         live.objects.validate_binding_indexes().unwrap();
         live.objects.validate_confirmation_indexes().unwrap();
         // The merge is idempotent at the identity level: the same block again

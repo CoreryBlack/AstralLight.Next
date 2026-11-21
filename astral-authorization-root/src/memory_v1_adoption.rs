@@ -6,9 +6,8 @@
 //!   snapshot identity, schema manifest, coverage, current selection, lifecycle,
 //!   confirmation authority, resource ownership, eligibility, separation of
 //!   duties, writer coverage, audit correlation, persistence and recovery) plus a
-//!   trusted time. It still has no constructor: the schema, snapshot manifest,
-//!   lifecycle, confirmation authority, writer inventory, audit and recovery
-//!   contracts are not implemented, so nothing can honestly mark them proven.
+//!   trusted time. Startup verifies independently signed report references
+//!   against the exact captured root and reconciles structural facts locally.
 //! * **Experimental** is an explicit, operator-acknowledged profile for an
 //!   isolated service run. It checks the caller's schema version and nonzero
 //!   fingerprint, compares the reported counts with the root's rows, and checks
@@ -192,10 +191,22 @@ pub struct ColdLoadFacts {
     pub captured_at_unix_seconds: i64,
 }
 
+impl ColdLoadFacts {
+    // memory—v1: Both adoption grades reconcile the full source, including
+    // verified historical version identities, not just resident version bodies.
+    fn covers_source(&self, counts: TableCounts, metadata: RootMetadata) -> bool {
+        counts == self.snapshot_counts
+            && counts == self.scanned_counts
+            && counts.total() == Some(metadata.row_count)
+    }
+}
+
+pub mod startup;
+
 /// How a serving root was adopted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdoptionGrade {
-    /// All thirteen fact families proven. No constructor exists yet.
+    /// All thirteen fact families proven against the exact candidate.
     Production,
     /// Operator-acknowledged limits; for an isolated service run only.
     Experimental,
@@ -266,6 +277,8 @@ pub enum AdoptionEvidenceError {
     InvalidBounds,
     #[error("memory-v1 adoption evidence uses unsupported contract version {0}")]
     UnsupportedSchemaVersion(u16),
+    #[error(transparent)]
+    Startup(#[from] startup::StartupEvidenceError),
 }
 
 /// The outcome of a successful evidence check, bound to one exact snapshot.
@@ -475,9 +488,7 @@ impl AdoptionEvidence {
                 EvidenceState::Unknown
             }
         };
-        let coverage = counts == facts.snapshot_counts
-            && counts == facts.scanned_counts
-            && counts.total() == Some(metadata.row_count);
+        let coverage = facts.covers_source(counts, metadata);
         let schema = facts.schema_contract_version == MEMORY_V1_CANDIDATE_SCHEMA_VERSION
             && facts.schema_fingerprint != [0; 32];
         Self {
@@ -502,6 +513,31 @@ impl AdoptionEvidence {
             writer_coverage: EvidenceState::Unverified,
             audit_correlation: EvidenceState::Unverified,
             persistence_recovery: EvidenceState::Unverified,
+        }
+    }
+
+    // memory—v1: Combine authenticated external reports with structural checks
+    // over the candidate. The external signature cannot waive any local check.
+    pub(crate) fn from_verified_startup(
+        metadata: RootMetadata,
+        counts: TableCounts,
+        valid_current_pointers: bool,
+        facts: &ColdLoadFacts,
+        verified: startup::VerifiedStartupEvidence,
+    ) -> Self {
+        Self {
+            source_provenance: EvidenceState::Proven,
+            snapshot_identity: EvidenceState::Proven,
+            lifecycle_and_validity: EvidenceState::Proven,
+            confirmation_authority: EvidenceState::Proven,
+            resource_ownership: EvidenceState::Proven,
+            eligibility: EvidenceState::Proven,
+            separation_of_duties: EvidenceState::Proven,
+            writer_coverage: EvidenceState::Proven,
+            audit_correlation: EvidenceState::Proven,
+            persistence_recovery: EvidenceState::Proven,
+            trusted_time_unix_seconds: Some(verified.trusted_time),
+            ..Self::from_cold_load(metadata, counts, valid_current_pointers, facts)
         }
     }
 
@@ -541,36 +577,30 @@ impl AdoptionEvidence {
     }
 }
 
-/// A sealed fact supplied by one independent evidence owner for one family.
-///
-/// The type is deliberately empty of constructors in this module: only the
-/// family-specific owner functions below can produce a `Proven` fact, and each
-/// of those checks its own postcondition before returning one. A caller cannot
-/// forge `Proven` by naming a family without running its check.
+/// A family declaration. Naming a family is not independent evidence: this
+/// value can model an assumption on an isolated test root, never establish a
+/// fact on the process root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProvenFamily {
     family: AdoptionLimit,
 }
 
 impl ProvenFamily {
-    /// The family this sealed fact proves; diagnostics only.
+    /// The declared family; diagnostics only.
     pub const fn family(self) -> AdoptionLimit {
         self.family
     }
 
-    /// memory—v1: Seal one fact for exactly the named family. The caller still
-    /// must run its own owner check; this constructor only binds the fact to
-    /// the family so a later verifier cannot misattribute it.
+    /// memory—v1: Declare a family by name. Even a matching declaration does
+    /// not attest that family's postcondition on the process root.
     pub const fn proven_for(family: AdoptionLimit) -> Self {
         Self { family }
     }
 }
 
-/// One complete production-evidence bundle assembled by the composition owner.
-///
-/// Every mandatory family must carry a sealed [`ProvenFamily`] produced by its
-/// own check; anything absent keeps that family `Unknown` and fails adoption.
-/// This type has no constructor that maps booleans into `Proven`.
+/// Inputs to the production gate. The root re-derives structural facts from
+/// the candidate. The public family declarations are not independent proofs.
+#[derive(Default)]
 pub struct ProductionEvidenceInput {
     source_provenance: Option<ProvenFamily>,
     snapshot_identity: Option<ProvenFamily>,
@@ -582,87 +612,67 @@ pub struct ProductionEvidenceInput {
     writer_coverage: Option<ProvenFamily>,
     audit_correlation: Option<ProvenFamily>,
     persistence_recovery: Option<ProvenFamily>,
-    /// The trusted clock observation, nonnegative Unix seconds. The contract
-    /// requires the issuer to have checked the same clock source it will use
-    /// for commit fences; the adoption verifier rejects only negatives here.
-    trusted_time_unix_seconds: i64,
-}
-
-impl Default for ProductionEvidenceInput {
-    /// An empty bundle fails adoption; families are added one at a time.
-    fn default() -> Self {
-        Self {
-            source_provenance: None,
-            snapshot_identity: None,
-            lifecycle_and_validity: None,
-            confirmation_authority: None,
-            resource_ownership: None,
-            eligibility: None,
-            separation_of_duties: None,
-            writer_coverage: None,
-            audit_correlation: None,
-            persistence_recovery: None,
-            trusted_time_unix_seconds: 0,
-        }
-    }
+    /// A caller-supplied timestamp is not a trusted clock observation on the
+    /// process root. Absence must not be represented as Unix epoch zero.
+    trusted_time_unix_seconds: Option<i64>,
 }
 
 impl ProductionEvidenceInput {
-    /// Attach a sealed source-provenance fact from its owner.
+    /// Record the caller's source-provenance declaration.
     pub fn with_source_provenance(&mut self, fact: ProvenFamily) -> &mut Self {
         self.source_provenance = Some(fact);
         self
     }
 
-    /// Attach a sealed consistent-snapshot-identity fact from its owner.
+    /// Record the caller's consistent-snapshot-identity declaration.
     pub fn with_snapshot_identity(&mut self, fact: ProvenFamily) -> &mut Self {
         self.snapshot_identity = Some(fact);
         self
     }
 
-    /// Attach a sealed lifecycle-and-validity fact from its owner.
+    /// Record the caller's lifecycle-and-validity declaration.
     pub fn with_lifecycle_and_validity(&mut self, fact: ProvenFamily) -> &mut Self {
         self.lifecycle_and_validity = Some(fact);
         self
     }
 
-    /// Attach a sealed confirmation-authority fact from its owner.
+    /// Record the caller's confirmation-authority declaration.
     pub fn with_confirmation_authority(&mut self, fact: ProvenFamily) -> &mut Self {
         self.confirmation_authority = Some(fact);
         self
     }
 
-    /// Attach a sealed resource-ownership fact from its owner.
+    /// Record the caller's resource-ownership declaration.
     pub fn with_resource_ownership(&mut self, fact: ProvenFamily) -> &mut Self {
         self.resource_ownership = Some(fact);
         self
     }
 
-    /// Attach a sealed eligibility fact from its owner.
+    /// Record the caller's eligibility declaration.
     pub fn with_eligibility(&mut self, fact: ProvenFamily) -> &mut Self {
         self.eligibility = Some(fact);
         self
     }
 
-    /// Attach a sealed separation-of-duties fact from its owner.
+    /// Record the caller's separation-of-duties declaration.
     pub fn with_separation_of_duties(&mut self, fact: ProvenFamily) -> &mut Self {
         self.separation_of_duties = Some(fact);
         self
     }
 
-    /// Attach a sealed writer-coverage fact from its owner.
+    /// Record the caller's writer-coverage declaration.
     pub fn with_writer_coverage(&mut self, fact: ProvenFamily) -> &mut Self {
         self.writer_coverage = Some(fact);
         self
     }
 
-    /// Attach a sealed audit-correlation fact from its owner.
+    /// Record the caller's audit-correlation declaration.
     pub fn with_audit_correlation(&mut self, fact: ProvenFamily) -> &mut Self {
         self.audit_correlation = Some(fact);
         self
     }
 
-    /// Attach a sealed persistence-and-recovery fact from its owner.
+    /// Record the caller's persistence-and-recovery declaration.
     pub fn with_persistence_recovery(&mut self, fact: ProvenFamily) -> &mut Self {
         self.persistence_recovery = Some(fact);
         self
@@ -670,23 +680,20 @@ impl ProductionEvidenceInput {
 
     /// Record the trusted clock observation for this bundle.
     pub fn with_trusted_time(&mut self, unix_seconds: i64) -> &mut Self {
-        self.trusted_time_unix_seconds = unix_seconds;
+        self.trusted_time_unix_seconds = Some(unix_seconds);
         self
     }
 
-    /// Derive complete production evidence for one exact candidate.
-    ///
-    /// The structural families (schema manifest, coverage, current selection)
-    /// are verified against the root's own rows exactly as in the experimental
-    /// path; they cannot be sealed by the caller because the root re-derives
-    /// them. Every sealed family becomes `Proven`; every missing family stays
-    /// `Unknown` and fails adoption later, listing the exact gaps.
-    fn build_evidence(
+    /// memory—v1: Reconcile structural facts with the held candidate. Until
+    /// independent evidence owners exist, declarations by name are assumptions
+    /// usable only on a root installed by the isolated fixture registry.
+    pub(crate) fn production_evidence(
         &self,
         metadata: RootMetadata,
         counts: TableCounts,
         valid_current_pointers: bool,
         facts: &ColdLoadFacts,
+        isolated_fixture: bool,
     ) -> AdoptionEvidence {
         let proven_if = |holds: bool| {
             if holds {
@@ -695,14 +702,12 @@ impl ProductionEvidenceInput {
                 EvidenceState::Unknown
             }
         };
-        let coverage = counts == facts.snapshot_counts
-            && counts == facts.scanned_counts
-            && counts.total() == Some(metadata.row_count);
+        let coverage = facts.covers_source(counts, metadata);
         let schema = facts.schema_contract_version == MEMORY_V1_CANDIDATE_SCHEMA_VERSION
             && facts.schema_fingerprint != [0; 32];
-        let sealed = |family: Option<ProvenFamily>, limit: AdoptionLimit| {
+        let declared = |family: Option<ProvenFamily>, limit: AdoptionLimit| {
             match family {
-                Some(fact) if fact.family() == limit => EvidenceState::Proven,
+                Some(fact) if isolated_fixture && fact.family() == limit => EvidenceState::Proven,
                 // A mismatched or absent fact is an unknown, never a proven value.
                 _ => EvidenceState::Unknown,
             }
@@ -715,51 +720,33 @@ impl ProductionEvidenceInput {
             row_count: metadata.row_count,
             adoption_schema_version: MEMORY_V1_ADOPTION_SCHEMA_VERSION,
             issuer: EvidenceIssuer::Production,
-            source_provenance: sealed(self.source_provenance, AdoptionLimit::SourceProvenance),
-            snapshot_identity: sealed(self.snapshot_identity, AdoptionLimit::SnapshotIdentity),
+            source_provenance: declared(self.source_provenance, AdoptionLimit::SourceProvenance),
+            snapshot_identity: declared(self.snapshot_identity, AdoptionLimit::SnapshotIdentity),
             schema_manifest: proven_if(schema),
             complete_coverage: proven_if(coverage),
             current_selection: proven_if(valid_current_pointers),
-            lifecycle_and_validity: sealed(
+            lifecycle_and_validity: declared(
                 self.lifecycle_and_validity,
                 AdoptionLimit::LifecycleAndValidity,
             ),
-            confirmation_authority: sealed(
+            confirmation_authority: declared(
                 self.confirmation_authority,
                 AdoptionLimit::ConfirmationAuthority,
             ),
-            resource_ownership: sealed(self.resource_ownership, AdoptionLimit::ResourceOwnership),
-            eligibility: sealed(self.eligibility, AdoptionLimit::Eligibility),
-            separation_of_duties: sealed(
+            resource_ownership: declared(self.resource_ownership, AdoptionLimit::ResourceOwnership),
+            eligibility: declared(self.eligibility, AdoptionLimit::Eligibility),
+            separation_of_duties: declared(
                 self.separation_of_duties,
                 AdoptionLimit::SeparationOfDuties,
             ),
-            trusted_time_unix_seconds: Some(self.trusted_time_unix_seconds),
-            writer_coverage: sealed(self.writer_coverage, AdoptionLimit::WriterCoverage),
-            audit_correlation: sealed(self.audit_correlation, AdoptionLimit::AuditCorrelation),
-            persistence_recovery: sealed(
+            trusted_time_unix_seconds: self.trusted_time_unix_seconds.filter(|_| isolated_fixture),
+            writer_coverage: declared(self.writer_coverage, AdoptionLimit::WriterCoverage),
+            audit_correlation: declared(self.audit_correlation, AdoptionLimit::AuditCorrelation),
+            persistence_recovery: declared(
                 self.persistence_recovery,
                 AdoptionLimit::PersistenceRecovery,
             ),
         }
-    }
-}
-
-impl AdoptionEvidence {
-    /// Build complete production evidence for one exact candidate snapshot.
-    ///
-    /// This is the single production-grade construction entry point. The
-    /// structural families are re-derived from the candidate's own rows; the
-    /// ten remaining families must carry sealed facts from their independent
-    /// owners, or adoption fails naming the gaps.
-    pub(crate) fn production(
-        metadata: RootMetadata,
-        counts: TableCounts,
-        valid_current_pointers: bool,
-        facts: &ColdLoadFacts,
-        input: &ProductionEvidenceInput,
-    ) -> Self {
-        input.build_evidence(metadata, counts, valid_current_pointers, facts)
     }
 }
 

@@ -22,6 +22,10 @@ use super::memory_v1_session::{
     SessionFreshnessBindingError, VerifiedSessionFacts,
 };
 
+mod cleanup;
+
+use cleanup::{CleanupHint, CleanupPlan};
+
 const CREDENTIAL_PREFIX: &str = "m1.";
 const MAX_ACTIVE_SESSIONS: usize = 100_000;
 
@@ -37,6 +41,7 @@ struct SessionState {
     records: HashMap<[u8; 32], SessionRecord>,
     max_records: usize,
     last_issue_clock: Option<i64>,
+    cleanup: CleanupHint,
 }
 
 struct IdentityProofState;
@@ -188,6 +193,7 @@ impl MemoryV1SessionAuthority {
                 records: HashMap::new(),
                 max_records: MAX_ACTIVE_SESSIONS,
                 last_issue_clock: None,
+                cleanup: CleanupHint::default(),
             })),
             identity_proof_state: Arc::new(IdentityProofState),
             authority_id: Arc::new(SessionAuthorityToken::new()),
@@ -272,13 +278,18 @@ impl MemoryV1SessionAuthority {
             .write()
             .map_err(|_| MutationError::CardDisableRequiresSessionCoordinator)?;
         let result = publish()?;
+        let mut revoked = false;
         for record in state.records.values_mut() {
             if !record.revoked
                 && record.facts.candidate_identity().user_card_id.into_bytes() == user_card_id
             {
                 record.revocation_generation = record.revocation_generation.saturating_add(1);
                 record.revoked = true;
+                revoked = true;
             }
+        }
+        if revoked {
+            state.cleanup.note_revocation();
         }
         Ok(result)
     }
@@ -323,6 +334,7 @@ impl MemoryV1SessionAuthority {
             }
         }
         if exhausted {
+            state.cleanup.note_revocation();
             for record in state.records.values_mut() {
                 if !record.revoked && record.facts.candidate_identity().user_card_id == user_card_id
                 {
@@ -339,6 +351,9 @@ impl MemoryV1SessionAuthority {
             user_card_id.into_bytes(),
             expected,
             || {
+                if count != 0 {
+                    state.cleanup.note_revocation();
+                }
                 for record in state.records.values_mut() {
                     if !record.revoked
                         && record.facts.candidate_identity().user_card_id == user_card_id
@@ -461,9 +476,13 @@ impl MemoryV1SessionIssuer {
             .state
             .write()
             .map_err(|_| MemoryV1SessionAuthorityError::Unavailable)?;
-        Self::prune_expired(&mut state, now_unix_seconds);
-        Self::reserve_issued(&mut state, digest)?;
+        if let Some(cleanup) = CleanupPlan::prepare(&state, now_unix_seconds)? {
+            cleanup.apply(&mut state, None);
+        }
+        Self::reserve_issued(&mut state, digest, None)?;
+        let expiry = record.facts.expires_at_unix_seconds();
         Self::insert_prepared(&mut state, digest, record);
+        state.cleanup.note_expiry(expiry);
         Ok(issued)
     }
 
@@ -496,30 +515,9 @@ impl MemoryV1SessionIssuer {
             if !record.facts.valid_at(observed) {
                 return Err(MemoryV1SessionAuthorityError::Unavailable);
             }
-            let cleanup_time = now_unix_seconds;
-            let mut expired = Vec::new();
-            expired
-                .try_reserve(state.records.len())
-                .map_err(|_| MemoryV1SessionAuthorityError::CapacityExhausted)?;
-            expired.extend(
-                state
-                    .records
-                    .iter()
-                    .filter(|(_, record)| {
-                        record.revoked || record.facts.expires_at_unix_seconds() <= cleanup_time
-                    })
-                    .map(|(digest, _)| *digest),
-            );
-            if state.records.len() - expired.len() >= state.max_records {
-                return Err(MemoryV1SessionAuthorityError::CapacityExhausted);
-            }
-            if state.records.contains_key(&digest) {
-                return Err(MemoryV1SessionAuthorityError::Unavailable);
-            }
-            state
-                .records
-                .try_reserve(1)
-                .map_err(|_| MemoryV1SessionAuthorityError::CapacityExhausted)?;
+            let cleanup = CleanupPlan::prepare(&state, now_unix_seconds)?;
+            Self::reserve_issued(&mut state, digest, cleanup.as_ref())?;
+            let expiry = record.facts.expires_at_unix_seconds();
             let issued = reader
                 .try_with_current_login_card(identity, &self.authority_id, || {
                     let final_time = clock
@@ -537,8 +535,10 @@ impl MemoryV1SessionIssuer {
                 .ok_or(MemoryV1SessionAuthorityError::Unavailable)??;
             // The session writer keeps the temporary extra record invisible.
             // Cleanup occurs only after the root lock has been released.
-            for expired_digest in expired {
-                state.records.remove(&expired_digest);
+            if let Some(cleanup) = cleanup {
+                cleanup.apply(&mut state, Some(expiry));
+            } else {
+                state.cleanup.note_expiry(expiry);
             }
             Ok(issued)
         })
@@ -592,21 +592,13 @@ impl MemoryV1SessionIssuer {
         Ok((digest, record, MemoryV1IssuedSession { credential }))
     }
 
-    // memory—v1: Fixture-only cleanup uses the explicitly supplied test clock.
-    #[cfg(any(test, feature = "test-support"))]
-    fn prune_expired(state: &mut SessionState, now_unix_seconds: i64) {
-        state.records.retain(|_, record| {
-            !record.revoked && record.facts.expires_at_unix_seconds() > now_unix_seconds
-        });
-    }
-
-    // memory—v1: Fixture-only capacity reservation for unchecked issuance.
-    #[cfg(any(test, feature = "test-support"))]
+    // memory—v1: Reserve capacity after accounting for the verified cleanup list.
     fn reserve_issued(
         state: &mut SessionState,
         digest: [u8; 32],
+        cleanup: Option<&CleanupPlan>,
     ) -> Result<(), MemoryV1SessionAuthorityError> {
-        if state.records.len() >= state.max_records {
+        if state.records.len() - cleanup.map_or(0, CleanupPlan::len) >= state.max_records {
             return Err(MemoryV1SessionAuthorityError::CapacityExhausted);
         }
         if state.records.contains_key(&digest) {
@@ -652,6 +644,9 @@ impl MemoryV1SessionIssuer {
                 record.revoked = true;
             }
         }
+        if count != 0 {
+            state.cleanup.note_revocation();
+        }
         if exhausted {
             Err(MemoryV1SessionAuthorityError::RevocationGenerationExhausted)
         } else {
@@ -674,15 +669,16 @@ impl MemoryV1SessionIssuer {
         if record.revoked {
             return Ok(());
         }
-        let next = record.revocation_generation.checked_add(1);
-        record.revoked = true;
-        match next {
+        let result = match record.revocation_generation.checked_add(1) {
             Some(generation) => {
                 record.revocation_generation = generation;
                 Ok(())
             }
             None => Err(MemoryV1SessionAuthorityError::RevocationGenerationExhausted),
-        }
+        };
+        record.revoked = true;
+        state.cleanup.note_revocation();
+        result
     }
 }
 
@@ -697,6 +693,7 @@ impl MemoryV1SessionVerifier {
                 records: HashMap::new(),
                 max_records: MAX_ACTIVE_SESSIONS,
                 last_issue_clock: None,
+                cleanup: CleanupHint::default(),
             })),
             authority_id: Arc::new(SessionAuthorityToken::new()),
         }
@@ -954,6 +951,9 @@ mod tests {
     use crate::memory_v1_root::{install_process_root, RootHandle, RootOwner};
     use std::sync::OnceLock;
     use uuid::Uuid;
+
+    #[cfg(feature = "test-support")]
+    mod cleanup_contention;
 
     fn identity() -> CandidateIdentity {
         CandidateIdentity {
@@ -2283,6 +2283,51 @@ mod tests {
                 .issue(proof, 100, 30),
             Err(MemoryV1SessionAuthorityError::ForeignIdentityProof)
         ));
+    }
+
+    // memory—v1: Each revocation path must independently make cleanup eligible.
+    #[test]
+    fn cleanup_hint_tracks_expiry_and_each_revocation_path() {
+        for path in 0..3 {
+            let authority = MemoryV1SessionAuthority::new();
+            let adapter = authority.identity_session_adapter();
+            let verifier = authority.verifier();
+            let live = issue_for_card(&adapter, 4, 100);
+            let revoked = issue_for_card(&adapter, 3, 100);
+            assert!(CleanupPlan::prepare(&authority.state.read().unwrap(), 399)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                CleanupPlan::prepare(&authority.state.read().unwrap(), 400)
+                    .unwrap()
+                    .unwrap()
+                    .len(),
+                2,
+            );
+
+            match path {
+                0 => adapter.revoke(revoked.credential()).unwrap(),
+                1 => assert_eq!(adapter.revoke_sessions_for_user_card(card_id(3)), Ok(1)),
+                2 => authority.publish_card_disable([3; 16], || Ok(())).unwrap(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                verifier.verify(revoked.credential(), 110),
+                Err(MemoryV1SessionAuthorityError::Revoked),
+            );
+            authority.state.write().unwrap().max_records = 2;
+            let fresh = issue_for_card(&adapter, 3, 110);
+            assert_eq!(
+                verifier.verify(revoked.credential(), 110),
+                Err(MemoryV1SessionAuthorityError::InvalidCredential),
+            );
+            assert!(verifier.verify(live.credential(), 110).is_ok());
+            assert!(verifier.verify(fresh.credential(), 110).is_ok());
+            let state = authority.state.read().unwrap();
+            assert_eq!(state.records.len(), 2);
+            assert!(CleanupPlan::prepare(&state, 399).unwrap().is_none());
+            assert_eq!(CleanupPlan::prepare(&state, 400).unwrap().unwrap().len(), 1);
+        }
     }
 
     #[test]

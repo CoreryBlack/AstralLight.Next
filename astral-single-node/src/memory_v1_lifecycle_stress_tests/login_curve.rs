@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{ensure, Context, Result};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Instant};
 
@@ -194,6 +194,7 @@ fn response_token(body: &Value) -> Option<&str> {
 struct Samples {
     ok_rtt_us: Vec<u64>,
     non_200: BTreeMap<u16, usize>,
+    non_200_reasons: BTreeMap<String, usize>,
     timeouts: usize,
     transport_errors: usize,
     invalid_200: usize,
@@ -208,6 +209,9 @@ impl Samples {
         self.ok_rtt_us.extend(worker.ok_rtt_us);
         for (status, count) in worker.non_200 {
             *self.non_200.entry(status).or_default() += count;
+        }
+        for (reason, count) in worker.non_200_reasons {
+            *self.non_200_reasons.entry(reason).or_default() += count;
         }
         self.timeouts += worker.timeouts;
         self.transport_errors += worker.transport_errors;
@@ -231,6 +235,7 @@ impl Samples {
                 "attempts": self.ok_rtt_us.len() + non_200_count + self.timeouts + self.transport_errors,
                 "http_200": q.count, "ok": ok, "invalid_200": self.invalid_200,
                 "non_200_count": non_200_count, "non_200_by_status": self.non_200,
+                "non_200_by_reason": self.non_200_reasons,
                 "timeouts": self.timeouts, "transport_errors": self.transport_errors,
                 "late": self.late, "late_ok": self.late_ok,
                 "ok_per_sec": ok as f64 / WINDOW.as_secs_f64(),
@@ -277,7 +282,15 @@ async fn sample(class: Class, request: RequestBuilder, deadline: Instant) -> Sam
                     samples.late_ok += usize::from(late);
                 }
             }
-            Ok((status, _)) => *samples.non_200.entry(status.as_u16()).or_default() += 1,
+            Ok((status, body)) => {
+                *samples.non_200.entry(status.as_u16()).or_default() += 1;
+                let body = serde_json::from_slice::<Value>(body.as_ref()).unwrap_or(Value::Null);
+                let reason = body["reasonCode"].as_str().unwrap_or("UNCLASSIFIED");
+                *samples
+                    .non_200_reasons
+                    .entry(reason.to_owned())
+                    .or_default() += 1;
+            }
             Err(error) if error.is_timeout() => samples.timeouts += 1,
             Err(_) => samples.transport_errors += 1,
         }
@@ -291,92 +304,57 @@ pub(super) async fn measure(addr: SocketAddr, cell: Cell) -> Result<()> {
         addr.ip().is_loopback(),
         "login curve requires loopback HTTP"
     );
-    let endpoints = std::sync::Arc::new(Endpoints {
+    let endpoints = Endpoints {
         login: format!("http://{addr}{LOGIN}"),
         registry: format!("http://{addr}{REGISTRY}"),
         registry_len: registry_declarations().len(),
-    });
-    // Issue the same one ALLOW session even for login-only cells to keep the
-    // pre-cell setup comparable. Only the reader workers use this session.
-    let setup_client = client()?;
-    let token: std::sync::Arc<str> = endpoints
-        .warm_login(
-            &setup_client,
-            endpoints.login_request(&setup_client, CARD_ALLOW),
-        )
-        .await?
-        .into();
-    drop(setup_client);
+    };
+    // A warm login also validates its bearer with a registry read. Prepare the
+    // clients serially so those fixture checks cannot contend with other logins.
+    // Any warm-up failure still fails the cell; only sampling is concurrent.
+    let requests = timeout(WARMUP_TIMEOUT, async {
+        let setup_client = client()?;
+        let token = endpoints
+            .warm_login(
+                &setup_client,
+                endpoints.login_request(&setup_client, CARD_ALLOW),
+            )
+            .await?;
+        let mut requests = Vec::with_capacity(cell.readers + cell.logins);
+        for _ in 0..cell.readers {
+            let client = client()?;
+            let request = endpoints.read_request(&client, &token);
+            endpoints
+                .warm_read(request.try_clone().expect("replayable fixture request"))
+                .await?;
+            requests.push((Class::Read, request));
+        }
+        for _ in 0..cell.logins {
+            let client = client()?;
+            let request = endpoints.login_request(&client, CARD_BOB);
+            endpoints
+                .warm_login(
+                    &client,
+                    request.try_clone().expect("replayable fixture request"),
+                )
+                .await?;
+            requests.push((Class::Login, request));
+        }
+        Ok::<_, anyhow::Error>(requests)
+    })
+    .await
+    .context("login curve warm-up exceeded its budget")??;
 
-    let workers = cell.readers + cell.logins;
-    let (ready_tx, mut ready_rx) = mpsc::channel(workers);
     let (start_tx, start_rx) = watch::channel(None::<Instant>);
     let mut jobs = JoinSet::new();
-    for index in 0..workers {
-        let class = if index < cell.readers {
-            Class::Read
-        } else {
-            Class::Login
-        };
-        let endpoints = endpoints.clone();
-        let token = token.clone();
-        let ready_tx = ready_tx.clone();
+    for (class, request) in requests {
         let mut start_rx = start_rx.clone();
         jobs.spawn(async move {
-            let warm = async {
-                let client = client()?;
-                match class {
-                    Class::Read => {
-                        let request = endpoints.read_request(&client, &token);
-                        endpoints
-                            .warm_read(request.try_clone().expect("replayable fixture request"))
-                            .await?;
-                        Ok::<_, anyhow::Error>(request)
-                    }
-                    Class::Login => {
-                        let request = endpoints.login_request(&client, CARD_BOB);
-                        endpoints
-                            .warm_login(
-                                &client,
-                                request.try_clone().expect("replayable fixture request"),
-                            )
-                            .await?;
-                        Ok(request)
-                    }
-                }
-            }
-            .await;
-            let request = match warm {
-                Ok(request) => request,
-                Err(error) => {
-                    let _ = ready_tx.send(Err(error)).await;
-                    return None;
-                }
-            };
-            ready_tx.send(Ok(())).await.ok()?;
-            drop(ready_tx);
             let deadline = (*start_rx.wait_for(Option::is_some).await.ok()?)?;
             Some((class, sample(class, request, deadline).await))
         });
     }
-    drop(ready_tx);
     drop(start_rx);
-    let ready = timeout(WARMUP_TIMEOUT, async {
-        for _ in 0..workers {
-            ready_rx
-                .recv()
-                .await
-                .context("curve worker exited during warm-up")??;
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await
-    .context("login curve warm-up exceeded its budget")
-    .and_then(|result| result);
-    if let Err(error) = ready {
-        jobs.shutdown().await;
-        return Err(error);
-    }
 
     let deadline = Instant::now() + WINDOW;
     start_tx

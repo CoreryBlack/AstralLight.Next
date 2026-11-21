@@ -149,18 +149,29 @@ impl PreparedGovernedMutation<'_> {
         self.before.frontier
     }
 
-    /// memory—v1: The composition may attach only the successive, verified
-    /// journal boundary to this exact successor. The proof is checked by the
-    /// composition against the durable receipt before calling this method.
-    pub fn publish_with_prefix(
+    /// memory—v1: Publish the prevalidated successor together with the
+    /// governance position and the complete reserved journal record of this
+    /// exact mutation, in one CAS.
+    ///
+    /// The successor snapshot publishes the facts, the frontier and the
+    /// complete reserved frame together; the reservation is retrievable from
+    /// the published snapshot through
+    /// [`RootOwner::published_governance_record`], so the record the
+    /// composition writes after this publication is the one the snapshot
+    /// itself claims. The composition verifies the written record against
+    /// the reservation and confirms the local durable prefix before any
+    /// success response. No journal byte is written by this method.
+    pub fn publish_with_reserved_record(
         &self,
         prefix: GovernancePrefix,
+        reservation: crate::memory_v1_root::ReservedGovernanceRecord,
     ) -> Result<RootMetadata, MutationError> {
         if !prefix.follows(self.before.frontier) {
             return Err(MutationError::ConcurrentModification);
         }
         self.publish_snapshot(Arc::new(RootSnapshot {
             frontier: GovernanceFrontier::Published(prefix),
+            reservation: Some(reservation),
             ..self.next.snapshot.as_ref().clone()
         }))
     }

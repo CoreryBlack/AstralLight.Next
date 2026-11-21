@@ -4,19 +4,13 @@
 //! private until the owner publishes it with the corresponding candidate and
 //! metadata. It is not evidence of source provenance or persistence.
 
-use std::collections::BTreeSet;
-
-use crate::memory_v1_digest::{Change, DigestAdditions, DigestIndex, Key};
+use crate::memory_v1_digest::{Change, DigestAdditions, DigestIndex};
 use crate::memory_v1_hamt::HamtCandidate;
 use crate::memory_v1_hamt_runtime::{
     binding_change, card_change, change_confirmation_change, confirmation_change, rule_set_change,
-    version_change, visit_context_changes, RuntimeError,
+    visit_context_changes, RuntimeError,
 };
 use crate::memory_v1_root::{ManagementMutationV2, MutationError};
-
-// DigestIndex::prepare bounds individual batches at 128 changes. Preparing
-// several batches on a private clone preserves all-or-nothing publication.
-const DIGEST_BATCH_SIZE: usize = 128;
 
 // memory—v1: Bind each mutation's exact resulting rows to the existing index.
 pub(crate) fn prepare_root_digest(
@@ -66,12 +60,20 @@ pub(crate) fn prepare_root_digest(
             changes.push(change_confirmation_change(confirmation));
         }
         ManagementMutationV2::ConfirmationBatch { rows } => {
+            // memory—v1: A governed confirmation batch is insert-only. Stage its checked
+            // successor rows directly; a duplicate anywhere rejects the entire private batch.
+            let mut additions = DigestAdditions::new(current);
             for row in rows {
                 let confirmation = next
                     .confirmation(row.confirmation_id)
                     .ok_or_else(inconsistent)?;
-                changes.push(confirmation_change(confirmation));
+                additions
+                    .push(confirmation_change(confirmation))
+                    .map_err(|error| MutationError::Runtime(RuntimeError::Digest(error)))?;
             }
+            return additions
+                .finish()
+                .map_err(|error| MutationError::Runtime(RuntimeError::Digest(error)));
         }
         ManagementMutationV2::UserCardCreate { row } => {
             let card = next.user_card(row.user_card_id).ok_or_else(inconsistent)?;
@@ -99,7 +101,7 @@ pub(crate) fn prepare_root_digest(
                 .change_confirmation(change_confirmation.confirmation_id)
                 .ok_or_else(inconsistent)?;
             changes.push(rule_set_change(rule_set));
-            changes.push(version_change(version));
+            changes.push(next.source_change(version));
             changes.push(change_confirmation_change(confirmation));
             changes.push(Change::select_current(
                 rule_set.rule_set_id,
@@ -124,7 +126,7 @@ pub(crate) fn prepare_root_digest(
                 .change_confirmation(change_confirmation.confirmation_id)
                 .ok_or_else(inconsistent)?;
             changes.push(rule_set_change(rule_set));
-            changes.push(version_change(version));
+            changes.push(next.source_change(version));
             changes.push(change_confirmation_change(confirmation));
             changes.push(Change::select_current(
                 *rule_set_id,
@@ -135,49 +137,29 @@ pub(crate) fn prepare_root_digest(
             return Err(MutationError::ContextLoadNotGovernable)
         }
     }
-    prepare_batches(current, changes)
+    current
+        .prepare(changes)
+        .map_err(|error| MutationError::Runtime(RuntimeError::Digest(error)))
 }
 
 // memory—v1: Share unchanged trie branches; hash only the validated additions.
 pub(crate) fn prepare_context_load_digest(
     current: &DigestIndex,
     delta: &crate::memory_v1_hamt::ContextDelta,
+    next: &HamtCandidate,
 ) -> Result<DigestIndex, MutationError> {
     let (rows, selections) = delta.facts();
     let mut builder = DigestAdditions::new(current);
-    visit_context_changes(rows, selections, |change| {
-        builder.push(change).map_err(RuntimeError::Digest)
-    })
+    visit_context_changes(
+        rows,
+        selections,
+        |row| next.source_change(row),
+        |change| builder.push(change).map_err(RuntimeError::Digest),
+    )
     .map_err(MutationError::Runtime)?;
     builder
         .finish()
         .map_err(|error| MutationError::Runtime(RuntimeError::Digest(error)))
-}
-
-// memory—v1: Reject duplicate identities across all chunks, including a duplicate
-// split across the 128-change boundary, before producing any prepared index.
-fn prepare_batches(
-    current: &DigestIndex,
-    changes: Vec<Change>,
-) -> Result<DigestIndex, MutationError> {
-    let mut seen = BTreeSet::new();
-    for change in &changes {
-        let key: &Key = match change {
-            Change::Put { key, .. } | Change::Delete { key } => key,
-        };
-        if !seen.insert(key.clone()) {
-            return Err(MutationError::Runtime(RuntimeError::Digest(
-                crate::memory_v1_digest::DigestError::DuplicateKey,
-            )));
-        }
-    }
-    let mut result = current.clone();
-    for batch in changes.chunks(DIGEST_BATCH_SIZE) {
-        result = result
-            .prepare(batch.iter().cloned())
-            .map_err(|error| MutationError::Runtime(RuntimeError::Digest(error)))?;
-    }
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -188,7 +170,7 @@ mod tests {
         CurrentSelection, IdentityCardRow, RuleSetChangeConfirmationRow, RuleSetRow,
         RuleSetVersionRow, TenantRow, UserCardRow, UserCardStatus, UserRow,
     };
-    use crate::memory_v1_digest::{DigestError, Table};
+    use crate::memory_v1_digest::DigestError;
     use crate::memory_v1_hamt::{CandidateBudget, HamtCandidate};
     use crate::memory_v1_hamt_runtime::digest_rows;
     use crate::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
@@ -682,7 +664,7 @@ mod tests {
     #[test]
     // memory—v1: Confirmation batches remain equivalent across the 128-change chunk boundary.
     fn confirmation_batch_digest_matches_rebuild_at_128_and_129_changes() {
-        for count in [128, 129] {
+        for count in [1, 64, 128, 129, 256] {
             let (rows, selections, confirmations) = batch_fixture(count);
             let base = candidate(rows, selections);
             let current = digest(&base);
@@ -700,25 +682,20 @@ mod tests {
     #[test]
     // memory—v1: Duplicate identities crossing a digest chunk are rejected atomically.
     fn duplicate_key_across_digest_chunks_is_rejected_atomically() {
-        let duplicate = Key::row(Table::User, wide_id(0x10, 1));
-        let mut changes = vec![Change::Put {
-            key: duplicate.clone(),
-            fields: vec![Some(vec![1])],
-        }];
-        for index in 0..127 {
-            changes.push(Change::Put {
-                key: Key::row(Table::User, wide_id(0x20, index)),
-                fields: vec![Some(vec![2])],
-            });
-        }
-        changes.push(Change::Put {
-            key: duplicate,
-            fields: vec![Some(vec![3])],
-        });
-        let original = DigestIndex::new();
+        let (rows, selections, mut confirmations) = batch_fixture(128);
+        let base = candidate(rows, selections);
+        let original = digest(&base);
         let original_digest = original.digest();
+        let next = base.with_confirmations_batch(&confirmations).unwrap();
+        confirmations.push(confirmations[0].clone());
         assert!(matches!(
-            prepare_batches(&original, changes),
+            prepare_root_digest(
+                &original,
+                &next,
+                &ManagementMutationV2::ConfirmationBatch {
+                    rows: confirmations
+                }
+            ),
             Err(MutationError::Runtime(RuntimeError::Digest(
                 DigestError::DuplicateKey
             )))
@@ -727,8 +704,8 @@ mod tests {
     }
 
     #[test]
-    // memory—v1: Capacity failure does not mutate the original prepared digest.
-    fn digest_capacity_failure_preserves_original_index() {
+    // memory—v1: Incremental growth through the old ceiling preserves the predecessor.
+    fn digest_growth_crosses_old_capacity_and_matches_rebuild() {
         let user_id = id(1);
         let tenant_id = id(3);
         let card_id = id(4);
@@ -789,19 +766,15 @@ mod tests {
             .with_confirmation_insert(new_confirmation.clone())
             .unwrap();
         let original_digest = current.digest();
-        assert!(matches!(
-            prepare_root_digest(
-                &current,
-                &next,
-                &ManagementMutationV2::BindingCreate {
-                    row: new_binding,
-                    confirmation: new_confirmation,
-                },
-            ),
-            Err(MutationError::Runtime(RuntimeError::Digest(
-                DigestError::LimitExceeded
-            )))
-        ));
+        assert_incremental_equals_rebuild(
+            &current,
+            &next,
+            ManagementMutationV2::BindingCreate {
+                row: new_binding,
+                confirmation: new_confirmation,
+            },
+        );
+        assert_ne!(digest(&next).digest(), original_digest);
         assert_eq!(current.digest(), original_digest);
     }
 

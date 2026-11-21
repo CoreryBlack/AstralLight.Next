@@ -2124,10 +2124,10 @@ series = ["E1", "M2"]
 scope = "component"
 boundary = "memory-v1 single-node composition and experimental service contracts over a fixture root adopted through the test-only test-support hook: one full-path protected request through the real Gateway, TrustGraph routes, permission middleware and PolicyEngine::evaluate_memory_v1, the Identity capability handed to Gateway assembly, request-scope budget lifecycle, captured-candidate installation, settings/acknowledged-limit parsing, and a loopback-TCP lifecycle of login, authorized read, deny decisions, pending route and logout with graceful drain; the root rows are fixtures, not database provenance, coverage, confirmer authority or production adoption; loopback sockets only, no MySQL, RabbitMQ, deployment or authorization-proof evidence"
 sources = ["astral-single-node/src/memory_v1_composition.rs", "astral-single-node/src/memory_v1_full_path_tests.rs", "astral-single-node/src/memory_v1_service.rs", "astral-single-node/src/memory_v1_service_tests.rs"]
-argv = ["cargo", "test", "-p", "astral-single-node", "--locked", "--bin", "astral-single-node", "--", "--test-threads=1", "memory_v1_composition::", "memory_v1_service::"]
+argv = ["cargo", "test", "-p", "astral-single-node", "--locked", "--bin", "astral-single-node", "--", "--test-threads=1", "--skip", "synthetic_scenarios::", "memory_v1_composition::", "memory_v1_service::"]
 acceptance = "rust"
-minimum_tests = 12
-expected_tests = 12
+minimum_tests = 26
+expected_tests = 26
 timeout_seconds = 900
 
 [[suite]]
@@ -2137,12 +2137,12 @@ profile = "native-kernel"
 test_services = []
 series = ["E1", "M2"]
 scope = "component"
-boundary = "real astral-single-node binary started as a child process with a cleared environment: a non-loopback listen address, an unset ASTRAL_MEMORY_V1_CREDENTIALS_FILE, an unknown acknowledged-limit name, a group/world-readable credentials file (on a platform without Unix mode bits every credentials file is refused as unverifiable) and an unreachable candidate database are each refused without ever printing the readiness line; on a non-Unix host the unreachable-database case prints [SKIP] because the credentials gate refuses first; the end-to-end loopback host guard is checked on parsed URLs only; no reachable database, no served request and no adoption evidence; the database-backed cases are registered separately and not selected here"
+boundary = "real astral-single-node binary started as a child process with a cleared environment: invalid listener, credentials or acknowledged limits and a missing retained journal refuse before readiness; a staged, checkpoint-bound journal without independently signed startup evidence refuses before MySQL without recreating the journal; diagnostics redact credentials, and the parsed URL host guard is checked. Unix-only subjects cannot certify the full refusal lane on other platforms. No reachable database, served request or production adoption evidence; database-backed cases are selected separately"
 sources = ["astral-single-node/tests/memory_v1_service_process.rs", "astral-single-node/src/memory_v1_service.rs", "astral-single-node/src/main.rs"]
-argv = ["cargo", "test", "-p", "astral-single-node", "--locked", "--test", "memory_v1_service_process", "--", "--test-threads=1", "--skip", "real_service_end_to_end", "--skip", "paper_mysql::"]
+argv = ["cargo", "test", "-p", "astral-single-node", "--locked", "--test", "memory_v1_service_process", "--", "--test-threads=1", "--skip", "real_service_end_to_end", "--skip", "paper_mysql::", "--skip", "mysql_recovery::"]
 acceptance = "rust"
-minimum_tests = 7
-expected_tests = 7
+minimum_tests = 10
+expected_tests = 10
 timeout_seconds = 900
 
 [[suite]]

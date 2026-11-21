@@ -11,8 +11,8 @@
 //! it. A shared-root owner must atomically publish the matching facts, digest,
 //! instance and monotonic version, with its own concurrency fence. Equal content
 //! deliberately has equal hashes, including after ABA, so the hash alone is not
-//! a freshness token. Fixed per-snapshot and per-batch limits bound this index,
-//! but retained snapshots and already allocated input need caller-owned budgets.
+//! a freshness token. Per-row and per-batch limits bound individual operations;
+//! resident state, retained snapshots and already allocated input need owner budgets.
 //!
 //! Keys are table tag + exact 16-byte ID + (for versions) length-framed version
 //! bytes. A distinct tag represents the caller's explicit current selection.
@@ -43,10 +43,8 @@ const MAX_FIELD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FIELDS: usize = 32;
 pub(crate) const MAX_ROW_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BATCH: usize = 128;
-/// Maximum distinct row and current-selection keys in one candidate digest.
-/// memory—v1: This local resource limit is not a database or business limit.
+/// memory—v1: Historical sample size retained for comparable benchmarks, not a root limit.
 pub const MAX_ROOT_DIGEST_KEYS: usize = 4096;
-const MAX_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 
 /// This candidate digest, not a database rule-set hash or authorization proof.
 pub type ContentDigest = [u8; 32];
@@ -99,6 +97,15 @@ impl Key {
             tag: 6,
             id: rule_set_id,
             version: Some(version),
+        }
+    }
+
+    // memory—v1: One key per runtime source, independent of its selected version.
+    pub(crate) fn source_slot(id: [u8; 16]) -> Self {
+        Self {
+            tag: 11,
+            id,
+            version: None,
         }
     }
 
@@ -215,15 +222,9 @@ impl DigestIndex {
                     if old.is_some_and(|old| old.as_ref() == &fields) {
                         continue;
                     }
-                    if old.is_none() && next.rows.len() >= MAX_ROOT_DIGEST_KEYS {
-                        return Err(DigestError::LimitExceeded);
-                    }
                     let previous_size =
                         old.map_or(0, |old| row_size(old).expect("stored rows are bounded"));
-                    let total_bytes = next.total_bytes - previous_size + row_bytes;
-                    if total_bytes > MAX_TOTAL_BYTES {
-                        return Err(DigestError::LimitExceeded);
-                    }
+                    let total_bytes = updated_size(next.total_bytes, previous_size, row_bytes)?;
                     let key_bytes = encode_key(&key)?;
                     let leaf = hash_leaf(&key_bytes, &fields)?;
                     let path = hash_path(&key_bytes);
@@ -246,12 +247,14 @@ impl DigestIndex {
         }
         Ok(next)
     }
+}
 
-    // memory—v1: A bounded additive load hashes the changed paths in one pass.
-    // Reuse all unaffected branches, including their precomputed digests.
-    pub(crate) fn remaining_bytes(&self) -> usize {
-        MAX_TOTAL_BYTES.saturating_sub(self.total_bytes)
-    }
+// memory—v1: Account the exact replacement without a product-wide payload ceiling.
+fn updated_size(total: usize, old: usize, new: usize) -> Result<usize, DigestError> {
+    total
+        .checked_sub(old)
+        .and_then(|n| n.checked_add(new))
+        .ok_or(DigestError::LimitExceeded)
 }
 
 pub(crate) struct DigestAdditions<'a> {
@@ -279,15 +282,10 @@ impl<'a> DigestAdditions<'a> {
         if self.next.rows.contains_key(&key) {
             return Err(DigestError::DuplicateKey);
         }
-        if self.next.rows.len() >= MAX_ROOT_DIGEST_KEYS {
-            return Err(DigestError::LimitExceeded);
-        }
-        self.next.total_bytes = self
-            .next
-            .total_bytes
-            .checked_add(row_size(&fields)?)
-            .filter(|total| *total <= MAX_TOTAL_BYTES)
-            .ok_or(DigestError::LimitExceeded)?;
+        let total_bytes = updated_size(self.next.total_bytes, 0, row_size(&fields)?)?;
+        self.leaves
+            .try_reserve(1)
+            .map_err(|_| DigestError::LimitExceeded)?;
         let key_bytes = encode_key(&key)?;
         self.leaves.push((
             hash_path(&key_bytes),
@@ -295,6 +293,7 @@ impl<'a> DigestAdditions<'a> {
             hash_leaf(&key_bytes, &fields)?,
         ));
         self.next.rows.insert(key, Arc::new(fields));
+        self.next.total_bytes = total_bytes;
         Ok(())
     }
 
@@ -363,14 +362,8 @@ impl ColdDigestBuilder {
         if old.is_some_and(|old| old.as_ref() == &fields) {
             return Ok(());
         }
-        if old.is_none() && self.rows.len() >= MAX_ROOT_DIGEST_KEYS {
-            return Err(DigestError::LimitExceeded);
-        }
         let previous_size = old.map_or(0, |old| row_size(old).expect("stored rows are bounded"));
-        let total_bytes = self.total_bytes - previous_size + row_bytes;
-        if total_bytes > MAX_TOTAL_BYTES {
-            return Err(DigestError::LimitExceeded);
-        }
+        let total_bytes = updated_size(self.total_bytes, previous_size, row_bytes)?;
         let key_bytes = encode_key(&key)?;
         // Match prepare's framing validation before checking the path collision.
         let leaf = hash_leaf(&key_bytes, &fields)?;
@@ -390,7 +383,7 @@ impl ColdDigestBuilder {
 
     // memory—v1: Construct every occupied branch once, after complete validation.
     pub(crate) fn finish(self) -> Result<DigestIndex, DigestError> {
-        self.finish_with(|leaves| tree::build(leaves, 0))
+        self.finish_with(tree::build_root)
     }
 
     fn finish_with(
@@ -400,11 +393,15 @@ impl ColdDigestBuilder {
         if let Some(error) = self.error {
             return Err(error);
         }
-        let leaves: Vec<_> = self
-            .paths
-            .into_iter()
-            .map(|(path, (key, hash))| (path, key, hash))
-            .collect();
+        let mut leaves = Vec::new();
+        leaves
+            .try_reserve_exact(self.paths.len())
+            .map_err(|_| DigestError::LimitExceeded)?;
+        leaves.extend(
+            self.paths
+                .into_iter()
+                .map(|(path, (key, hash))| (path, key, hash)),
+        );
         let tree = build(&leaves);
         let mut rows = OrdMap::new();
         for (key, fields) in self.rows {
@@ -916,9 +913,9 @@ mod tests {
                 .unwrap();
             }
             if parallel {
-                cold.finish_with(tree::build_with_two_workers).unwrap()
-            } else {
                 cold.finish().unwrap()
+            } else {
+                cold.finish_with(|leaves| tree::build(leaves, 0)).unwrap()
             }
         }
 
@@ -938,8 +935,8 @@ mod tests {
             for (arm, values) in samples.iter_mut().enumerate() {
                 values.sort_unstable();
                 println!(
-                    "digest-profile: keys={count} threads={} n={} p50_ns={} p95_ns={}",
-                    arm + 1,
+                    "digest-profile: keys={count} scheduling={} n={} p50_ns={} p95_ns={}",
+                    ["serial", "production"][arm],
                     values.len(),
                     values[19],
                     values[37],
@@ -1008,9 +1005,9 @@ mod tests {
         );
         assert!(matches!(builder.finish(), Err(DigestError::LimitExceeded)));
         let mut builder = ColdDigestBuilder::new();
-        builder.total_bytes = MAX_TOTAL_BYTES - 1;
+        builder.total_bytes = usize::MAX - 1;
         builder.push(key.clone(), vec![Some(vec![0])]).unwrap();
-        assert_eq!(builder.total_bytes, MAX_TOTAL_BYTES);
+        assert_eq!(builder.total_bytes, usize::MAX);
         assert_eq!(
             builder.push(Key::row(Table::User, [10; 16]), vec![Some(vec![0])]),
             Err(DigestError::LimitExceeded)
@@ -1023,11 +1020,19 @@ mod tests {
             builder.push(Key::row(Table::User, id), vec![]).unwrap();
         }
         assert_eq!(builder.rows.len(), MAX_ROOT_DIGEST_KEYS);
-        assert_eq!(
-            builder.push(Key::row(Table::Tenant, [0; 16]), vec![]),
-            Err(DigestError::LimitExceeded)
-        );
-        assert!(matches!(builder.finish(), Err(DigestError::LimitExceeded)));
+        let root = builder.finish().unwrap();
+        let key = Key::row(Table::Tenant, [0; 16]);
+        let mut additions = DigestAdditions::new(&root);
+        additions
+            .push(Change::Put {
+                key: key.clone(),
+                fields: vec![],
+            })
+            .unwrap();
+        let successor = additions.finish().unwrap();
+        assert!(root.get(&key).is_none());
+        assert!(successor.get(&key).is_some());
+        assert_ne!(root.digest(), successor.digest());
     }
 
     #[test]

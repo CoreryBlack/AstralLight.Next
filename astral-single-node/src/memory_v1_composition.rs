@@ -537,13 +537,20 @@ mod tests {
 
         // memory—v1: Build two versions so the caller's selection is observable.
         fn rows() -> CandidateRows {
-            let version = |number| RuleSetVersionRow {
-                rule_set_id: id(5),
-                version_bytes: vec![number],
-                content_bytes: vec![number],
-                timestamp_bytes: vec![number],
-                hash_input_bytes: vec![number],
-                hash_bytes: vec![number],
+            let version = |number| {
+                use astral_authorization_root::memory_v1_rules::{
+                    canonical_version_bytes, version_digest,
+                };
+                let content = br#"{"rules":[{"ruleId":"r","resource":"document","action":"read","effect":"ALLOW"}]}"#;
+                let hash_input_bytes = canonical_version_bytes(&[number], content, &[number]);
+                RuleSetVersionRow {
+                    rule_set_id: id(5),
+                    version_bytes: vec![number],
+                    content_bytes: content.to_vec(),
+                    timestamp_bytes: vec![number],
+                    hash_bytes: version_digest(&hash_input_bytes),
+                    hash_input_bytes,
+                }
             };
             CandidateRows {
                 users: vec![UserRow { user_id: id(1) }],
@@ -663,6 +670,20 @@ mod tests {
             ),
             Err(CandidateInstallationError::Root(RootError::Candidate(
                 CandidateError::RowBudgetExceeded { max: 7 }
+            )))
+        ));
+        assert!(matches!(
+            process_root_handle(),
+            Err(RootError::NotInstalled)
+        ));
+
+        let mut corrupt_archive = rows();
+        corrupt_archive.rule_set_versions[1].hash_bytes[0] ^= 1;
+        let selections = corrupt_archive.current_version_selections().unwrap();
+        assert!(matches!(
+            install_captured_candidate(capture(corrupt_archive), selections, budget()),
+            Err(CandidateInstallationError::Root(RootError::Candidate(
+                CandidateError::RuleIntegrity(_)
             )))
         ));
         assert!(matches!(

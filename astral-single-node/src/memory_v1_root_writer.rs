@@ -7,15 +7,18 @@
 //! adoption gate once, and every later commit re-checks the exact observation
 //! before building any candidate.
 //!
-//! The durable owner prepares an exact successor before appending its record.
-//! The root-owned reservation remains held until the same successor publishes.
-//! Card disable coordinates publication with the bound session authority.
+//! The durable owner reserves the complete immutable journal record in
+//! memory, publishes it together with the facts and the governance position
+//! under one CAS, and only then writes the reserved record to the journal.
+//! The root-owned reservation remains held until the same successor publishes
+//! and the written record is verified. Card disable coordinates publication
+//! with the bound session authority.
 
 use std::sync::Arc;
 
 use astral_authorization_root::memory_v1_root::{
     GovernanceFrontier, ManagementMutationV2, PreparedGovernedMutation, ProductionAdmission,
-    RootError, RootMetadata, RootOwner, RootStatus,
+    ReservedGovernanceRecord, RootError, RootMetadata, RootOwner, RootStatus,
 };
 use astral_trustgraph::service::memory_v1_mutation_coordinator::{
     RootBinding, VerifiedRootAdmission,
@@ -128,6 +131,19 @@ impl RootMutationWriter {
     ) -> Result<GovernanceFrontier, RootError> {
         self.root
             .current_governance_frontier(&self.admission, expected)
+    }
+
+    /// memory—v1: Read the complete reserved journal record that the exact
+    /// live serving snapshot published. The commit owner calls this after the
+    /// CAS succeeded, with the returned metadata, so the record it writes is
+    /// taken from the published snapshot itself and never from caller-held
+    /// state.
+    pub(crate) fn published_record(
+        &self,
+        expected: &RootMetadata,
+    ) -> Result<Option<ReservedGovernanceRecord>, RootError> {
+        self.root
+            .published_governance_record(&self.admission, expected)
     }
 
     /// memory—v1: Reserve and validate the exact request-bound successor before journaling.

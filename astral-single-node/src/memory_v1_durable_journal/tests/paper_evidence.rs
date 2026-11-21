@@ -40,8 +40,9 @@ use astral_types::memory_v1_journal::{
 };
 
 use super::{
-    DurableJournalError, DurableJournalLimits, JournalAppendDisposition, JournalDurability,
-    LocalDurablePrefixReceipt, MemoryV1DurableJournal,
+    DurableJournalError, DurableJournalLimits, IoOperation, JournalAppendDisposition,
+    JournalDurability, LocalDurablePrefixReceipt, MemoryV1DurableJournal, SyncTestEvent,
+    OPEN_SYNC_EVENTS,
 };
 
 const STREAM: [u8; 16] = [10; 16];
@@ -400,7 +401,11 @@ fn j1_flipped_byte_in_the_last_frame_is_refused() {
 // The limit is stated in sections/03-protocol.tex line 61 (a valid scan may be
 // consistent with a shorter history, and recovery needs an independent anchor)
 // and sections/04-implementation.tex line 55 (an external tail learned from the
-// same file cannot exclude a missing suffix on its own).
+// same file cannot exclude a missing suffix on its own). An independently
+// supplied tail does refuse the same cut; see
+// `j1_independent_expected_tail_refuses_a_clean_boundary_truncation`. The gap
+// that remains is the self-derived service reopen, which cannot be closed
+// without an external anchor source.
 // asserts current behaviour that is a known gap; update when fixed.
 #[test]
 fn witness_j1_clean_frame_boundary_truncation_is_accepted_as_a_shorter_history() {
@@ -601,21 +606,15 @@ fn j3_mutation_gap_against_an_external_baseline_is_refused_by_scan_against_wrong
     assert_eq!(reopened.position().mutation_sequence(), 2);
 }
 
-// memory—v1: J4 witness. A frame appended without a durable wait, followed by a
-// crash, is reopened and treated as confirmed without any sync_data call. The
-// reopen seeds the confirmed prefix from the scanned file length (the durability
-// state assignment in `open`), and `ensure_durable` returns Ok on its fast path
-// when the confirmed end covers the requested end (lines 355-356). The sync at
-// open is what sections/03-protocol.tex requires: the Recover step (line 16, and
-// the proof at line 52) says to synchronize the retained file before claiming it,
-// and the necessity row "Synchronize at open before claiming" (line 84) states
-// that omitting it violates d <= S. sections/04-implementation.tex does not
-// disclose this reopen case. Adding a sync at open flips the sync_calls
-// assertion below.
-// asserts current behaviour that is a known gap; update when fixed.
+// memory—v1: J4. The reopen now synchronizes the verified retained tail through
+// the coordinator's own flush before confirming it, so the confirmed prefix
+// covers only bytes this machine has made durable (d <= S), as the Recover step
+// of sections/03-protocol.tex requires. The reopen pays exactly one sync_data;
+// the confirmed tail and a replayed receipt ride that flush without syncing
+// again, and appends after the reopen keep the group commit.
 #[test]
-fn witness_j4_reopen_marks_unsynced_tail_confirmed_without_sync() {
-    let dir = ScratchDir::new("j4");
+fn j4_reopen_synchronizes_the_verified_tail_before_confirming_it() {
+    let dir = ScratchDir::new("j4-open-sync");
     let (mut journal, durability) = create_with(&dir, DurableJournalLimits::conservative());
     let request = deny_request("j4-deny", 4, 1, 1, 4);
     let prepared = journal.prepare_deny(&request, &durability).unwrap();
@@ -625,16 +624,164 @@ fn witness_j4_reopen_marks_unsynced_tail_confirmed_without_sync() {
     drop(journal);
     drop(durability);
 
-    let (reopened, reopened_durability) = reopen(&dir).unwrap();
+    let (mut reopened, reopened_durability) = reopen(&dir).unwrap();
     assert_eq!(reopened.record_count(), 1);
     assert_eq!(reopened.file_position(), end);
-    reopened_durability
-        .ensure_durable(end)
-        .expect("the reopened tail is treated as already confirmed");
     assert_eq!(
         reopened_durability.sync_calls(),
-        0,
-        "no sync_data ran for the recovered frame"
+        1,
+        "the reopen flushed the retained tail once"
+    );
+
+    reopened_durability
+        .ensure_durable(end)
+        .expect("the synchronized tail is confirmed");
+    assert_eq!(
+        reopened_durability.sync_calls(),
+        1,
+        "the confirmed tail is not flushed again"
+    );
+
+    let replay = reopened
+        .prepare_deny(&deny_request("j4-deny", 4, 1, 1, 4), &reopened_durability)
+        .unwrap()
+        .into_durable_receipt(&reopened_durability)
+        .unwrap();
+    assert_eq!(replay.disposition(), JournalAppendDisposition::Replayed);
+    assert_eq!(
+        reopened_durability.sync_calls(),
+        1,
+        "a replayed receipt rides the confirmed prefix"
+    );
+}
+
+// memory—v1: J4. A failed open-time synchronization refuses the reopen
+// fail-closed. The test-only interception pauses the recover flush of the reopen
+// before `sync_data` and fails it the way a real synchronization failure is
+// reported. The reopen returns the precise error without an owner or a
+// coordinator, nothing is claimed durable, no byte is written, and the writer
+// lock is released when the local handles drop, so a later open with a fresh
+// handle re-verifies and re-synchronizes the same file.
+#[test]
+fn j4_failed_open_sync_refuses_the_reopen_fail_closed() {
+    let dir = ScratchDir::new("j4-open-fail");
+    let (mut journal, durability) = create_with(&dir, DurableJournalLimits::conservative());
+    let request = deny_request("j4-fail", 5, 1, 1, 5);
+    let prepared = journal.prepare_deny(&request, &durability).unwrap();
+    let end = prepared.durable_end;
+    drop(prepared);
+    drop(journal);
+    drop(durability);
+
+    let (events, receiver) = mpsc::channel();
+    OPEN_SYNC_EVENTS.with(|slot| *slot.borrow_mut() = Some(events));
+    let interceptor =
+        std::thread::spawn(
+            move || match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+                SyncTestEvent::Flushing { target, resume } => {
+                    assert_eq!(target, end);
+                    resume
+                        .send(Err(DurableJournalError::Io {
+                            operation: IoOperation::SyncFile,
+                            kind: std::io::ErrorKind::Other,
+                        }))
+                        .unwrap();
+                }
+                _ => panic!("unexpected sync event"),
+            },
+        );
+    let refused = refusal(reopen(&dir));
+    interceptor.join().unwrap();
+    assert_eq!(
+        refused,
+        DurableJournalError::Io {
+            operation: IoOperation::SyncFile,
+            kind: std::io::ErrorKind::Other,
+        }
+    );
+    assert_eq!(
+        file_len(&dir.journal()),
+        end,
+        "the refused reopen writes nothing"
+    );
+
+    let (reopened, reopened_durability) =
+        reopen(&dir).expect("a later open with a fresh handle re-verifies and re-synchronizes");
+    assert_eq!(reopened.record_count(), 1);
+    assert_eq!(
+        reopened_durability.sync_calls(),
+        1,
+        "the fresh open pays its own recover flush"
+    );
+}
+
+// memory—v1: J4. Retained bytes lost after the scan are not claimed. The test
+// cuts the file below the scanned prefix while the recover flush is paused; the
+// sync then succeeds on the shorter file, and the length floor of the flush
+// refuses the claim as a file change. The reopen reports it fail-closed, and
+// the cut file no longer reopens at all because the scan refuses the torn tail.
+#[test]
+fn j4_retained_bytes_lost_after_the_scan_refuse_the_reopen() {
+    let dir = ScratchDir::new("j4-open-floor");
+    let (mut journal, durability) = create_with(&dir, DurableJournalLimits::conservative());
+    let request = deny_request("j4-floor", 6, 1, 1, 6);
+    let prepared = journal.prepare_deny(&request, &durability).unwrap();
+    let end = prepared.durable_end;
+    drop(prepared);
+    drop(journal);
+    drop(durability);
+
+    let (events, receiver) = mpsc::channel();
+    OPEN_SYNC_EVENTS.with(|slot| *slot.borrow_mut() = Some(events));
+    let path = dir.journal();
+    let interceptor =
+        std::thread::spawn(
+            move || match receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+                SyncTestEvent::Flushing { target, resume } => {
+                    assert_eq!(target, end);
+                    truncate_to(&path, target - 1);
+                    resume.send(Ok(())).unwrap();
+                }
+                _ => panic!("unexpected sync event"),
+            },
+        );
+    let refused = refusal(reopen(&dir));
+    interceptor.join().unwrap();
+    assert_eq!(refused, DurableJournalError::FileChanged);
+    assert_eq!(file_len(&dir.journal()), end - 1);
+    assert_eq!(
+        refusal(reopen(&dir)),
+        DurableJournalError::FileChanged,
+        "the cut file no longer reopens"
+    );
+}
+
+// memory—v1: J1. Against a genuinely independent expected tail — one learned
+// before the bytes went missing — a clean frame-boundary truncation is refused
+// as a chain mismatch: the missing frame changes the verified tail hash, so
+// missing historical bytes cannot be confirmed. Only the self-derived reopen
+// (`scan_tail` feeding `open` its own result) accepts the shorter history,
+// which `witness_j1_clean_frame_boundary_truncation_is_accepted_as_a_shorter_history`
+// pins as the gap that needs an external anchor.
+#[test]
+fn j1_independent_expected_tail_refuses_a_clean_boundary_truncation() {
+    let dir = ScratchDir::new("j1-independent");
+    let boundaries = write_three_denies(&dir);
+    let remembered = scanned_tail(&dir.journal());
+    assert_eq!(remembered.journal_sequence(), 3);
+    truncate_to(&dir.journal(), boundaries[1]);
+
+    let open = MemoryV1DurableJournal::open(
+        &dir.journal(),
+        stream(),
+        epoch(),
+        genesis(),
+        remembered,
+        DurableJournalLimits::conservative(),
+    );
+    assert_eq!(
+        refusal(open),
+        DurableJournalError::Frame(JournalError::ChainMismatch)
     );
 }
 
@@ -1206,8 +1353,8 @@ fn j5_mutation_replay_under_another_identity_is_refused_as_an_existing_operation
 // as durable, and not one byte more. An offset beyond the scanned length is one
 // that nothing registered, so confirming it is refused as an invalid record; a
 // confirmed prefix that overshot the file by even one byte would accept it. The
-// scanned length itself is confirmed without a sync, which is the reopen gap that
-// `witness_j4_reopen_marks_unsynced_tail_confirmed_without_sync` pins.
+// scanned length itself is confirmed only after the reopen's recover flush,
+// which `j4_reopen_synchronizes_the_verified_tail_before_confirming_it` pins.
 #[test]
 fn j4_reopened_tail_is_confirmed_through_the_scanned_length_and_no_further() {
     let dir = ScratchDir::new("j4-exact");

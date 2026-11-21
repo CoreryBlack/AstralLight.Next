@@ -161,7 +161,7 @@ fn cache_hit_promotion_preserves_order_and_accounting_on_eviction() {
     let (count, bytes) = cache_summary(&cache);
     assert!(count <= MAX_ENTRIES);
     assert!(bytes <= MAX_BYTES);
-    for stripe in &cache.stripes {
+    for stripe in cache.stripes.iter() {
         let entries = stripe.lock().unwrap();
         assert_eq!(entries.values.len(), entries.order.len());
         assert_eq!(
@@ -277,7 +277,7 @@ fn concurrent_cache_reads_and_fills_preserve_internal_bounds() {
     let (count, bytes) = cache_summary(&cache);
     assert!(count <= MAX_ENTRIES);
     assert!(bytes <= MAX_BYTES);
-    for stripe in &cache.stripes {
+    for stripe in cache.stripes.iter() {
         let entries = stripe.lock().unwrap();
         assert_eq!(entries.values.len(), entries.order.len());
         assert_eq!(

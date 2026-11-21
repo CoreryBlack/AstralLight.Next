@@ -44,14 +44,15 @@ const MAX_LEDGER_ENTRIES: usize = 65_536;
 const AUDIT_DIGEST_DOMAIN: &[u8] = b"astrallight/memory-v1/coordinator/audit/1\0";
 const PUBLICATION_LINK_DOMAIN: &[u8] = b"astrallight/memory-v1/coordinator/publication/1\0";
 const JOURNAL_PAYLOAD_DOMAIN: &[u8] = b"astrallight/memory-v1/journal/mutation-envelope/1\0";
-const JOURNAL_PAYLOAD_VERSION: u16 = 1;
+mod origin_boot;
+pub use origin_boot::journal_producer_boot_id;
+use origin_boot::{decode_origin_boot, ORIGIN_BYTES, ORIGIN_VERSION};
 const JOURNAL_PAYLOAD_SINGLE: u8 = 1;
 const JOURNAL_PAYLOAD_EVENT: u8 = 2;
 const JOURNAL_PAYLOAD_FLAGS: u8 = 0;
 const JOURNAL_PAYLOAD_HEADER_BYTES: usize =
     JOURNAL_PAYLOAD_DOMAIN.len() + 2 + 1 + 1 + 4 + 4 + 4 + 32 + 32;
 const DENY_PAYLOAD_DOMAIN: &[u8] = b"astrallight/memory-v1/journal/deny-envelope/1\0";
-const DENY_PAYLOAD_VERSION: u16 = 1;
 const DENY_PAYLOAD_HEADER_BYTES: usize = DENY_PAYLOAD_DOMAIN.len() + 2 + 1 + 4 + 4 + 32;
 const DENY_AUDIT_DIGEST_DOMAIN: &[u8] = b"astrallight/memory-v1/coordinator/deny-audit-value/1\0";
 
@@ -564,6 +565,7 @@ impl MutationAuditCandidate {
 /// a durable proof, establish root adoption, or authorize a replay.
 #[derive(Clone, Debug)]
 pub struct DecodedJournalPayload {
+    origin_boot_id: Option<MemoryId>,
     mutation: ManagementMutationV2,
     audit: MutationAuditCandidate,
     mutation_digest: CoordinatorDigest,
@@ -571,6 +573,10 @@ pub struct DecodedJournalPayload {
 }
 
 impl DecodedJournalPayload {
+    /// memory—v1: The retained producer identity, absent in version 1.
+    pub const fn origin_boot_id(&self) -> Option<MemoryId> {
+        self.origin_boot_id
+    }
     pub const fn mutation(&self) -> &ManagementMutationV2 {
         &self.mutation
     }
@@ -626,9 +632,6 @@ pub fn decode_journal_payload(bytes: &[u8]) -> Result<DecodedJournalPayload, Coo
             .try_into()
             .map_err(|_| CoordinatorError::InvalidJournalPayload)?,
     );
-    if version != JOURNAL_PAYLOAD_VERSION {
-        return Err(CoordinatorError::InvalidJournalPayload);
-    }
     let kind = take(&mut offset, 1)?[0];
     if !matches!(kind, JOURNAL_PAYLOAD_SINGLE | JOURNAL_PAYLOAD_EVENT)
         || take(&mut offset, 1)?[0] != JOURNAL_PAYLOAD_FLAGS
@@ -656,7 +659,8 @@ pub fn decode_journal_payload(bytes: &[u8]) -> Result<DecodedJournalPayload, Coo
     let audit_digest: CoordinatorDigest = take(&mut offset, 32)?
         .try_into()
         .map_err(|_| CoordinatorError::InvalidJournalPayload)?;
-    let expected_total = JOURNAL_PAYLOAD_HEADER_BYTES
+    let origin_boot_id = decode_origin_boot(version, bytes, &mut offset)?;
+    let expected_total = offset
         .checked_add(mutation_len)
         .and_then(|value| value.checked_add(audit_len))
         .ok_or(CoordinatorError::InvalidJournalPayload)?;
@@ -704,6 +708,7 @@ pub fn decode_journal_payload(bytes: &[u8]) -> Result<DecodedJournalPayload, Coo
         return Err(CoordinatorError::InvalidJournalPayload);
     }
     Ok(DecodedJournalPayload {
+        origin_boot_id,
         mutation,
         audit,
         mutation_digest,
@@ -712,7 +717,7 @@ pub fn decode_journal_payload(bytes: &[u8]) -> Result<DecodedJournalPayload, Coo
 }
 
 fn journal_payload_len(mutation_len: usize, audit_len: usize) -> Result<usize, CoordinatorError> {
-    let total = JOURNAL_PAYLOAD_HEADER_BYTES
+    let total = (JOURNAL_PAYLOAD_HEADER_BYTES + ORIGIN_BYTES)
         .checked_add(mutation_len)
         .and_then(|value| value.checked_add(audit_len))
         .ok_or(CoordinatorError::CandidateUnavailable)?;
@@ -744,7 +749,7 @@ fn encode_journal_payload(
         .try_reserve_exact(total)
         .map_err(|_| CoordinatorError::CandidateUnavailable)?;
     payload.extend_from_slice(JOURNAL_PAYLOAD_DOMAIN);
-    payload.extend_from_slice(&JOURNAL_PAYLOAD_VERSION.to_be_bytes());
+    payload.extend_from_slice(&ORIGIN_VERSION.to_be_bytes());
     payload.push(kind);
     payload.push(JOURNAL_PAYLOAD_FLAGS);
     payload.extend_from_slice(&(total as u32).to_be_bytes());
@@ -752,6 +757,7 @@ fn encode_journal_payload(
     payload.extend_from_slice(&(audit_wire.len() as u32).to_be_bytes());
     payload.extend_from_slice(&mutation_digest);
     payload.extend_from_slice(&audit_digest);
+    payload.extend_from_slice(journal_producer_boot_id().as_bytes());
     payload.extend_from_slice(mutation_wire);
     payload.extend_from_slice(audit_wire);
     if payload.len() != total {
@@ -1612,7 +1618,7 @@ impl DenyJournalRequest {
             &observation,
         )
         .map_err(|_| CoordinatorError::CandidateUnavailable)?;
-        let payload_len = DENY_PAYLOAD_HEADER_BYTES
+        let payload_len = (DENY_PAYLOAD_HEADER_BYTES + ORIGIN_BYTES)
             .checked_add(wire.len())
             .ok_or(CoordinatorError::CandidateUnavailable)?;
         if payload_len > astral_types::memory_v1_journal::MAX_PAYLOAD_BYTES {
@@ -1663,7 +1669,7 @@ impl DenyJournalRequest {
         )
         .map_err(|_| CoordinatorError::CandidateUnavailable)?;
         let observation_digest = digest_bytes(DENY_AUDIT_DIGEST_DOMAIN, &wire);
-        let total = DENY_PAYLOAD_HEADER_BYTES
+        let total = (DENY_PAYLOAD_HEADER_BYTES + ORIGIN_BYTES)
             .checked_add(wire.len())
             .ok_or(CoordinatorError::CandidateUnavailable)?;
         if total > astral_types::memory_v1_journal::MAX_PAYLOAD_BYTES {
@@ -1674,11 +1680,12 @@ impl DenyJournalRequest {
             .try_reserve_exact(total)
             .map_err(|_| CoordinatorError::CandidateUnavailable)?;
         payload.extend_from_slice(DENY_PAYLOAD_DOMAIN);
-        payload.extend_from_slice(&DENY_PAYLOAD_VERSION.to_be_bytes());
+        payload.extend_from_slice(&ORIGIN_VERSION.to_be_bytes());
         payload.push(JOURNAL_PAYLOAD_FLAGS);
         payload.extend_from_slice(&(total as u32).to_be_bytes());
         payload.extend_from_slice(&(wire.len() as u32).to_be_bytes());
         payload.extend_from_slice(&observation_digest);
+        payload.extend_from_slice(journal_producer_boot_id().as_bytes());
         payload.extend_from_slice(&wire);
         if payload.len() != self.payload_bytes {
             return Err(CoordinatorError::CandidateUnavailable);
@@ -1702,6 +1709,13 @@ impl DenyJournalRequest {
 pub fn decode_deny_journal_payload(
     bytes: &[u8],
 ) -> Result<MemoryV1DenyObservation, CoordinatorError> {
+    decode_deny_journal_payload_with_origin(bytes).map(|(_, observation)| observation)
+}
+
+/// memory—v1: Decode the observation and its original producer from this frame.
+pub fn decode_deny_journal_payload_with_origin(
+    bytes: &[u8],
+) -> Result<(Option<MemoryId>, MemoryV1DenyObservation), CoordinatorError> {
     if bytes.len() > astral_types::memory_v1_journal::MAX_PAYLOAD_BYTES
         || bytes.len() < DENY_PAYLOAD_HEADER_BYTES
     {
@@ -1726,7 +1740,7 @@ pub fn decode_deny_journal_payload(
             .try_into()
             .map_err(|_| CoordinatorError::InvalidJournalPayload)?,
     );
-    if version != DENY_PAYLOAD_VERSION || take(&mut offset, 1)?[0] != JOURNAL_PAYLOAD_FLAGS {
+    if take(&mut offset, 1)?[0] != JOURNAL_PAYLOAD_FLAGS {
         return Err(CoordinatorError::InvalidJournalPayload);
     }
     let total_len = u32::from_be_bytes(
@@ -1742,8 +1756,9 @@ pub fn decode_deny_journal_payload(
     let observation_digest: CoordinatorDigest = take(&mut offset, 32)?
         .try_into()
         .map_err(|_| CoordinatorError::InvalidJournalPayload)?;
+    let origin = decode_origin_boot(version, bytes, &mut offset)?;
     if total_len != bytes.len()
-        || DENY_PAYLOAD_HEADER_BYTES
+        || offset
             .checked_add(observation_len)
             .is_none_or(|expected| expected != total_len)
     {
@@ -1757,6 +1772,7 @@ pub fn decode_deny_journal_payload(
         return Err(CoordinatorError::InvalidJournalPayload);
     }
     astral_types::memory_v1_deny_observation::decode_memory_v1_deny_observation(observation_wire)
+        .map(|observation| (origin, observation))
         .map_err(|_| CoordinatorError::InvalidJournalPayload)
 }
 
@@ -2309,6 +2325,33 @@ mod tests {
         assert_eq!(decoded.request_fingerprint(), request.request_fingerprint());
         assert_eq!(decoded.mutation_digest(), request.mutation_digest());
         assert_eq!(decoded.audit_digest(), request.audit_digest());
+    }
+
+    #[test]
+    fn journal_origin_is_read_from_retained_bytes_and_absent_on_v1() {
+        let request = request("op", UserCardStatus::Disabled);
+        let mut payload = request.journal_payload().unwrap();
+        assert_eq!(
+            decode_journal_payload(&payload).unwrap().origin_boot_id(),
+            Some(journal_producer_boot_id())
+        );
+        let origin = JOURNAL_PAYLOAD_HEADER_BYTES..JOURNAL_PAYLOAD_HEADER_BYTES + ORIGIN_BYTES;
+        payload[origin.clone()].copy_from_slice(id(91).as_bytes());
+        assert_eq!(
+            decode_journal_payload(&payload).unwrap().origin_boot_id(),
+            Some(id(91))
+        );
+        payload[origin.clone()].fill(0);
+        assert!(decode_journal_payload(&payload).is_err());
+        payload.drain(origin);
+        let version = JOURNAL_PAYLOAD_DOMAIN.len();
+        payload[version..version + 2].copy_from_slice(&1_u16.to_be_bytes());
+        let len = (payload.len() as u32).to_be_bytes();
+        payload[version + 4..version + 8].copy_from_slice(&len);
+        assert_eq!(
+            decode_journal_payload(&payload).unwrap().origin_boot_id(),
+            None
+        );
     }
 
     #[test]

@@ -1,26 +1,10 @@
-//! memory—v1: the crash-recovery owner of the unified single-node path.
-//!
-//! Recovery runs before adoption and before any listener exists. The order is
-//! the A/A1 contract:
-//!
-//! 1. the durable journal is opened and fully chain-verified (the caller owns
-//!    the open); the journal's own record sequence is the authoritative order;
-//! 2. the captured MySQL candidate is installed as a Candidate root;
-//! 3. every journaled mutation is replayed in order against that candidate
-//!    through the root's controlled recovery path. A replay failure, a
-//!    sequence gap, or any uncertain result stops recovery and the process
-//!    refuses to serve — there is no partial-start and no automatic retry;
-//! 4. DENY records are skipped here: their audit value is already durable and
-//!    they carry no state change;
-//! 5. after replay the root is adopted at the production grade with the same
-//!    sealed startup bundle as a fresh start; the adoption's structural gate
-//!    revalidates the full replayed state.
-//!
-//! The database apply direction stays one-way: MySQL is the cold-start
-//! source, and journaled in-memory changes are backed up asynchronously. A
-//! replayed change is therefore applied to the root only; reconciling MySQL
-//! rows against the replayed state is the apply owner's later task and this
-//! module never writes to the database.
+//! memory—v1: Ordered replay into a candidate root. This checks journal values
+//! and root transitions, not MySQL application, audit receipts or progress.
+//! Normal startup cannot use it instead of reconciling the database before
+//! cold capture (§15.10.4). Only the adoption gate may publish Serving.
+
+mod applied_history;
+pub use applied_history::verify_applied_history;
 
 use std::sync::Arc;
 

@@ -1,19 +1,18 @@
-//! memory—v1: Process-level tests of the experimental real-service binary.
+//! memory—v1: Process-level checks of the unified service binary.
 //!
-//! Part A runs by default and needs no database: the real binary refuses every
-//! unsafe or incomplete start before it serves anything.
-//!
-//! Part B (`--ignored`) is the database-backed end-to-end run. It creates its own
-//! run-scoped database on an operator-supplied server, applies the reviewed candidate
-//! DDL, seeds the fixture, starts the real binary against it, verifies that
-//! unproven confirmation authority stays pending, stops the binary gracefully and
-//! drops the database. It never touches any other database and refuses to start
-//! unless the server address is loopback (an SSH tunnel, never a public address).
+//! Part A needs no database: incomplete starts refuse before readiness. A
+//! staged, checkpoint-bound retained journal is not a substitute for the
+//! signed evidence gate. Part B uses a real MySQL fixture and a separate test
+//! signer; neither proves production adoption. On an approved loopback MySQL
+//! server each run creates and drops one schema. Protected databases are only
+//! inventoried.
 //!
 //! Part C is the explicitly approved paper evidence lane. It uses a dedicated
 //! pre-provisioned schema; it never runs Part B's administrative DDL.
 //!
-//! Database URLs come from the operator's environment at run time.
+//! Database URLs come from the operator's environment at run time. Child
+//! failure diagnostics are captured after the output readers drain, with URL
+//! credentials and known secret values scrubbed before they are printed.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -53,8 +52,17 @@ const RULES_DENY: [u8; 16] = [0x42; 16];
 const PROTECTED_DATABASES: [&str; 2] = ["astral_light_rust", "platform_v4"];
 const RUN_DATABASE_PREFIX: &str = "astral_rehearsal_mv1_";
 
+#[cfg(unix)]
+#[path = "memory_v1_service_process/change_confirmation_withdrawal.rs"]
+mod change_confirmation_withdrawal;
+#[cfg(unix)]
+#[path = "memory_v1_service_process/mysql_recovery.rs"]
+mod mysql_recovery;
 #[path = "memory_v1_service_process/paper_mysql.rs"]
 mod paper_mysql;
+#[cfg(unix)]
+#[path = "memory_v1_service_process/startup_issuer.rs"]
+mod startup_issuer;
 
 // ───────────────────────────── shared helpers ─────────────────────────────
 
@@ -127,6 +135,52 @@ fn all_limits() -> String {
         .join(",")
 }
 
+// memory—v1: Environment variable names whose values are credentials; they must
+// never survive into captured child diagnostics.
+const SECRET_ENV: [&str; 3] = [
+    "JWT_ACCESS_SECRET",
+    "JWT_REFRESH_SECRET",
+    "GATEWAY_HMAC_SECRET",
+];
+
+// memory—v1: Scrub URL credentials and every known secret value from text before
+// it becomes test diagnostics. Hosts and paths stay so failures remain useful.
+fn redact(text: &str, env: &[(String, String)]) -> String {
+    let mut redacted = text.to_owned();
+    for (name, value) in env {
+        if SECRET_ENV.contains(&name.as_str()) && !value.is_empty() {
+            redacted = redacted.replace(value.as_str(), "[redacted-secret]");
+        }
+    }
+    redact_url_userinfo(&redacted)
+}
+
+// memory—v1: Replace the userinfo of every scheme://authority pair, keeping the
+// host. The last '@' before the path ends the userinfo, so passwords containing
+// '@' are covered too.
+fn redact_url_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find("://") {
+        out.push_str(&rest[..index + 3]);
+        let after_scheme = &rest[index + 3..];
+        let authority_end = after_scheme
+            .find(['/', '?', '#'])
+            .unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..authority_end];
+        match authority.rfind('@') {
+            Some(at) => {
+                out.push_str("[credentials-redacted]");
+                out.push_str(&authority[at..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &after_scheme[authority_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 // memory—v1: The environment the service needs; nothing is inherited from the caller.
 fn service_env(database_url: &str, credentials: &Path) -> (Vec<(String, String)>, TempDir) {
     let journal_dir = TempDir::new("journal");
@@ -142,6 +196,10 @@ fn service_env(database_url: &str, credentials: &Path) -> (Vec<(String, String)>
         (
             "ASTRAL_MEMORY_V1_JOURNAL_DIR".to_owned(),
             journal_dir.path().to_str().unwrap().to_owned(),
+        ),
+        (
+            "ASTRAL_MEMORY_V1_INSTALLATION_ID".to_owned(),
+            uuid::Uuid::new_v4().to_string(),
         ),
         (
             "ASTRAL_MEMORY_V1_ACKNOWLEDGE_LIMITS".to_owned(),
@@ -196,16 +254,21 @@ fn with_var(mut env: Vec<(String, String)>, name: &str, value: &str) -> Vec<(Str
     env
 }
 
-// memory—v1: A started service process with its output captured.
+// memory—v1: A started service process with its output captured and the exact
+// environment it was started with, so diagnostics can be scrubbed of secrets.
 struct Running {
     child: Child,
     stdout: mpsc::UnboundedReceiver<String>,
     stderr: Arc<Mutex<String>>,
     seen_stdout: Vec<String>,
+    env: Arc<Vec<(String, String)>>,
+    stdout_reader: tokio::task::JoinHandle<()>,
+    stderr_reader: tokio::task::JoinHandle<()>,
 }
 
 // memory—v1: Start the real binary with exactly `env`, in an empty working directory.
 fn start(env: &[(String, String)], cwd: &Path) -> Running {
+    let env: Arc<Vec<(String, String)>> = Arc::new(env.to_vec());
     let mut child = Command::new(BIN)
         .env_clear()
         .envs(env.iter().map(|(name, value)| (name, value)))
@@ -218,7 +281,7 @@ fn start(env: &[(String, String)], cwd: &Path) -> Running {
         .expect("start the astral-single-node binary");
     let (tx, stdout) = mpsc::unbounded_channel();
     let out = child.stdout.take().unwrap();
-    tokio::spawn(async move {
+    let stdout_reader = tokio::spawn(async move {
         let mut lines = BufReader::new(out).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let _ = tx.send(line);
@@ -227,7 +290,7 @@ fn start(env: &[(String, String)], cwd: &Path) -> Running {
     let stderr = Arc::new(Mutex::new(String::new()));
     let err = child.stderr.take().unwrap();
     let sink = Arc::clone(&stderr);
-    tokio::spawn(async move {
+    let stderr_reader = tokio::spawn(async move {
         let mut lines = BufReader::new(err).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let mut sink = sink.lock().unwrap();
@@ -240,19 +303,36 @@ fn start(env: &[(String, String)], cwd: &Path) -> Running {
         stdout,
         stderr,
         seen_stdout: Vec::new(),
+        env,
+        stdout_reader,
+        stderr_reader,
     }
 }
 
 impl Running {
-    // memory—v1: Everything the process wrote so far (stdout lines, then stderr).
+    // memory—v1: Wait for the output readers to reach the end of both pipes so the
+    // diagnostics are complete; bounded so a pipe still held open cannot stall the test.
+    async fn drain(&mut self, limit: Duration) {
+        let readers = async {
+            let _ = (&mut self.stdout_reader).await;
+            let _ = (&mut self.stderr_reader).await;
+        };
+        let _ = timeout(limit, readers).await;
+    }
+
+    // memory—v1: Everything the process wrote so far (stdout lines, then stderr),
+    // scrubbed of URL credentials and known secret values.
     fn output(&mut self) -> String {
         while let Ok(line) = self.stdout.try_recv() {
             self.seen_stdout.push(line);
         }
-        format!(
-            "stdout:\n{}\nstderr:\n{}",
-            self.seen_stdout.join("\n"),
-            self.stderr.lock().unwrap()
+        redact(
+            &format!(
+                "stdout:\n{}\nstderr:\n{}",
+                self.seen_stdout.join("\n"),
+                self.stderr.lock().unwrap()
+            ),
+            &self.env,
         )
     }
 
@@ -269,6 +349,7 @@ impl Running {
                     Some(line) => self.seen_stdout.push(line),
                     None => {
                         let status = self.child.wait().await.ok();
+                        self.drain(Duration::from_secs(2)).await;
                         return Err(format!("exited ({status:?}) before readiness\n{}", self.output()));
                     }
                 },
@@ -285,6 +366,7 @@ impl Running {
             Ok(status) => status.expect("wait for the service process"),
             Err(_) => {
                 let _ = self.child.kill().await;
+                self.drain(Duration::from_secs(2)).await;
                 panic!("the service outlived {limit:?}\n{}", self.output());
             }
         }
@@ -296,12 +378,12 @@ async fn refused(env: &[(String, String)]) -> String {
     let cwd = TempDir::new("cwd");
     let mut running = start(env, cwd.path());
     let status = running.exit(Duration::from_secs(60)).await;
-    // Let the reader tasks flush their last lines.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The child has exited; let the readers reach the end of both pipes.
+    running.drain(Duration::from_secs(2)).await;
     let output = running.output();
     assert!(
         !status.success(),
-        "the service must refuse to start\n{output}"
+        "the service must refuse to start (exit status {status:?})\n{output}"
     );
     assert!(
         !output.contains(READY_PREFIX),
@@ -409,23 +491,226 @@ async fn unreachable_database_is_refused() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+// memory—v1: Naming every limit and supplying credentials cannot bootstrap
+// an absent history. Refuse before MySQL, without creating a replacement.
+async fn missing_retained_journal_is_not_recreated() {
+    let dir = TempDir::new("missing-history");
+    let credentials = write_credentials(dir.path(), 0o600);
+    let (env, journal) = service_env(UNREACHABLE_DB, &credentials);
+    let output = refused(&env).await;
+    assert!(
+        output.contains("bootstrap or reconciliation required"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("connect the memory-v1 candidate database"),
+        "{output}"
+    );
+    assert_eq!(std::fs::read_dir(journal.path()).unwrap().count(), 0);
+}
+
+// memory—v1: Stage the real retained journal and its installation checkpoint
+// exactly where the official startup gate looks for them. The service derives
+// its initial history from the installation ID; the fixture mirrors that
+// documented derivation so the staged files bind to the same installation. If
+// the derivation ever drifts, the gate refuses — never a silent acceptance.
+// The two file names are the retained journal and checkpoint base the startup
+// gate reads (`memory_v1_service.rs`).
+#[cfg(unix)]
+fn stage_retained_journal(dir: &Path, installation: [u8; 16]) -> (MemoryId, MemoryId, [u8; 32]) {
+    use astral_single_node::memory_v1_durable_journal::{
+        CheckpointInstallId, DurableJournalLimits, LocalCheckpointCoverage, LocalCheckpointStore,
+        MemoryV1DurableJournal,
+    };
+    use astral_types::memory_v1_journal::JournalAnchor;
+    let digest = |label: &[u8]| -> [u8; 32] {
+        Sha256::new()
+            .chain_update(label)
+            .chain_update(installation)
+            .finalize()
+            .into()
+    };
+    let id = |label: &[u8]| MemoryId::from_bytes(digest(label)[..16].try_into().expect("16 bytes"));
+    let stream = id(b"astrallight/memory-v1/installation/stream/1\0");
+    let epoch = id(b"astrallight/memory-v1/installation/epoch/1\0");
+    let genesis = digest(b"astrallight/memory-v1/installation/genesis/1\0");
+    let anchor = JournalAnchor::new(stream, 0, 0, genesis).expect("well-formed genesis anchor");
+    let limits = DurableJournalLimits::conservative();
+    let (journal, durability) = MemoryV1DurableJournal::create(
+        &dir.join("memory-v1-durable.bin"),
+        stream,
+        epoch,
+        anchor,
+        limits,
+    )
+    .expect("stage the retained journal file");
+    let (store, _record) = LocalCheckpointStore::bootstrap(
+        &dir.join("memory-v1-durable"),
+        CheckpointInstallId::from_install_uuid(installation).expect("checkpoint installation id"),
+        stream,
+        epoch,
+        anchor,
+        LocalCheckpointCoverage::from_anchor(anchor, 0),
+        limits,
+    )
+    .expect("stage the installation checkpoint");
+    journal
+        .attach_checkpoint(&durability, store)
+        .expect("bind the checkpoint to the staged journal");
+    (stream, epoch, genesis)
+}
+
+// memory—v1: Give the disposable E2E installation an explicit, matching baseline.
+// These facts are inputs to the real startup verifier, not production adoption proof.
+#[cfg(unix)]
+async fn stage_e2e_bootstrap(
+    env: &[(String, String)],
+    journal_dir: &Path,
+    pool: &MySqlPool,
+) -> (MemoryId, MemoryId, [u8; 32]) {
+    use astral_db::memory_v1_apply::{
+        initialize_memory_v1_apply_progress, MemoryV1ApplyProgressInit,
+    };
+
+    let install = env
+        .iter()
+        .find(|(name, _)| name == "ASTRAL_MEMORY_V1_INSTALLATION_ID")
+        .expect("fixture installation id")
+        .1
+        .parse::<uuid::Uuid>()
+        .expect("valid fixture installation id");
+    let (stream, epoch, genesis) = stage_retained_journal(journal_dir, *install.as_bytes());
+    assert_eq!(
+        initialize_memory_v1_apply_progress(pool, stream, epoch, genesis)
+            .await
+            .expect("bind the disposable database genesis to its retained journal"),
+        MemoryV1ApplyProgressInit::Initialized,
+        "a new run database must not already have a genesis row"
+    );
+    (stream, epoch, genesis)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+// memory—v1: A staged checkpoint passes the journal gate but is not signed
+// startup evidence. The real process refuses before MySQL or HTTP readiness.
+async fn staged_retained_journal_still_requires_independent_evidence() {
+    let installation = uuid::Uuid::new_v4();
+    let dir = TempDir::new("staged-history");
+    let credentials = write_credentials(dir.path(), 0o600);
+    let (env, journal) = service_env(UNREACHABLE_DB, &credentials);
+    let env = with_var(
+        env,
+        "ASTRAL_MEMORY_V1_INSTALLATION_ID",
+        &installation.to_string(),
+    );
+    let (stream, epoch, genesis) = stage_retained_journal(journal.path(), *installation.as_bytes());
+    let output = refused(&env).await;
+    assert!(
+        output.contains("memory-v1 durable journal verified"),
+        "{output}"
+    );
+    assert!(
+        output.contains("ASTRAL_MEMORY_V1_STARTUP_EVIDENCE_PUBLIC_KEY"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("connect the memory-v1 candidate database"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("bootstrap or reconciliation required"),
+        "the staged history must not be treated as absent\n{output}"
+    );
+    assert!(
+        journal.path().join("memory-v1-durable.bin").is_file(),
+        "the staged retained journal is consumed, never recreated or removed"
+    );
+
+    use astral_authorization_root::memory_v1_adoption::startup::StartupEvidenceSubject;
+    let subject = StartupEvidenceSubject {
+        installation_id: MemoryId::from_bytes(*installation.as_bytes()),
+        database_scope: [1; 32],
+        schema_fingerprint: [2; 32],
+        candidate_digest: [3; 32],
+        registry_digest: [4; 32],
+        journal_stream: stream,
+        journal_epoch: epoch,
+        journal_sequence: 0,
+        mutation_sequence: 0,
+        journal_tail_hash: genesis,
+    };
+    let stale =
+        startup_issuer::fixture_envelope(env.clone(), dir.path(), subject.clone(), |value| {
+            value.issued_at -= 600;
+            value.expires_at -= 600;
+        });
+    let mut other = subject.clone();
+    other.installation_id = MemoryId::from_bytes(*uuid::Uuid::new_v4().as_bytes());
+    let wrong_installation = startup_issuer::sign_fixture(env.clone(), dir.path(), other);
+    let wrong_key = with_var(
+        startup_issuer::sign_fixture(env, dir.path(), subject),
+        "ASTRAL_MEMORY_V1_STARTUP_EVIDENCE_PUBLIC_KEY",
+        &hex::encode([1; 32]),
+    );
+    for (fixture, expected) in [
+        (
+            wrong_installation,
+            "does not bind the captured startup state",
+        ),
+        (wrong_key, "invalid memory-v1 startup evidence signature"),
+    ] {
+        let output = refused(&fixture).await;
+        assert!(output.contains(expected), "{output}");
+        assert!(
+            !output.contains("connect the memory-v1 candidate database"),
+            "{output}"
+        );
+    }
+    let output = refused(&stale).await;
+    assert!(output.contains("stale, not yet valid"), "{output}");
+    assert!(
+        !output.contains("connect the memory-v1 candidate database"),
+        "{output}"
+    );
+}
+
+// memory—v1: Diagnostics scrub URL credentials and known secret values while
+// keeping the host, so failures stay useful without leaking credentials. The
+// URL here is assembled, never a real connection string: the password is
+// generated in this run and the host is the reserved .invalid domain.
+#[test]
+fn diagnostics_redact_url_credentials_and_secrets() {
+    let password = format!("pw-{}", uuid::Uuid::new_v4().simple());
+    let secret = format!("jwt-{}", uuid::Uuid::new_v4().simple());
+    let url = format!("mysql://fixture-user:{password}@db.example.invalid:3306/db");
+    let env = vec![
+        ("DATABASE_URL".to_owned(), url.clone()),
+        ("JWT_ACCESS_SECRET".to_owned(), secret.clone()),
+    ];
+    let redacted = redact(&format!("connect failed: {url} with {secret}"), &env);
+    assert!(!redacted.contains(&password), "{redacted}");
+    assert!(!redacted.contains(&secret), "{redacted}");
+    assert!(!redacted.contains("fixture-user:"), "{redacted}");
+    assert!(
+        redacted.contains("mysql://[credentials-redacted]@db.example.invalid:3306/db"),
+        "the scrubbed URL keeps its host for diagnosis: {redacted}"
+    );
+}
+
 // ───────────────── Part B: database-backed end-to-end (ignored) ─────────────────
 
-// memory—v1: The reviewed candidate DDL, extracted unchanged from its design document.
-//
-// The document keeps the DDL inside one block comment on purpose. This takes exactly
-// the text inside that comment and accepts nothing but the nine expected
-// `CREATE TABLE memory_*` statements.
-fn candidate_ddl() -> Vec<String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../Docs/memory-v1/数据库结构候选.sql");
-    let text = std::fs::read_to_string(&path).expect("read the candidate DDL document");
-    let start = text
-        .find("/* OFFLINE CANDIDATE")
-        .expect("the candidate DDL block comment");
-    let block = &text[start..];
-    let body_start = block.find('\n').expect("the marker line ends") + 1;
-    let body_end = block.rfind("*/").expect("the block comment closes");
-    let sql = block[body_start..body_end]
+// memory—v1: The reviewed candidate DDL is kept inside an offline block and
+// only the explicitly allowed CREATE TABLE statements reach the fixture connection.
+fn fixture_ddl(text: &str, tables: &[&str]) -> Vec<String> {
+    let (_, block) = text
+        .split_once("/* OFFLINE CANDIDATE")
+        .expect("fixture DDL block");
+    let (_, body) = block.split_once('\n').expect("fixture DDL marker line");
+    let (body, _) = body.split_once("*/").expect("fixture DDL block end");
+    let sql = body
         .lines()
         .filter(|line| !line.trim_start().starts_with("--"))
         .collect::<Vec<_>>()
@@ -436,26 +721,11 @@ fn candidate_ddl() -> Vec<String> {
         .filter(|statement| !statement.is_empty())
         .map(str::to_owned)
         .collect();
-    let expected = [
-        "memory_user",
-        "memory_identity_card",
-        "memory_tenant",
-        "memory_user_card",
-        "memory_rule_set",
-        "memory_rule_set_version",
-        "memory_card_rule_set_binding",
-        "memory_binding_confirmation",
-        "memory_rule_set_change_confirmation",
-    ];
-    assert_eq!(
-        statements.len(),
-        expected.len(),
-        "unexpected DDL statements"
-    );
-    for (statement, table) in statements.iter().zip(expected) {
+    assert_eq!(statements.len(), tables.len(), "unexpected DDL statements");
+    for (statement, table) in statements.iter().zip(tables) {
         assert!(
             statement.starts_with(&format!("CREATE TABLE {table} (")),
-            "unexpected DDL statement for {table}: {statement}"
+            "unexpected DDL statement for {table}"
         );
         assert!(
             !statement.contains("/*") && !statement.contains("*/"),
@@ -463,6 +733,37 @@ fn candidate_ddl() -> Vec<String> {
         );
     }
     statements
+}
+
+// memory—v1: The nine candidate source tables in fixture order.
+fn candidate_ddl() -> Vec<String> {
+    fixture_ddl(
+        include_str!("../../Docs/memory-v1/数据库结构候选.sql"),
+        &[
+            "memory_user",
+            "memory_identity_card",
+            "memory_tenant",
+            "memory_user_card",
+            "memory_rule_set",
+            "memory_rule_set_version",
+            "memory_card_rule_set_binding",
+            "memory_binding_confirmation",
+            "memory_rule_set_change_confirmation",
+        ],
+    )
+}
+
+// memory—v1: Only the run-owned E2E schema adds the four apply tables.
+fn apply_candidate_ddl() -> Vec<String> {
+    fixture_ddl(
+        include_str!("../../Docs/sql/memory-v1-apply-candidate.sql"),
+        &[
+            "mv1_apply_fence",
+            "mv1_apply_receipt",
+            "mv1_apply_progress",
+            "mv1_apply_audit_event",
+        ],
+    )
 }
 
 // memory—v1: The offline candidate includes the frozen user-card status domain.
@@ -912,9 +1213,14 @@ fn end_to_end_loopback_guard_accepts_ipv6_and_refuses_remote_hosts() {
 }
 
 #[tokio::test]
-#[ignore = "needs ASTRAL_MEMORY_V1_E2E_ADMIN_URL: a loopback MySQL server URL; creates and drops one run-scoped database"]
+#[ignore = "production adoption gate: requires reconciled journal/bootstrap, independent evidence and a loopback MySQL fixture; creates and drops one run-scoped database"]
 // memory—v1: Cold-load a run-scoped database, serve the real lifecycle, stop, drop the database.
 async fn real_service_end_to_end_against_a_run_scoped_database() {
+    with_run_scoped_mysql_fixture(false).await;
+}
+
+// memory—v1: Share setup and teardown between the independent MySQL process lanes.
+async fn with_run_scoped_mysql_fixture(recovery: bool) {
     // Configuration is checked on every platform first: a missing or non-loopback server is an
     // error, never a silent skip.
     let admin_url = std::env::var("ASTRAL_MEMORY_V1_E2E_ADMIN_URL")
@@ -966,11 +1272,11 @@ async fn real_service_end_to_end_against_a_run_scoped_database() {
             .connect(&run_url)
             .await
             .expect("connect to the run-scoped database");
-        for statement in candidate_ddl() {
+        for statement in candidate_ddl().into_iter().chain(apply_candidate_ddl()) {
             sqlx::query(&statement)
                 .execute(&pool)
                 .await
-                .unwrap_or_else(|error| panic!("apply candidate DDL: {error}\n{statement}"));
+                .unwrap_or_else(|error| panic!("apply fixture DDL: {error}"));
         }
         let rows = {
             let mut connection = pool.acquire().await.expect("acquire fixture connection");
@@ -978,14 +1284,49 @@ async fn real_service_end_to_end_against_a_run_scoped_database() {
                 .await
                 .expect("seed the E2E fixture")
         };
-        pool.close().await;
 
         let dir = TempDir::new("e2e");
         let credentials = write_credentials(dir.path(), 0o600);
         let cwd = TempDir::new("e2e-cwd");
         let (env, _journal_dir) = service_env(&run_url, &credentials);
+        #[cfg(unix)]
+        let env = {
+            let (stream, epoch, genesis) =
+                stage_e2e_bootstrap(&env, _journal_dir.path(), &pool).await;
+            let mut connection = pool
+                .acquire()
+                .await
+                .expect("fixture source identity connection");
+            let scope =
+                astral_db::memory_v1_candidate_loader::read_startup_database_scope(&mut connection)
+                    .await
+                    .expect("read fixture source identity");
+            drop(connection);
+            if recovery {
+                mysql_recovery::exercise(mysql_recovery::Fixture {
+                    env,
+                    cwd: cwd.path(),
+                    evidence_dir: dir.path(),
+                    journal_dir: _journal_dir.path(),
+                    db: &pool,
+                    scope,
+                    stream,
+                    epoch,
+                    genesis,
+                    rows,
+                })
+                .await;
+                pool.close().await;
+                return;
+            }
+            startup_issuer::provision(env, cwd.path(), dir.path(), scope).await
+        };
+        pool.close().await;
         let mut running = start(&env, cwd.path());
         lifecycle(&mut running, rows).await;
+        assert!(running
+            .output()
+            .contains("memory-v1 signed startup evidence accepted"));
 
         // After the cold load the service holds no database connection.
         let observer = MySqlPoolOptions::new()

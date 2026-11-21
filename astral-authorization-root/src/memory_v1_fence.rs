@@ -286,6 +286,27 @@ pub(crate) enum FenceReadError {
     Poisoned,
 }
 
+/// The read-phase fence stamp captured when a request reader is created.
+///
+/// memory—v1 §4.7: Capture the registry and its immutable table before loading
+/// the request root. A later opening of a dependency invalidates this phase,
+/// even if the window has already closed by the final ALLOW check.
+#[derive(Clone)]
+pub(crate) struct FenceReadStamp {
+    registry: Arc<RegistryMarker>,
+    table: Arc<FenceTable>,
+}
+
+impl std::fmt::Debug for FenceReadStamp {
+    // memory—v1: The table internals stay private; only the observed revision
+    // is diagnostic output.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FenceReadStamp")
+            .field("revision", &self.table.revision)
+            .finish()
+    }
+}
+
 /// The actual snapshot premise a declaration is checked against.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FencePremise {
@@ -302,12 +323,12 @@ pub struct FenceRegistry {
 /// A conservative bound for live fences. A caller that needs more concurrent
 /// fences must choose a larger bound as part of the root capacity contract.
 const MAX_ACTIVE_FENCES: usize = 4096;
-// Bound caller-supplied dependency lists before processing a final check.
-pub(crate) const MAX_FENCE_CHECK_OBJECTS: usize = 4096;
+// Historical sample width for final-check regressions, not a cardinality limit.
+#[cfg(test)]
+pub(crate) const FENCE_SAMPLE_WIDTH: usize = 4096;
 // The standalone registry accepts arbitrary IDs. Retaining at most this many
-// inactive object generations bounds memory independently of ID churn. Existing
-// rule sets fit within the root digest key limit, but churn through new IDs can
-// still evict proof; an overlapping check then conservatively returns PENDING.
+// inactive object generations bounds memory independently of ID churn. Eviction
+// can invalidate an overlapping check, which then conservatively returns PENDING.
 const MAX_INACTIVE_FENCE_HISTORY: usize = 4096;
 
 #[derive(Clone)]
@@ -545,6 +566,70 @@ impl FenceRegistry {
         Ok(observation)
     }
 
+    /// memory—v1 §4.7: Capture one read-phase stamp from one table snapshot.
+    ///
+    /// The stamp must be captured before the caller loads the request snapshot
+    /// so no begin->abort window on a touched rule set can hide between the
+    /// two. Poison is reported instead of a stamp; the caller must treat the
+    /// read phase as unverifiable.
+    pub(crate) fn try_capture_read_stamp(&self) -> Result<FenceReadStamp, FenceReadError> {
+        if self.state.writer.is_poisoned() {
+            return Err(FenceReadError::Poisoned);
+        }
+        let stamp = FenceReadStamp {
+            registry: Arc::clone(&self.state.marker),
+            table: self.state.table.load_full(),
+        };
+        if self.state.writer.is_poisoned() {
+            return Err(FenceReadError::Poisoned);
+        }
+        Ok(stamp)
+    }
+
+    /// memory—v1 §4.7: Bracket `f` with object-specific observations and prove,
+    /// against the read-phase stamp table, that no declared dependency opened
+    /// during the phase or during the bracket.
+    ///
+    /// Check the same dependencies at the final clock sample. A later opening
+    /// invalidates the read even if it has already closed; an evicted opening
+    /// invalidates any read whose proof can no longer be established.
+    pub(crate) fn try_with_unfenced_since_stamp<T>(
+        &self,
+        stamp: &FenceReadStamp,
+        rule_set_ids: &[BinaryId],
+        f: impl FnOnce(&dyn Fn(BinaryId) -> bool) -> T,
+    ) -> Option<T> {
+        if !Arc::ptr_eq(&stamp.registry, &self.state.marker) || !self.metadata_is_healthy() {
+            return None;
+        }
+        // Root callers supply a sorted, deduplicated list. Refuse an ambiguous
+        // list rather than copying it or accepting an undeclared dependency.
+        if rule_set_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return None;
+        }
+        let initial = self.state.table.load();
+        let result = f(&|rule_set_id| {
+            rule_set_ids.binary_search(&rule_set_id).is_ok()
+                && !initial.active.contains_key(&rule_set_id)
+        });
+        let current = self.state.table.load();
+        if !self.metadata_is_healthy()
+            || current.history_floor > stamp.table.revision
+            || rule_set_ids.iter().any(|id| {
+                stamp.table.active.contains_key(id)
+                    || initial.active.contains_key(id)
+                    || current.active.contains_key(id)
+                    || current
+                        .object_revisions
+                        .get(id)
+                        .is_some_and(|opened| *opened > stamp.table.revision)
+            })
+        {
+            return None;
+        }
+        Some(result)
+    }
+
     /// memory—v1: Prove the commit still owns the live window in this registry.
     pub(crate) fn verify_guard(
         &self,
@@ -625,39 +710,18 @@ impl FenceRegistry {
     /// occur between snapshots, even if it closes before the second snapshot.
     /// The history floor refuses observations whose proof was evicted. Unknown
     /// keys and initially active dependencies fail closed.
+    ///
+    /// This no-stamp form captures the stamp immediately before the bracket;
+    /// production final checks must pass the read-phase stamp of the reader
+    /// that produced their dependency record (§4.7 ABA protection).
+    #[cfg(test)]
     pub(crate) fn try_with_unfenced<T>(
         &self,
         rule_set_ids: &[BinaryId],
         f: impl FnOnce(&dyn Fn(BinaryId) -> bool) -> T,
     ) -> Option<T> {
-        if rule_set_ids.len() > MAX_FENCE_CHECK_OBJECTS || !self.metadata_is_healthy() {
-            return None;
-        }
-        // Root callers supply a sorted, deduplicated list. Refuse an ambiguous
-        // list rather than copying it or accepting an undeclared dependency.
-        if rule_set_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return None;
-        }
-        let initial = self.state.table.load();
-        let result = f(&|rule_set_id| {
-            rule_set_ids.binary_search(&rule_set_id).is_ok()
-                && !initial.active.contains_key(&rule_set_id)
-        });
-        let current = self.state.table.load();
-        if !self.metadata_is_healthy()
-            || current.history_floor > initial.revision
-            || rule_set_ids.iter().any(|rule_set_id| {
-                initial.active.contains_key(rule_set_id)
-                    || current.active.contains_key(rule_set_id)
-                    || current
-                        .object_revisions
-                        .get(rule_set_id)
-                        .is_some_and(|revision| *revision > initial.revision)
-            })
-        {
-            return None;
-        }
-        Some(result)
+        let stamp = self.try_capture_read_stamp().ok()?;
+        self.try_with_unfenced_since_stamp(&stamp, rule_set_ids, f)
     }
 
     /// memory—v1: Read one immutable fence snapshot without waiting for a writer.
@@ -874,7 +938,7 @@ mod tests {
         );
         fences.abort(second).unwrap();
         assert!(fences
-            .try_with_unfenced(&vec![first; MAX_FENCE_CHECK_OBJECTS + 1], |_| ())
+            .try_with_unfenced(&vec![first; FENCE_SAMPLE_WIDTH + 1], |_| ())
             .is_none());
         assert!(fences.try_with_unfenced(&[first, first], |_| ()).is_none());
         assert!(fences.try_with_unfenced(&[second, first], |_| ()).is_none());
@@ -982,6 +1046,7 @@ mod tests {
             None
         );
         fences.abort([1; 16]).unwrap();
+        // Both windows closed before this read began.
         assert_eq!(
             fences.try_with_unfenced(&[[1; 16], [2; 16]], |unfenced| unfenced([2; 16])),
             Some(true)
@@ -1096,6 +1161,123 @@ mod tests {
         assert_eq!(table.history_floor, FenceRevision(1));
         assert_eq!(table.inactive_revisions.len(), MAX_INACTIVE_FENCE_HISTORY);
         assert!(!table.object_revisions.contains_key(&old));
+    }
+
+    // memory—v1 §4.7: A read-phase stamp detects a begin->abort window on a
+    // touched rule set (ABA) while an unrelated window leaves the stamp usable.
+    #[test]
+    fn read_stamp_detects_touched_aba_and_ignores_unrelated_windows() {
+        let fences = FenceRegistry::default();
+        let touched = [1; 16];
+        let unrelated = [2; 16];
+
+        // No openings at all: the initial stamp proves both objects unopened.
+        let stamp = fences.try_capture_read_stamp().unwrap();
+        assert_eq!(stamp.table.revision, FenceRevision(0));
+        assert_eq!(
+            fences.try_with_unfenced_since_stamp(&stamp, &[touched], |unfenced| unfenced(touched)),
+            Some(true)
+        );
+        assert_eq!(
+            fences.try_with_unfenced_since_stamp(&stamp, &[unrelated], |unfenced| unfenced(
+                unrelated
+            )),
+            Some(true)
+        );
+
+        // A complete window on the touched object must fail the recheck even
+        // though the fence is no longer active (begin->abort ABA).
+        fences
+            .begin(touched, &declaration(b"v1"), &premise(b"v1"))
+            .unwrap();
+        fences.abort(touched).unwrap();
+        assert_eq!(
+            fences.try_with_unfenced_since_stamp(&stamp, &[touched], |unfenced| unfenced(touched)),
+            None
+        );
+        // The same global revision advance must not touch the unrelated object.
+        assert_eq!(
+            fences.try_with_unfenced_since_stamp(&stamp, &[unrelated], |unfenced| unfenced(
+                unrelated
+            )),
+            Some(true)
+        );
+
+        // A phase begun after close can use the object, but only in this registry.
+        let fresh = fences.try_capture_read_stamp().unwrap();
+        assert_eq!(
+            fences.try_with_unfenced_since_stamp(&fresh, &[touched], |unfenced| unfenced(touched)),
+            Some(true)
+        );
+        assert_eq!(
+            FenceRegistry::default().try_with_unfenced_since_stamp(&fresh, &[touched], |_| ()),
+            None
+        );
+        fences
+            .begin(touched, &declaration(b"v1"), &premise(b"v1"))
+            .unwrap();
+        let inside = fences.try_capture_read_stamp().unwrap();
+        fences.abort(touched).unwrap();
+        assert_eq!(
+            fences.try_with_unfenced_since_stamp(&inside, &[touched], |_| ()),
+            None
+        );
+    }
+
+    // memory—v1 §4.7: A stamp whose proof may have been evicted fails closed
+    // for unknown objects, and the union check keeps ABA and eviction in one
+    // snapshot.
+    #[test]
+    fn read_stamp_fails_closed_on_evicted_history() {
+        let fences = FenceRegistry::default();
+        let relevant = u128::MAX.to_be_bytes();
+        let stamp = fences.try_capture_read_stamp().unwrap();
+        fences
+            .begin(relevant, &declaration(b"v1"), &premise(b"v1"))
+            .unwrap();
+        fences.abort(relevant).unwrap();
+        for id in 0..MAX_INACTIVE_FENCE_HISTORY {
+            let other = (id as u128).to_be_bytes();
+            fences
+                .begin(other, &declaration(b"v1"), &premise(b"v1"))
+                .unwrap();
+            fences.abort(other).unwrap();
+        }
+        // The relevant opening was evicted; the floor advanced past the stamp,
+        // so absence of a retained entry cannot prove "never opened".
+        assert_eq!(
+            fences
+                .try_with_unfenced_since_stamp(&stamp, &[relevant], |unfenced| unfenced(relevant)),
+            None
+        );
+        // A stamp captured after the evictions stays usable.
+        let fresh = fences.try_capture_read_stamp().unwrap();
+        assert_eq!(
+            fences
+                .try_with_unfenced_since_stamp(&fresh, &[relevant], |unfenced| unfenced(relevant)),
+            Some(true)
+        );
+    }
+
+    // memory—v1: A poisoned writer cannot issue a read stamp, and a stamped
+    // check under poison fails closed.
+    #[test]
+    fn read_stamp_rejects_poisoned_writer() {
+        let fences = FenceRegistry::default();
+        let state = Arc::clone(&fences.state);
+        assert!(std::thread::spawn(move || {
+            let _lock = state.writer.write().unwrap();
+            panic!("inject fence writer poison");
+        })
+        .join()
+        .is_err());
+        assert!(matches!(
+            fences.try_capture_read_stamp(),
+            Err(FenceReadError::Poisoned)
+        ));
+        assert!(fences
+            .try_with_unfenced(&[1_u128.to_be_bytes()], |_| ())
+            .is_none());
     }
 
     // memory—v1 §4.6: one fence per object; a second modifier is rejected.

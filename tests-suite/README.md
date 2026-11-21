@@ -16,6 +16,40 @@ bash scripts/run-tests.sh --campaign --run --suite native-projection-lifecycle
 
 MANIFEST 中单独标记的 `COMPAT`/历史 campaign 条目是历史分类或阻塞边界，不是当前 Cargo 可执行目标；独立历史结果保持原样，不由当前文档改写为新的 PASS/FAIL。已退役 runner/probe 实现不作为执行入口或推荐路径。
 
+## DarkStar 全量测试与日志包
+
+```bash
+bash scripts/run-darkstar-tests.sh --list
+bash scripts/run-darkstar-tests.sh --artifact-root "$HOME/darkstar-evidence"
+# 仅在隔离实例、独立测试库和账户准备好，并注入专用 URL 后使用：
+ASTRAL_DARKSTAR_MYSQL_APPROVED_RUN="$RUN_ID" ASTRAL_PAPER_MYSQL_APPROVED_RUN="$RUN_ID" \
+  bash scripts/run-darkstar-tests.sh --mysql --run-id "$RUN_ID" --artifact-root "$HOME/darkstar-evidence"
+```
+
+入口复用 `test-campaign` 的 Rust 执行、断言计数和日志检查。清单组合 [`MANIFEST.toml`](MANIFEST.toml) 的论文套件及 [`darkstar.toml`](../test-harness/src/campaign/darkstar.toml) 的当前实现、规模、压力和真实库补充项。默认运行离线和临时回环测试，不连接 MySQL；`--list` 不启动测试。需要已安装 Rust、锁定依赖缓存、Git 和 `tar`。复测可重复使用 `--suite <完整套件 ID>`，例如 `bash scripts/run-darkstar-tests.sh --list --suite darkstar-binding-history --suite paper-repair-full-bounds`；只运行选中项，顺序沿用全量计划，MySQL 目标仍需 `--mysql`。大型修复模型安排在最后，建议以独立 run-id 和有内存上限的隔离进程运行，不与性能采样并跑。
+
+两条模拟套件也可单独运行，无需 `--mysql`：
+
+```bash
+bash scripts/run-darkstar-tests.sh \
+  --suite darkstar-synthetic-paper-warm-governance \
+  --suite darkstar-synthetic-binary-lifecycle
+```
+
+它们使用模拟快照，走真实回环 HTTP 和临时本机 journal，分别测试暖态卡片治理与会话生命周期。结果按独立 ID 和 `synthetic_evidence` 标记归档，不替代 `paper-usenix-mysql` 或 `darkstar-mysql-binary-e2e`，也不证明数据库来源、正式采纳或真实进程就绪。
+
+默认计划还包括 `darkstar-synthetic-writer-contention`（四写者、四读者及锁阶段采样）和 `darkstar-synthetic-soak-smoke`（四个一秒窗口）。完整一小时独立运行：
+
+```bash
+bash scripts/run-darkstar-tests.sh --suite darkstar-synthetic-soak-hour
+```
+
+`darkstar-mysql-binary-e2e` 使用临时测试签发者验证真实二进制启动与 HTTP 生命周期。独立的 `darkstar-mysql-transport-recovery` 使用同一类型的隔离实例，切断并恢复进程到 MySQL 的连接，核对首个正确授权响应及一条 DENY 的回执和审计；不停止 MySQL 进程，不证明生产签发、数据库崩溃恢复或生产 RTO。
+
+`--mysql` 额外要求独立 MySQL 8.0 测试实例。论文夹具使用下文的 `ASTRAL_PAPER_MYSQL_URL`；另为 `ASTRAL_MEMORY_V1_APPLY_TEST_MYSQL_URL` 准备仅限 `astral_rehearsal_apply_$RUN_ID` 的 `darkstar_apply` 账户，预置九张候选表和四张 apply 表；冷安装会核对整个快照的行数，因此 `ASTRAL_DARKSTAR_COLD_MYSQL_URL` 必须使用另一个空库 `astral_rehearsal_cold_$RUN_ID` 和仅限该库的 `darkstar_cold` 账户，预置同样的十三张表；`ASTRAL_MEMORY_V1_E2E_ADMIN_URL` 使用无默认数据库的 `darkstar_e2e` 账户，仅在一次性实例内允许创建和删除测试库。四个 URL 均须使用数字 IPv4 回环和端口 `3308`。不要指向宿主现有实例、共享库或转发到生产的隧道。脚本不创建实例、不应用生产迁移、不绕过真实进程的采纳门禁。缺少授权或配置的套件单独记为 `BLOCKED`；选中后断言失败记为 `FAIL`。独立套件继续执行，无法证明子进程或日志已收尾的 `UNKNOWN` 停止后续派发，不自动重试。
+
+每个 run-id 输出独立 `result.json`、逐项 stdout/stderr 和带 SHA-256 的 `.tar.gz`；日志按执行器既有规则脱敏，未证明完整或未脱敏的日志不计入完整证据。压缩包内 `SHA256SUMS` 可在解包目录校验。其它独立工作区、旧 V6/V7/S15、Redis/RabbitMQ 历史路径及外部 TLA+ 不计作本次 DarkStar PASS。
+
 ## DarkStar 论文复跑：USENIX Security / Computers & Security
 
 在仓库根目录使用 [`scripts/run-paper-tests.sh`](../scripts/run-paper-tests.sh)。入口自动构建 Rust runner 和所选测试二进制；需要 Git、仓库指定的 Rust 工具链、系统链接器以及与 `Cargo.lock` 匹配的本地依赖缓存。不联网下载、不安装系统工具；首次准备空缓存应由操作者单独完成。仅回环性能夹具要求 Unix 文件权限、可用的临时目录与回环端口。

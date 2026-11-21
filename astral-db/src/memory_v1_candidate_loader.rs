@@ -30,18 +30,18 @@ use astral_authorization_root::memory_v1_db_rows::{
     TenantRow, UserCardRow, UserCardStatus, UserRow,
 };
 use astral_authorization_root::memory_v1_rules::{MemoryV1OwnerScope, MemoryV1TenantScope};
+use astral_types::{memory_v1::MemoryId, memory_v1_journal::JournalAnchor};
+use futures_util::TryStreamExt;
 use sqlx::{mysql::MySqlRow, Connection, MySql, MySqlPool, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-// These are capture limits, not protocol limits. Transient SQLx row buffers and
-// container overhead are additional; each of at most five variable fields is
-// capped server-side at the remaining byte budget plus one overflow byte.
-const MAX_ROWS: usize = 100_000;
-const MAX_BYTES: usize = 16 * 1024 * 1024;
+// Limit one variable field independently of the whole snapshot. SQL reads one
+// extra byte; decoding rejects the sentinel instead of accepting a clipped field.
+const MAX_FIELD_BYTES: usize = 16 * 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(30);
 
-/// Caller-chosen total limits across all nine tables, bounded by implementation caps.
+/// Caller-chosen total limits across all nine tables, separate from per-field limits.
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureBudget {
     /// Maximum number of rows across the nine tables.
@@ -192,6 +192,8 @@ pub enum CandidateCaptureError {
     /// The full manifest comparison failed without exposing raw metadata values.
     #[error("memory-v1 candidate schema contract failed: {0}")]
     SchemaContract(String),
+    #[error("candidate snapshot lacks the exact locally confirmed apply prefix")]
+    ApplyPrefixMismatch,
     /// A field has an invalid value or an unsupported byte length.
     #[error("invalid candidate field: {0}")]
     InvalidField(&'static str),
@@ -241,11 +243,7 @@ struct Meter {
 impl Meter {
     // memory—v1: Validate caller caps before acquiring a connection.
     fn new(budget: CaptureBudget) -> Result<Self, CandidateCaptureError> {
-        if budget.max_rows == 0
-            || budget.max_rows > MAX_ROWS
-            || budget.max_bytes == 0
-            || budget.max_bytes > MAX_BYTES
-        {
+        if budget.max_rows == 0 || budget.max_bytes == 0 {
             return Err(CandidateCaptureError::InvalidBudget);
         }
         Ok(Self {
@@ -269,6 +267,9 @@ impl Meter {
 
     // memory—v1: Charge exact field bytes and reject overflow without truncating.
     fn bytes(&mut self, len: usize) -> Result<(), CandidateCaptureError> {
+        if len > MAX_FIELD_BYTES {
+            return Err(CandidateCaptureError::BudgetExceeded("field"));
+        }
         self.bytes = self
             .bytes
             .checked_add(len)
@@ -281,7 +282,12 @@ impl Meter {
 
     // memory—v1: Limit every variable field before SQLx receives it.
     fn sentinel(&self) -> i64 {
-        (self.budget.max_bytes - self.bytes + 1) as i64
+        (self
+            .budget
+            .max_bytes
+            .saturating_sub(self.bytes)
+            .min(MAX_FIELD_BYTES)
+            + 1) as i64
     }
 }
 
@@ -448,10 +454,8 @@ fn tenant_scope(
     }
 }
 
-// Fixed queries use server-side byte caps and fetch at most one row at a time.
-// OFFSET is bounded by MAX_ROWS and the whole capture has a deadline. Ordering
-// uses the original key columns, but uniqueness is not yet verified; a completed
-// scan therefore remains diagnostic and does not prove coverage.
+// Fixed ordered scans are consumed one SQLx row at a time under the transaction
+// deadline and the caller's total budget. Completion alone does not prove coverage.
 struct TableSpec {
     name: &'static str,
     sql: &'static str,
@@ -459,15 +463,15 @@ struct TableSpec {
 }
 
 const TABLES: &[TableSpec] = &[
-    TableSpec { name: "memory_user", sql: "SELECT LEFT(user_id,17) AS user_id FROM memory_user ORDER BY user_id LIMIT 1 OFFSET ?", variable_fields: 0 },
-    TableSpec { name: "memory_identity_card", sql: "SELECT LEFT(identity_card_id,17) AS identity_card_id, LEFT(user_id,17) AS user_id FROM memory_identity_card ORDER BY identity_card_id LIMIT 1 OFFSET ?", variable_fields: 0 },
-    TableSpec { name: "memory_tenant", sql: "SELECT LEFT(tenant_id,17) AS tenant_id, LEFT(parent_tenant_id,17) AS parent_tenant_id FROM memory_tenant ORDER BY tenant_id LIMIT 1 OFFSET ?", variable_fields: 0 },
-    TableSpec { name: "memory_user_card", sql: "SELECT LEFT(user_card_id,17) AS user_card_id, LEFT(user_id,17) AS user_id, LEFT(tenant_id,17) AS tenant_id, LEFT(CAST(status AS BINARY),16) AS status FROM memory_user_card ORDER BY user_card_id LIMIT 1 OFFSET ?", variable_fields: 0 },
-    TableSpec { name: "memory_rule_set", sql: "SELECT LEFT(rule_set_id,17) AS rule_set_id, LEFT(owner_tenant_id,17) AS owner_tenant_id, LEFT(current_version_bytes,?) AS current_version_bytes, LEFT(CAST(status AS BINARY),17) AS status FROM memory_rule_set ORDER BY rule_set_id LIMIT 1 OFFSET ?", variable_fields: 1 },
-    TableSpec { name: "memory_rule_set_version", sql: "SELECT LEFT(rule_set_id,17) AS rule_set_id, LEFT(version_bytes,?) AS version_bytes, LEFT(content_bytes,?) AS content_bytes, LEFT(timestamp_bytes,?) AS timestamp_bytes, LEFT(hash_input_bytes,?) AS hash_input_bytes, LEFT(hash_bytes,?) AS hash_bytes FROM memory_rule_set_version ORDER BY memory_rule_set_version.rule_set_id, memory_rule_set_version.version_bytes LIMIT 1 OFFSET ?", variable_fields: 5 },
-    TableSpec { name: "memory_card_rule_set_binding", sql: "SELECT LEFT(binding_id,17) AS binding_id, LEFT(user_card_id,17) AS user_card_id, LEFT(rule_set_id,17) AS rule_set_id, LEFT(CAST(binding_layer AS BINARY),8) AS binding_layer, valid_from, valid_until, LEFT(CAST(owner_scope AS BINARY),32) AS owner_scope, LEFT(CAST(tenant_scope AS BINARY),32) AS tenant_scope, removed_at, LEFT(removed_by,17) AS removed_by FROM memory_card_rule_set_binding ORDER BY binding_id LIMIT 1 OFFSET ?", variable_fields: 0 },
-    TableSpec { name: "memory_binding_confirmation", sql: "SELECT LEFT(confirmation_id,17) AS confirmation_id, LEFT(binding_id,17) AS binding_id, LEFT(rule_set_id,17) AS rule_set_id, LEFT(version_bytes,?) AS version_bytes, LEFT(confirmer_user_id,17) AS confirmer_user_id, LEFT(scope_bytes,?) AS scope_bytes, LEFT(operation_id,?) AS operation_id, LEFT(confirmed_at_bytes,?) AS confirmed_at_bytes, revoked_at, LEFT(revoked_by,17) AS revoked_by FROM memory_binding_confirmation ORDER BY confirmation_id LIMIT 1 OFFSET ?", variable_fields: 4 },
-    TableSpec { name: "memory_rule_set_change_confirmation", sql: "SELECT LEFT(confirmation_id,17) AS confirmation_id, LEFT(rule_set_id,17) AS rule_set_id, LEFT(version_bytes,?) AS version_bytes, LEFT(confirmer_user_id,17) AS confirmer_user_id, LEFT(affected_scope_bytes,?) AS affected_scope_bytes, LEFT(operation_id,?) AS operation_id, LEFT(confirmed_at_bytes,?) AS confirmed_at_bytes, revoked_at, LEFT(revoked_by,17) AS revoked_by FROM memory_rule_set_change_confirmation ORDER BY confirmation_id LIMIT 1 OFFSET ?", variable_fields: 4 },
+    TableSpec { name: "memory_user", sql: "SELECT LEFT(user_id,17) AS user_id FROM memory_user ORDER BY user_id LIMIT ?", variable_fields: 0 },
+    TableSpec { name: "memory_identity_card", sql: "SELECT LEFT(identity_card_id,17) AS identity_card_id, LEFT(user_id,17) AS user_id FROM memory_identity_card ORDER BY identity_card_id LIMIT ?", variable_fields: 0 },
+    TableSpec { name: "memory_tenant", sql: "SELECT LEFT(tenant_id,17) AS tenant_id, LEFT(parent_tenant_id,17) AS parent_tenant_id FROM memory_tenant ORDER BY tenant_id LIMIT ?", variable_fields: 0 },
+    TableSpec { name: "memory_user_card", sql: "SELECT LEFT(user_card_id,17) AS user_card_id, LEFT(user_id,17) AS user_id, LEFT(tenant_id,17) AS tenant_id, LEFT(CAST(status AS BINARY),16) AS status FROM memory_user_card ORDER BY user_card_id LIMIT ?", variable_fields: 0 },
+    TableSpec { name: "memory_rule_set", sql: "SELECT LEFT(rule_set_id,17) AS rule_set_id, LEFT(owner_tenant_id,17) AS owner_tenant_id, LEFT(current_version_bytes,?) AS current_version_bytes, LEFT(CAST(status AS BINARY),17) AS status FROM memory_rule_set ORDER BY rule_set_id LIMIT ?", variable_fields: 1 },
+    TableSpec { name: "memory_rule_set_version", sql: "SELECT LEFT(rule_set_id,17) AS rule_set_id, LEFT(version_bytes,?) AS version_bytes, LEFT(content_bytes,?) AS content_bytes, LEFT(timestamp_bytes,?) AS timestamp_bytes, LEFT(hash_input_bytes,?) AS hash_input_bytes, LEFT(hash_bytes,?) AS hash_bytes FROM memory_rule_set_version ORDER BY memory_rule_set_version.rule_set_id, memory_rule_set_version.version_bytes LIMIT ?", variable_fields: 5 },
+    TableSpec { name: "memory_card_rule_set_binding", sql: "SELECT LEFT(binding_id,17) AS binding_id, LEFT(user_card_id,17) AS user_card_id, LEFT(rule_set_id,17) AS rule_set_id, LEFT(CAST(binding_layer AS BINARY),8) AS binding_layer, valid_from, valid_until, LEFT(CAST(owner_scope AS BINARY),32) AS owner_scope, LEFT(CAST(tenant_scope AS BINARY),32) AS tenant_scope, removed_at, LEFT(removed_by,17) AS removed_by FROM memory_card_rule_set_binding ORDER BY binding_id LIMIT ?", variable_fields: 0 },
+    TableSpec { name: "memory_binding_confirmation", sql: "SELECT LEFT(confirmation_id,17) AS confirmation_id, LEFT(binding_id,17) AS binding_id, LEFT(rule_set_id,17) AS rule_set_id, LEFT(version_bytes,?) AS version_bytes, LEFT(confirmer_user_id,17) AS confirmer_user_id, LEFT(scope_bytes,?) AS scope_bytes, LEFT(operation_id,?) AS operation_id, LEFT(confirmed_at_bytes,?) AS confirmed_at_bytes, revoked_at, LEFT(revoked_by,17) AS revoked_by FROM memory_binding_confirmation ORDER BY confirmation_id LIMIT ?", variable_fields: 4 },
+    TableSpec { name: "memory_rule_set_change_confirmation", sql: "SELECT LEFT(confirmation_id,17) AS confirmation_id, LEFT(rule_set_id,17) AS rule_set_id, LEFT(version_bytes,?) AS version_bytes, LEFT(confirmer_user_id,17) AS confirmer_user_id, LEFT(affected_scope_bytes,?) AS affected_scope_bytes, LEFT(operation_id,?) AS operation_id, LEFT(confirmed_at_bytes,?) AS confirmed_at_bytes, revoked_at, LEFT(revoked_by,17) AS revoked_by FROM memory_rule_set_change_confirmation ORDER BY confirmation_id LIMIT ?", variable_fields: 4 },
 ];
 
 // memory—v1: Fixed metadata queries fetch one extra row as an overflow sentinel.
@@ -838,26 +842,29 @@ async fn read_rows(
     let mut out = CandidateRows::default();
     let mut scans = Vec::with_capacity(TABLES.len());
     for table in TABLES {
-        let mut offset = 0_i64;
         let mut table_rows = 0_usize;
-        loop {
-            let mut query = sqlx::query(table.sql);
-            for _ in 0..table.variable_fields {
-                query = query.bind(meter.sentinel());
-            }
-            let row = query
-                .bind(offset)
-                .fetch_optional(&mut **tx)
-                .await
-                .map_err(|e| db_error(table.name, e))?;
-            let Some(row) = row else { break };
+        let mut query = sqlx::query(table.sql);
+        for _ in 0..table.variable_fields {
+            query = query.bind(meter.sentinel());
+        }
+        // Fetch a sentinel row beyond the entire remaining allowance, never an
+        // accepted prefix. Streaming avoids one round trip and OFFSET scan per row.
+        let row_limit = u64::try_from(meter.budget.max_rows - meter.rows)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut stream = query.bind(row_limit).fetch(&mut **tx);
+        while let Some(row) = stream
+            .try_next()
+            .await
+            .map_err(|e| db_error(table.name, e))?
+        {
             meter.row()?;
             table_rows = table_rows
                 .checked_add(1)
                 .ok_or(CandidateCaptureError::BudgetExceeded("table row"))?;
             append(table.name, &row, &mut meter, &mut out)?;
-            offset += 1;
         }
+        drop(stream);
         // The count is read after the scan inside the same REPEATABLE READ snapshot,
         // so it is an independent view of the same rows, not a later state.
         let counted = count_rows(tx, table.name).await?;
@@ -928,8 +935,111 @@ pub async fn capture_unverified_candidate_rows_with_schema_diagnostic(
     pool: &MySqlPool,
     budget: CaptureBudget,
 ) -> Result<CandidateCaptureWithSchemaDiagnostic, CandidateCaptureError> {
+    capture_with_prefix(pool, budget, CaptureBinding::Unverified)
+        .await
+        .map(|(capture, _)| capture)
+}
+
+/// A candidate and the source identity observed in the same applied-prefix transaction.
+#[derive(Debug)]
+pub struct AppliedCandidateCapture {
+    pub candidate: CandidateCaptureWithSchemaDiagnostic,
+    pub database_scope: [u8; 32],
+}
+
+/// memory—v1: Capture the exact applied prefix and bind it to the source DB scope.
+pub async fn capture_startup_candidate(
+    pool: &MySqlPool,
+    budget: CaptureBudget,
+    epoch: astral_types::memory_v1::MemoryId,
+    tail: astral_types::memory_v1_journal::JournalAnchor,
+) -> Result<AppliedCandidateCapture, CandidateCaptureError> {
+    let (candidate, database_scope) =
+        capture_with_prefix(pool, budget, CaptureBinding::Startup(epoch, tail)).await?;
+    Ok(AppliedCandidateCapture {
+        candidate,
+        database_scope: database_scope
+            .ok_or(CandidateCaptureError::InvalidField("database identity"))?,
+    })
+}
+
+/// memory—v1: In one read-only snapshot require the local checkpoint's applied
+/// position, then capture the nine fact tables. Even genesis needs an explicit
+/// installed progress row. No progress is created or inferred here.
+pub async fn capture_candidate_at_applied_prefix(
+    pool: &MySqlPool,
+    budget: CaptureBudget,
+    epoch: astral_types::memory_v1::MemoryId,
+    tail: astral_types::memory_v1_journal::JournalAnchor,
+) -> Result<CandidateCaptureWithSchemaDiagnostic, CandidateCaptureError> {
+    capture_with_prefix(pool, budget, CaptureBinding::Applied(epoch, tail))
+        .await
+        .map(|(capture, _)| capture)
+}
+
+#[derive(Clone, Copy)]
+enum CaptureBinding {
+    Unverified,
+    Applied(MemoryId, JournalAnchor),
+    Startup(MemoryId, JournalAnchor),
+}
+
+// memory—v1: The caller selected the stream in this transaction's WHERE clause.
+fn require_matching_progress(
+    progress: Option<&crate::memory_v1_apply::MemoryV1ApplyProgressRow>,
+    epoch: astral_types::memory_v1::MemoryId,
+    tail: astral_types::memory_v1_journal::JournalAnchor,
+) -> Result<(), CandidateCaptureError> {
+    match progress {
+        Some(row)
+            if row.epoch_id == epoch
+                && row.last_journal_sequence == tail.journal_sequence()
+                && row.last_mutation_sequence == tail.mutation_sequence()
+                && row.last_frame_hash == *tail.frame_hash() =>
+        {
+            Ok(())
+        }
+        _ => Err(CandidateCaptureError::ApplyPrefixMismatch),
+    }
+}
+
+type ScopedCapture = (CandidateCaptureWithSchemaDiagnostic, Option<[u8; 32]>);
+
+/// memory—v1: Observe this actual connection's scope before recovery. The
+/// server/database tuple is not provenance without an independent signature.
+pub async fn read_startup_database_scope(
+    connection: &mut sqlx::MySqlConnection,
+) -> Result<[u8; 32], CandidateCaptureError> {
+    use sha2::{Digest, Sha256};
+    let (server, name): (String, Option<String>) =
+        sqlx::query_as("SELECT @@GLOBAL.server_uuid, DATABASE()")
+            .fetch_one(connection)
+            .await
+            .map_err(|e| db_error("read snapshot database identity", e))?;
+    let server = Uuid::parse_str(&server)
+        .ok()
+        .filter(|uuid| !uuid.is_nil())
+        .ok_or(CandidateCaptureError::InvalidField("server UUID"))?;
+    let name = name
+        .filter(|name| !name.is_empty())
+        .ok_or(CandidateCaptureError::InvalidField("database name"))?;
+    Ok(Sha256::new()
+        .chain_update(b"astrallight/memory-v1/mysql-scope/1\0")
+        .chain_update(server.as_bytes())
+        .chain_update((name.len() as u64).to_be_bytes())
+        .chain_update(name.as_bytes())
+        .finalize()
+        .into())
+}
+
+// memory—v1: Share the existing connection, deadline and rollback policy.
+async fn capture_with_prefix(
+    pool: &MySqlPool,
+    budget: CaptureBudget,
+    binding: CaptureBinding,
+) -> Result<ScopedCapture, CandidateCaptureError> {
     let meter = Meter::new(budget)?;
-    tokio::time::timeout(DEADLINE, capture_inner(pool, meter))
+    tokio::time::timeout(DEADLINE, capture_inner(pool, meter, binding))
         .await
         .map_err(|_| CandidateCaptureError::Deadline)?
 }
@@ -938,7 +1048,8 @@ pub async fn capture_unverified_candidate_rows_with_schema_diagnostic(
 async fn capture_inner(
     pool: &MySqlPool,
     meter: Meter,
-) -> Result<CandidateCaptureWithSchemaDiagnostic, CandidateCaptureError> {
+    binding: CaptureBinding,
+) -> Result<ScopedCapture, CandidateCaptureError> {
     let mut connection = pool
         .acquire()
         .await
@@ -952,7 +1063,25 @@ async fn capture_inner(
         .begin_with("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
         .await
         .map_err(|e| db_error("begin snapshot", e))?;
-    match read_rows(&mut tx, meter).await {
+    let capture = async {
+        if let CaptureBinding::Applied(epoch, tail) | CaptureBinding::Startup(epoch, tail) = binding
+        {
+            let progress =
+                crate::memory_v1_apply_records::read_progress_row(&mut *tx, &tail.stream_id())
+                    .await
+                    .map_err(|error| db_error("read snapshot apply prefix", error))?;
+            require_matching_progress(progress.as_ref(), epoch, tail)?;
+        }
+        let database_scope = if matches!(binding, CaptureBinding::Startup(..)) {
+            Some(read_startup_database_scope(&mut tx).await?)
+        } else {
+            None
+        };
+        let captured = read_rows(&mut tx, meter).await?;
+        Ok((captured, database_scope))
+    }
+    .await;
+    match capture {
         Ok(rows) => {
             tx.commit()
                 .await
@@ -974,6 +1103,50 @@ mod tests {
     use super::*;
 
     #[test]
+    // memory—v1: Cold capture accepts only the exact applied position in this stream.
+    fn cold_capture_requires_exact_apply_progress() {
+        use crate::memory_v1_apply::MemoryV1ApplyProgressRow;
+        use astral_types::{memory_v1::MemoryId, memory_v1_journal::JournalAnchor};
+        let epoch = MemoryId::from_bytes([2; 16]);
+        let tail = JournalAnchor::new(MemoryId::from_bytes([1; 16]), 12, 8, [3; 32]).unwrap();
+        let row = MemoryV1ApplyProgressRow {
+            epoch_id: epoch,
+            last_journal_sequence: 12,
+            last_mutation_sequence: 8,
+            last_frame_hash: [3; 32],
+        };
+        assert!(require_matching_progress(Some(&row), epoch, tail).is_ok());
+        for observed in [
+            None,
+            Some(MemoryV1ApplyProgressRow {
+                epoch_id: MemoryId::from_bytes([4; 16]),
+                ..row.clone()
+            }),
+            Some(MemoryV1ApplyProgressRow {
+                last_journal_sequence: 11,
+                ..row.clone()
+            }),
+            Some(MemoryV1ApplyProgressRow {
+                last_journal_sequence: 13,
+                ..row.clone()
+            }),
+            Some(MemoryV1ApplyProgressRow {
+                last_mutation_sequence: 7,
+                ..row.clone()
+            }),
+            Some(MemoryV1ApplyProgressRow {
+                last_frame_hash: [5; 32],
+                ..row
+            }),
+        ] {
+            assert!(matches!(
+                require_matching_progress(observed.as_ref(), epoch, tail),
+                Err(CandidateCaptureError::ApplyPrefixMismatch)
+            ));
+        }
+    }
+
+    #[test]
     // memory—v1: Budgets cover all rows and bytes and fail at the first excess.
     fn aggregate_budget_rejects_overflow() {
         assert!(matches!(
@@ -983,13 +1156,22 @@ mod tests {
             }),
             Err(CandidateCaptureError::InvalidBudget)
         ));
+        let mut large = Meter::new(CaptureBudget {
+            max_rows: 100_001,
+            max_bytes: MAX_FIELD_BYTES * 2,
+        })
+        .unwrap();
+        assert_eq!(large.sentinel(), (MAX_FIELD_BYTES + 1) as i64);
         assert!(matches!(
-            Meter::new(CaptureBudget {
-                max_rows: MAX_ROWS + 1,
-                max_bytes: 1
-            }),
-            Err(CandidateCaptureError::InvalidBudget)
+            large.bytes(MAX_FIELD_BYTES + 1),
+            Err(CandidateCaptureError::BudgetExceeded("field"))
         ));
+        large.bytes(MAX_FIELD_BYTES).unwrap();
+        large.bytes(MAX_FIELD_BYTES).unwrap();
+        for _ in 0..100_001 {
+            large.row().unwrap();
+        }
+        assert!(large.row().is_err());
         let mut meter = Meter::new(CaptureBudget {
             max_rows: 1,
             max_bytes: 3,
@@ -1117,7 +1299,7 @@ mod tests {
             rule_set
                 .find("LEFT(current_version_bytes,?) AS current_version_bytes")
                 .unwrap()
-                < rule_set.find("LIMIT 1 OFFSET ?").unwrap()
+                < rule_set.find("LIMIT ?").unwrap()
         );
 
         let binding = TABLES
@@ -1165,9 +1347,7 @@ mod tests {
         for pair in version_fields.windows(2) {
             assert!(version.find(pair[0]).unwrap() < version.find(pair[1]).unwrap());
         }
-        assert!(
-            version.find("LEFT(hash_bytes,?)").unwrap() < version.find("LIMIT 1 OFFSET ?").unwrap()
-        );
+        assert!(version.find("LEFT(hash_bytes,?)").unwrap() < version.find("LIMIT ?").unwrap());
 
         assert_eq!(
             TABLES
@@ -1283,7 +1463,7 @@ mod tests {
     fn table_queries_cover_candidate_schema() {
         assert_eq!(TABLES.len(), 9);
         for table in TABLES {
-            assert!(table.sql.contains("LIMIT 1 OFFSET ?"));
+            assert!(table.sql.contains("LIMIT ?"));
             assert!(!table.sql.to_ascii_uppercase().contains("MAX("));
             assert_eq!(table.sql.matches('?').count(), table.variable_fields + 1);
         }

@@ -8,8 +8,12 @@
 use std::collections::HashMap as TransientHashMap;
 use std::sync::Arc;
 
+mod checked_bindings;
 mod context_load;
+mod membership;
+mod source_slots;
 pub(crate) use context_load::{ContextDelta, ContextLoadError};
+use membership::{add_member, Members, Membership};
 
 use im::{HashMap, HashSet};
 
@@ -96,6 +100,8 @@ pub enum CandidateError {
         rule_set_id: BinaryId,
         version_bytes: Vec<u8>,
     },
+    /// memory—v1: Insufficient or unknown headroom for a complete operation.
+    WorkingMemoryUnavailable,
     /// The combined table row count exceeds the configured limit or overflows.
     RowBudgetExceeded { max: usize },
     /// The query would traverse more bindings than its configured limit.
@@ -132,7 +138,10 @@ pub struct RuleSetImpactCandidate {
 /// unspecified. This candidate has no authority or completeness semantics.
 #[derive(Clone, Debug)]
 pub struct HamtCandidate {
+    checked_bindings: Option<Arc<checked_bindings::CheckedBindings>>,
     budget: CandidateBudget,
+    // Optional process memory sampler; bounded offline candidates keep their caller limits.
+    headroom: Option<fn() -> Option<usize>>,
     row_count: usize,
     users: HashMap<BinaryId, Arc<UserRow>>,
     identities: HashMap<BinaryId, Arc<IdentityCardRow>>,
@@ -141,19 +150,21 @@ pub struct HamtCandidate {
     cards: HashMap<BinaryId, Arc<UserCardRow>>,
     rule_sets: HashMap<BinaryId, Arc<RuleSetRow>>,
     versions: HashMap<BinaryId, HashMap<Vec<u8>, Arc<RuleSetVersionRow>>>,
+    source_projection: bool,
+    archived_ids: HashMap<BinaryId, im::OrdSet<Vec<u8>>>,
     bindings: HashMap<BinaryId, Arc<BindingRow>>,
     confirmations: HashMap<BinaryId, Arc<BindingConfirmationRow>>,
     change_confirmations: HashMap<BinaryId, Arc<RuleSetChangeConfirmationRow>>,
     cards_by_user: HashMap<BinaryId, HashSet<BinaryId>>,
     cards_by_tenant: HashMap<BinaryId, HashSet<BinaryId>>,
     children_by_tenant: HashMap<BinaryId, HashSet<BinaryId>>,
-    bindings_by_card: HashMap<BinaryId, HashSet<BinaryId>>,
-    unremoved_bindings_by_card: HashMap<BinaryId, HashSet<BinaryId>>,
-    bindings_by_rule_set: HashMap<BinaryId, HashSet<BinaryId>>,
-    unremoved_bindings_by_rule_set: HashMap<BinaryId, HashSet<BinaryId>>,
-    confirmations_by_binding: HashMap<BinaryId, HashSet<BinaryId>>,
+    bindings_by_card: Membership,
+    unremoved_bindings_by_card: Membership,
+    bindings_by_rule_set: Membership,
+    unremoved_bindings_by_rule_set: Membership,
+    confirmations_by_binding: Membership,
     binding_confirmation_states: HashMap<BinaryId, BindingConfirmationState>,
-    changes_by_rule_set: HashMap<BinaryId, HashSet<BinaryId>>,
+    changes_by_rule_set: Membership,
     change_confirmation_index: ChangeConfirmationIndex,
     selections: HashMap<BinaryId, Arc<SelectedRuleVersion>>,
     // Monotonic generations travel with each immutable candidate snapshot.
@@ -168,7 +179,7 @@ pub struct HamtCandidate {
 // collections and replacing only the existing rule-set row and its generation.
 mod retirement {
     use super::{
-        binding_is_active, Arc, BinaryId, CandidateError, HamtCandidate, HashSet, RuleSetStatus,
+        binding_is_active, Arc, BinaryId, CandidateError, HamtCandidate, Members, RuleSetStatus,
         Table,
     };
 
@@ -228,7 +239,7 @@ mod retirement {
             return Err(CandidateError::InconsistentBinding);
         }
         let ids = current.unremoved_bindings_by_rule_set.get(&rule_set_id);
-        current.check_bindings(ids.map_or(0, HashSet::len))?;
+        current.check_bindings(ids.map_or(0, Members::len))?;
         for id in ids.into_iter().flat_map(|ids| ids.iter()) {
             let binding = current
                 .bindings
@@ -295,14 +306,19 @@ fn index(index: &mut HashMap<BinaryId, HashSet<BinaryId>>, key: BinaryId, value:
 
 // memory—v1: Count an index without allocating a reconstructed copy. Empty
 // buckets are invalid, and overflow must not make an incomplete index look exact.
-fn index_membership_count(index: &HashMap<BinaryId, HashSet<BinaryId>>) -> Option<usize> {
-    index.values().try_fold(0usize, |count, ids| {
-        if ids.is_empty() {
+fn count_nonempty(mut sizes: impl Iterator<Item = usize>) -> Option<usize> {
+    sizes.try_fold(0usize, |total, size| {
+        if size == 0 {
             None
         } else {
-            count.checked_add(ids.len())
+            total.checked_add(size)
         }
     })
+}
+
+// memory—v1: Validate complete membership counts for binding and confirmation indexes.
+fn index_membership_count(index: &Membership) -> Option<usize> {
+    count_nonempty(index.values().map(Members::len))
 }
 
 // memory—v1: Count all supplied table rows without arithmetic wraparound.
@@ -353,7 +369,9 @@ impl HamtCandidate {
             }
         }
         let mut candidate = Self {
+            checked_bindings: None,
             budget,
+            headroom: None,
             row_count,
             users: HashMap::new(),
             identities: HashMap::new(),
@@ -362,6 +380,8 @@ impl HamtCandidate {
             cards: HashMap::new(),
             rule_sets: HashMap::new(),
             versions: HashMap::new(),
+            source_projection: false,
+            archived_ids: HashMap::new(),
             bindings: HashMap::new(),
             confirmations: HashMap::new(),
             change_confirmations: HashMap::new(),
@@ -477,24 +497,24 @@ impl HamtCandidate {
                     user_card_id: row.user_card_id,
                 });
             }
-            index(
+            add_member(
                 &mut candidate.bindings_by_card,
                 row.user_card_id,
                 row.binding_id,
             );
             if row.removed_at.is_none() {
-                index(
+                add_member(
                     &mut candidate.unremoved_bindings_by_card,
                     row.user_card_id,
                     row.binding_id,
                 );
-                index(
+                add_member(
                     &mut candidate.unremoved_bindings_by_rule_set,
                     row.rule_set_id,
                     row.binding_id,
                 );
             }
-            index(
+            add_member(
                 &mut candidate.bindings_by_rule_set,
                 row.rule_set_id,
                 row.binding_id,
@@ -502,7 +522,7 @@ impl HamtCandidate {
             candidate.bindings.insert(row.binding_id, Arc::new(row));
         }
         for row in rows.binding_confirmations {
-            index(
+            add_member(
                 &mut candidate.confirmations_by_binding,
                 row.binding_id,
                 row.confirmation_id,
@@ -512,7 +532,7 @@ impl HamtCandidate {
                 .insert(row.confirmation_id, Arc::new(row));
         }
         for row in rows.rule_set_change_confirmations {
-            index(
+            add_member(
                 &mut candidate.changes_by_rule_set,
                 row.rule_set_id,
                 row.confirmation_id,
@@ -531,8 +551,7 @@ impl HamtCandidate {
         for binding_id in candidate.bindings.keys().copied().collect::<Vec<_>>() {
             candidate.refresh_binding_confirmation_state(binding_id)?;
         }
-        candidate.validate_binding_indexes()?;
-        candidate.validate_confirmation_indexes()?;
+        candidate.check_publication_indexes(false)?;
         Ok(candidate)
     }
 
@@ -609,20 +628,7 @@ impl HamtCandidate {
                 .or_default()
                 .push(row.as_ref());
         }
-        for (id, row) in &self.change_confirmations {
-            if *id != row.confirmation_id
-                || !self.rule_sets.contains_key(&row.rule_set_id)
-                || !self
-                    .changes_by_rule_set
-                    .get(&row.rule_set_id)
-                    .is_some_and(|ids| ids.contains(id))
-            {
-                return Err(CandidateError::InconsistentBinding);
-            }
-        }
         if index_membership_count(&self.confirmations_by_binding) != Some(self.confirmations.len())
-            || index_membership_count(&self.changes_by_rule_set)
-                != Some(self.change_confirmations.len())
             || self.binding_confirmation_states.len() != self.bindings.len()
         {
             return Err(CandidateError::InconsistentBinding);
@@ -644,6 +650,27 @@ impl HamtCandidate {
             if self.binding_confirmation_states.get(&binding_id) != Some(&state) {
                 return Err(CandidateError::InconsistentBinding);
             }
+        }
+        self.validate_change_confirmation_indexes()
+    }
+
+    // memory—v1: Check all source-change facts, reverse memberships and derived counters.
+    fn validate_change_confirmation_indexes(&self) -> Result<(), CandidateError> {
+        for (id, row) in &self.change_confirmations {
+            if *id != row.confirmation_id
+                || !self.rule_sets.contains_key(&row.rule_set_id)
+                || !self
+                    .changes_by_rule_set
+                    .get(&row.rule_set_id)
+                    .is_some_and(|ids| ids.contains(id))
+            {
+                return Err(CandidateError::InconsistentBinding);
+            }
+        }
+        if index_membership_count(&self.changes_by_rule_set)
+            != Some(self.change_confirmations.len())
+        {
+            return Err(CandidateError::InconsistentBinding);
         }
         let expected =
             ChangeConfirmationIndex::from_rows(self.change_confirmations.values().map(Arc::as_ref))
@@ -803,13 +830,13 @@ impl HamtCandidate {
     #[cfg(test)]
     // memory—v1: Inject a dangling confirmation reference for publication tests.
     pub(crate) fn insert_dangling_confirmation_for_test(&mut self, binding_id: BinaryId) {
-        index(&mut self.confirmations_by_binding, binding_id, [0; 16]);
+        add_member(&mut self.confirmations_by_binding, binding_id, [0; 16]);
     }
 
     #[cfg(test)]
     // memory—v1: Inject a dangling change-confirmation reference for publication tests.
     pub(crate) fn insert_dangling_change_for_test(&mut self, rule_set_id: BinaryId) {
-        index(&mut self.changes_by_rule_set, rule_set_id, [0; 16]);
+        add_member(&mut self.changes_by_rule_set, rule_set_id, [0; 16]);
     }
 
     /// memory—v1: Return the configured limits and combined nine-table row count.
@@ -950,7 +977,7 @@ impl HamtCandidate {
         self.tenant_tree_version = u64::MAX;
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn digest_inputs(&self) -> (CandidateRows, Vec<CurrentSelection>) {
         let rows = CandidateRows {
             users: self.users.values().map(|row| (**row).clone()).collect(),
@@ -998,11 +1025,12 @@ impl HamtCandidate {
             tenants: self.tenants.len(),
             user_cards: self.cards.len(),
             rule_sets: self.rule_sets.len(),
-            rule_set_versions: self
-                .versions
-                .values()
-                .map(HashMap::len)
-                .fold(0_usize, usize::saturating_add),
+            rule_set_versions: self.versions.values().map(HashMap::len).sum::<usize>()
+                + self
+                    .archived_ids
+                    .values()
+                    .map(im::OrdSet::len)
+                    .sum::<usize>(),
             bindings: self.bindings.len(),
             binding_confirmations: self.confirmations.len(),
             rule_set_change_confirmations: self.change_confirmations.len(),
@@ -1063,7 +1091,7 @@ impl HamtCandidate {
         self.rule_sets.get(&id).map(Arc::as_ref)
     }
 
-    /// memory—v1: Look up any supplied version, including historical versions.
+    /// memory—v1: Look up a retained body. Only diagnostic candidates can retain historical bodies.
     pub fn version(&self, rule_set_id: BinaryId, version: &[u8]) -> Option<&RuleSetVersionRow> {
         self.versions
             .get(&rule_set_id)?
@@ -1234,7 +1262,7 @@ impl HamtCandidate {
             id: card_id,
         })?;
         let ids = self.bindings_by_card.get(&card_id);
-        self.check_bindings(ids.map_or(0, HashSet::len))?;
+        self.check_bindings(ids.map_or(0, Members::len))?;
         let bindings = ids
             .into_iter()
             .flat_map(|ids| ids.iter())
@@ -1255,8 +1283,8 @@ impl HamtCandidate {
             id: card_id,
         })?;
         let ids = self.unremoved_bindings_by_card.get(&card_id);
-        self.check_bindings(ids.map_or(0, HashSet::len))?;
-        let mut bindings = Vec::with_capacity(ids.map_or(0, HashSet::len));
+        self.check_bindings(ids.map_or(0, Members::len))?;
+        let mut bindings = Vec::with_capacity(ids.map_or(0, Members::len));
         for id in ids.into_iter().flat_map(|ids| ids.iter()) {
             let binding = self
                 .bindings
@@ -1296,10 +1324,10 @@ impl HamtCandidate {
             for count in [
                 self.confirmations_by_binding
                     .get(&binding.binding_id)
-                    .map_or(0, HashSet::len),
+                    .map_or(0, Members::len),
                 self.changes_by_rule_set
                     .get(&binding.rule_set_id)
-                    .map_or(0, HashSet::len),
+                    .map_or(0, Members::len),
             ] {
                 total = total
                     .checked_add(count)
@@ -1307,7 +1335,7 @@ impl HamtCandidate {
                     .ok_or(CandidateError::ConfirmationBudgetExceeded { max })?;
             }
         }
-        Ok(())
+        self.check_read_workspace(total)
     }
 
     /// memory—v1: Return every supplied confirmation for a binding, across versions.
@@ -1390,7 +1418,7 @@ impl HamtCandidate {
     ) -> Result<RuleSetImpactCandidate, CandidateError> {
         self.require_rule_set(rule_set_id)?;
         let bindings = self.bindings_by_rule_set.get(&rule_set_id);
-        self.check_bindings(bindings.map_or(0, HashSet::len))?;
+        self.check_bindings(bindings.map_or(0, Members::len))?;
         let mut result = RuleSetImpactCandidate {
             binding_ids: HashSet::new(),
             card_ids: HashSet::new(),
@@ -1434,7 +1462,7 @@ impl HamtCandidate {
             return Err(CandidateError::InconsistentBinding);
         }
         let bindings = self.unremoved_bindings_by_rule_set.get(&rule_set_id);
-        self.check_bindings(bindings.map_or(0, HashSet::len))?;
+        self.check_bindings(bindings.map_or(0, Members::len))?;
         let mut result = RuleSetImpactCandidate {
             binding_ids: HashSet::new(),
             card_ids: HashSet::new(),
@@ -1593,7 +1621,7 @@ impl HamtCandidate {
                 },
             ));
         }
-        if self.version(row.rule_set_id, &row.version_bytes).is_some() {
+        if self.knows_version_id(row.rule_set_id, &row.version_bytes) {
             return Err(CandidateError::DuplicateVersion {
                 rule_set_id: row.rule_set_id,
                 version_bytes: row.version_bytes,
@@ -1778,18 +1806,18 @@ impl HamtCandidate {
         self.bindings.insert(row.binding_id, Arc::new(row.clone()));
         self.binding_confirmation_states
             .insert(row.binding_id, BindingConfirmationState::Invalid);
-        index(&mut self.bindings_by_card, row.user_card_id, row.binding_id);
-        index(
+        add_member(&mut self.bindings_by_card, row.user_card_id, row.binding_id);
+        add_member(
             &mut self.unremoved_bindings_by_card,
             row.user_card_id,
             row.binding_id,
         );
-        index(
+        add_member(
             &mut self.bindings_by_rule_set,
             row.rule_set_id,
             row.binding_id,
         );
-        index(
+        add_member(
             &mut self.unremoved_bindings_by_rule_set,
             row.rule_set_id,
             row.binding_id,
@@ -1976,7 +2004,7 @@ impl HamtCandidate {
             }));
         }
         self.require_active_rule_set(row.rule_set_id)?;
-        if self.version(row.rule_set_id, &row.version_bytes).is_none() {
+        if !self.knows_version_id(row.rule_set_id, &row.version_bytes) {
             return Err(CandidateError::UnknownVersion {
                 rule_set_id: row.rule_set_id,
                 version_bytes: row.version_bytes.clone(),
@@ -2002,7 +2030,7 @@ impl HamtCandidate {
         let card = binding.user_card_id;
         self.confirmations
             .insert(row.confirmation_id, Arc::new(row.clone()));
-        index(
+        add_member(
             &mut self.confirmations_by_binding,
             row.binding_id,
             row.confirmation_id,
@@ -2128,7 +2156,7 @@ impl HamtCandidate {
             }));
         }
         self.require_active_rule_set(row.rule_set_id)?;
-        if self.version(row.rule_set_id, &row.version_bytes).is_none() {
+        if !self.knows_version_id(row.rule_set_id, &row.version_bytes) {
             return Err(CandidateError::UnknownVersion {
                 rule_set_id: row.rule_set_id,
                 version_bytes: row.version_bytes.clone(),
@@ -2165,7 +2193,7 @@ impl HamtCandidate {
             .map_err(|_| CandidateError::InconsistentBinding)?;
         self.change_confirmations
             .insert(row.confirmation_id, Arc::new(row.clone()));
-        index(
+        add_member(
             &mut self.changes_by_rule_set,
             row.rule_set_id,
             row.confirmation_id,
@@ -2244,7 +2272,7 @@ impl HamtCandidate {
                 ));
             }
             self.require_active_rule_set(row.rule_set_id)?;
-            if self.version(row.rule_set_id, &row.version_bytes).is_none() {
+            if !self.knows_version_id(row.rule_set_id, &row.version_bytes) {
                 return Err(CandidateError::UnknownVersion {
                     rule_set_id: row.rule_set_id,
                     version_bytes: row.version_bytes.clone(),
@@ -2296,7 +2324,7 @@ impl HamtCandidate {
         for row in rows {
             next.confirmations
                 .insert(row.confirmation_id, Arc::new(row.clone()));
-            index(
+            add_member(
                 &mut next.confirmations_by_binding,
                 row.binding_id,
                 row.confirmation_id,
@@ -2309,8 +2337,9 @@ impl HamtCandidate {
     // memory—v1: Verify the exact card indexes and generations before extending
     // them. The reverse indexes cannot manufacture a user/tenant relationship.
     fn validate_card_indexes(&self) -> Result<(), CandidateError> {
-        if index_membership_count(&self.cards_by_user) != Some(self.cards.len())
-            || index_membership_count(&self.cards_by_tenant) != Some(self.cards.len())
+        if count_nonempty(self.cards_by_user.values().map(HashSet::len)) != Some(self.cards.len())
+            || count_nonempty(self.cards_by_tenant.values().map(HashSet::len))
+                != Some(self.cards.len())
             || self.card_dependencies.len() != self.cards.len()
         {
             return Err(CandidateError::InconsistentBinding);
@@ -2619,6 +2648,31 @@ impl HamtCandidate {
     }
 
     // memory—v1: Reject a binding-bearing read before traversing any bindings.
+    // memory—v1: The production composition supplies the sampler, never the request.
+    pub(crate) fn set_headroom(&mut self, probe: Option<fn() -> Option<usize>>) {
+        self.headroom = probe;
+    }
+
+    pub(crate) fn headroom(&self) -> Option<fn() -> Option<usize>> {
+        self.headroom
+    }
+
+    // memory—v1: Ordinary small reads use the process reserve. Larger reads must
+    // fit in their entirety; this guard never clips a binding or a confirmation.
+    pub(crate) fn check_read_workspace(&self, items: usize) -> Result<(), CandidateError> {
+        if items > 256 {
+            if let Some(probe) = self.headroom {
+                let bytes = items
+                    .checked_mul(512)
+                    .ok_or(CandidateError::WorkingMemoryUnavailable)?;
+                if !probe().is_some_and(|free| bytes <= free) {
+                    return Err(CandidateError::WorkingMemoryUnavailable);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn check_bindings(&self, actual: usize) -> Result<(), CandidateError> {
         if actual > self.budget.max_bindings_per_read {
             Err(CandidateError::BindingBudgetExceeded {
@@ -2626,7 +2680,7 @@ impl HamtCandidate {
                 actual,
             })
         } else {
-            Ok(())
+            self.check_read_workspace(actual)
         }
     }
 }
@@ -3179,13 +3233,13 @@ mod tests {
         assert_eq!(valid.validate_for_serving(), Ok(()));
 
         let mut dangling = valid.clone();
-        index(&mut dangling.confirmations_by_binding, id(12), id(99));
+        add_member(&mut dangling.confirmations_by_binding, id(12), id(99));
         let mut foreign = valid.clone();
         let mut row = (*foreign.confirmations[&id(15)]).clone();
         row.confirmation_id = id(30);
         row.binding_id = id(13);
         foreign.confirmations.insert(id(30), Arc::new(row));
-        index(&mut foreign.confirmations_by_binding, id(12), id(30));
+        add_member(&mut foreign.confirmations_by_binding, id(12), id(30));
         let mut mismatched = valid;
         let mut row = (*mismatched.confirmations[&id(15)]).clone();
         row.confirmation_id = id(99);
@@ -3537,6 +3591,31 @@ mod tests {
             budget(),
         )
         .unwrap()
+    }
+
+    #[test]
+    // memory—v1: A stale witness, same-sized key substitution, or bad change index must not hide corruption.
+    fn source_publication_rechecks_every_unproven_index() {
+        let before = candidate();
+        let mut changed_binding = before.clone();
+        changed_binding.confirmations_by_binding.remove(&id(12));
+        let mut missing_source = before.clone();
+        let row = missing_source.rule_sets.remove(&id(10)).unwrap();
+        missing_source.rule_sets.insert(id(99), row);
+        let mut changed_source_index = before.clone();
+        changed_source_index.changes_by_rule_set.clear();
+        for mut broken in [changed_binding, missing_source, changed_source_index] {
+            assert_eq!(
+                broken.check_publication_indexes(true),
+                Err(CandidateError::InconsistentBinding)
+            );
+        }
+        let mut unproven = before.clone();
+        unproven.checked_bindings = None;
+        unproven.check_publication_indexes(true).unwrap();
+        assert!(unproven.checked_bindings.is_some());
+        before.validate_binding_indexes().unwrap();
+        before.validate_confirmation_indexes().unwrap();
     }
 
     #[test]
@@ -4190,7 +4269,7 @@ mod tests {
         let before = vacant.card_dependency_generation(proposed.user_card_id);
 
         let mut dangling = vacant.clone();
-        index(
+        add_member(
             &mut dangling.bindings_by_card,
             proposed.user_card_id,
             id(200),
@@ -4205,7 +4284,7 @@ mod tests {
         );
 
         let mut foreign = vacant;
-        index(&mut foreign.bindings_by_card, proposed.user_card_id, id(13));
+        add_member(&mut foreign.bindings_by_card, proposed.user_card_id, id(13));
         assert!(matches!(
             foreign.with_binding_insert(proposed.clone()),
             Err(CandidateError::InconsistentBinding)
@@ -4539,16 +4618,16 @@ mod tests {
         let mut missing_binding = original.clone();
         missing_binding.confirmations_by_binding.remove(&id(12));
         let mut extra_binding = original.clone();
-        index(&mut extra_binding.confirmations_by_binding, id(12), id(99));
+        add_member(&mut extra_binding.confirmations_by_binding, id(12), id(99));
         let mut foreign_binding = original.clone();
-        index(
+        add_member(
             &mut foreign_binding.confirmations_by_binding,
             id(13),
             id(15),
         );
         let mut swapped_binding = original.clone();
         swapped_binding.confirmations_by_binding.remove(&id(12));
-        index(
+        add_member(
             &mut swapped_binding.confirmations_by_binding,
             id(13),
             id(15),
@@ -4556,7 +4635,7 @@ mod tests {
         let mut empty_binding = original.clone();
         empty_binding
             .confirmations_by_binding
-            .insert(id(99), HashSet::new());
+            .insert(id(99), Members::default());
         let mut mismatched_binding_row = original.clone();
         let mut row = (*mismatched_binding_row.confirmations[&id(15)]).clone();
         row.confirmation_id = id(99);
@@ -4579,16 +4658,16 @@ mod tests {
         let mut missing_change = original.clone();
         missing_change.changes_by_rule_set.remove(&id(10));
         let mut extra_change = original.clone();
-        index(&mut extra_change.changes_by_rule_set, id(10), id(99));
+        add_member(&mut extra_change.changes_by_rule_set, id(10), id(99));
         let mut foreign_change = original.clone();
-        index(&mut foreign_change.changes_by_rule_set, id(11), id(15));
+        add_member(&mut foreign_change.changes_by_rule_set, id(11), id(15));
         let mut swapped_change = original.clone();
         swapped_change.changes_by_rule_set.remove(&id(10));
-        index(&mut swapped_change.changes_by_rule_set, id(11), id(15));
+        add_member(&mut swapped_change.changes_by_rule_set, id(11), id(15));
         let mut empty_change = original.clone();
         empty_change
             .changes_by_rule_set
-            .insert(id(99), HashSet::new());
+            .insert(id(99), Members::default());
         let mut mismatched_change_row = original.clone();
         let mut row = (*mismatched_change_row.change_confirmations[&id(15)]).clone();
         row.confirmation_id = id(99);
@@ -4663,7 +4742,7 @@ mod tests {
     // a later dangling row is an index failure, not just an Invalid state.
     fn invalid_confirmation_does_not_hide_dangling_history() {
         let mut corrupted = candidate();
-        index(&mut corrupted.confirmations_by_binding, id(12), id(99));
+        add_member(&mut corrupted.confirmations_by_binding, id(12), id(99));
         let ids = corrupted.confirmations_by_binding[&id(12)]
             .iter()
             .copied()
@@ -4759,7 +4838,7 @@ mod tests {
         active.revoked_at = None;
         active.revoked_by = None;
         for row in [revoked, active] {
-            index(
+            add_member(
                 &mut candidate.confirmations_by_binding,
                 row.binding_id,
                 row.confirmation_id,
@@ -4806,7 +4885,7 @@ mod tests {
         let mut ids = candidate.confirmations_by_binding[&id(13)].clone();
         ids.remove(&id(31));
         candidate.confirmations_by_binding.insert(id(13), ids);
-        index(&mut candidate.confirmations_by_binding, id(14), id(31));
+        add_member(&mut candidate.confirmations_by_binding, id(14), id(31));
         assert_eq!(
             candidate.validate_confirmation_indexes(),
             Err(CandidateError::InconsistentBinding)
@@ -4854,9 +4933,9 @@ mod tests {
         let mut missing = original.clone();
         missing.unremoved_bindings_by_card.remove(&id(8));
         let mut extra = original.clone();
-        index(&mut extra.unremoved_bindings_by_card, id(8), id(99));
+        add_member(&mut extra.unremoved_bindings_by_card, id(8), id(99));
         let mut foreign = original.clone();
-        index(&mut foreign.unremoved_bindings_by_card, id(9), id(12));
+        add_member(&mut foreign.unremoved_bindings_by_card, id(9), id(12));
         let mut historical_missing = original.clone();
         historical_missing.bindings_by_card.remove(&id(8));
         let mut historical_rule_set_missing = original.clone();
@@ -4864,31 +4943,31 @@ mod tests {
             .bindings_by_rule_set
             .remove(&id(10));
         let mut historical_rule_set_extra = original.clone();
-        index(
+        add_member(
             &mut historical_rule_set_extra.bindings_by_rule_set,
             id(10),
             id(99),
         );
         let mut historical_rule_set_foreign = original.clone();
-        index(
+        add_member(
             &mut historical_rule_set_foreign.bindings_by_rule_set,
             id(11),
             id(12),
         );
         let mut empty = original.clone();
-        empty.bindings_by_card.insert(id(99), HashSet::new());
+        empty.bindings_by_card.insert(id(99), Members::default());
         let mut rule_set_missing = original.clone();
         rule_set_missing
             .unremoved_bindings_by_rule_set
             .remove(&id(10));
         let mut rule_set_extra = original.clone();
-        index(
+        add_member(
             &mut rule_set_extra.unremoved_bindings_by_rule_set,
             id(10),
             id(99),
         );
         let mut rule_set_foreign = original.clone();
-        index(
+        add_member(
             &mut rule_set_foreign.unremoved_bindings_by_rule_set,
             id(11),
             id(12),
@@ -4900,14 +4979,14 @@ mod tests {
             .get_mut(&id(8))
             .unwrap()
             .remove(&id(12));
-        index(&mut swapped_historical.bindings_by_card, id(8), id(99));
+        add_member(&mut swapped_historical.bindings_by_card, id(8), id(99));
         let mut swapped_historical_rule_set = original.clone();
         swapped_historical_rule_set
             .bindings_by_rule_set
             .get_mut(&id(10))
             .unwrap()
             .remove(&id(12));
-        index(
+        add_member(
             &mut swapped_historical_rule_set.bindings_by_rule_set,
             id(10),
             id(99),
@@ -4918,14 +4997,14 @@ mod tests {
             .get_mut(&id(8))
             .unwrap()
             .remove(&id(12));
-        index(&mut swapped_card.unremoved_bindings_by_card, id(8), id(99));
+        add_member(&mut swapped_card.unremoved_bindings_by_card, id(8), id(99));
         let mut swapped_rule_set = original.clone();
         swapped_rule_set
             .unremoved_bindings_by_rule_set
             .get_mut(&id(10))
             .unwrap()
             .remove(&id(12));
-        index(
+        add_member(
             &mut swapped_rule_set.unremoved_bindings_by_rule_set,
             id(10),
             id(99),
@@ -4933,15 +5012,15 @@ mod tests {
         let mut empty_historical_rule_set = original.clone();
         empty_historical_rule_set
             .bindings_by_rule_set
-            .insert(id(99), HashSet::new());
+            .insert(id(99), Members::default());
         let mut empty_card = original.clone();
         empty_card
             .unremoved_bindings_by_card
-            .insert(id(99), HashSet::new());
+            .insert(id(99), Members::default());
         let mut empty_rule_set = original.clone();
         empty_rule_set
             .unremoved_bindings_by_rule_set
-            .insert(id(99), HashSet::new());
+            .insert(id(99), Members::default());
         let mut half = original.clone();
         let mut row = (*half.bindings[&id(12)]).clone();
         row.removed_by = Some(id(1));

@@ -483,9 +483,14 @@ fn compound_checks_distinct_target_fences_before_denials() {
     let scope_deny = action("create", &target, &tenant, &other_user, other_facts);
     let allowed = action("create", &target, &tenant, &actor, actor_facts);
     let self_confirm = action("confirm", &target, &tenant, &actor, actor_facts);
-    let evaluate = |actions: &[MemoryV1CompoundAction<'_>]| {
-        engine.evaluate_memory_v1_compound(&root, &session, &MemoryV1CompoundRequest { actions })
-    };
+    let evaluate_phase =
+        |root: &astral_authorization_root::memory_v1_request::RequestRootExtension,
+         session: &RequestSessionExtension,
+         actions: &[MemoryV1CompoundAction<'_>]| {
+            engine.evaluate_memory_v1_compound(root, session, &MemoryV1CompoundRequest { actions })
+        };
+    let evaluate =
+        |actions: &[MemoryV1CompoundAction<'_>]| evaluate_phase(&root, &session, actions);
     let assert_deny = |actions: &[MemoryV1CompoundAction<'_>], source| {
         let result = evaluate(actions);
         assert_eq!(result.decision, MemoryV1Decision::Deny);
@@ -555,6 +560,13 @@ fn compound_checks_distinct_target_fences_before_denials() {
         &[allowed, self_confirm],
         MemoryV1DenySource::SelfConfirmation,
     );
+    assert_eq!(evaluate(&[allowed]).decision, MemoryV1Decision::Pending);
+    let fresh_scope = RequestRootScope::new(owner.handle(), Default::default());
+    let fresh_root = fresh_scope.extension();
+    let (fresh_session, _) = session_for(&authority, &fresh_root);
+    let evaluate = |actions: &[MemoryV1CompoundAction<'_>]| {
+        evaluate_phase(&fresh_root, &fresh_session, actions)
+    };
     assert_eq!(evaluate(&[allowed]).decision, MemoryV1Decision::Allow);
 
     // Rule set 32 is unrelated to the binding target but is the second active
@@ -582,7 +594,18 @@ fn compound_checks_distinct_target_fences_before_denials() {
         target_kind: MemoryV1CompoundTargetKind::UserCardDisable,
     };
     assert_pending(&[disable]);
+    assert_eq!(
+        evaluate(&[disable]).pending_source,
+        Some(MemoryV1PendingSource::FenceActive)
+    );
     owner.abort_modification_fence(id(32)).unwrap();
+    assert_eq!(evaluate(&[disable]).decision, MemoryV1Decision::Pending);
+    let final_scope = RequestRootScope::new(owner.handle(), Default::default());
+    let final_root = final_scope.extension();
+    let (final_session, _) = session_for(&authority, &final_root);
+    let evaluate = |actions: &[MemoryV1CompoundAction<'_>]| {
+        evaluate_phase(&final_root, &final_session, actions)
+    };
     assert_eq!(evaluate(&[disable]).decision, MemoryV1Decision::Allow);
 
     // A forged expected rule-set ID cannot replace the binding's root-derived ID.
@@ -772,6 +795,13 @@ fn user_card_create_final_check_requires_exact_live_root_target() {
         .unwrap();
     assert_eq!(check(&root, &session, target, None, false), None);
     owner.abort_modification_fence(id(30)).unwrap();
+    assert_eq!(check(&root, &session, target, None, false), None);
+    let fresh_scope = RequestRootScope::new(owner.handle(), Default::default());
+    let root = fresh_scope.extension();
+    let session = authority
+        .verifier()
+        .verify_and_bind(&credential, now(), &root)
+        .unwrap();
     assert!(check(&root, &session, target, None, false).is_some());
 
     let issued_at = now() - 120;
@@ -1013,6 +1043,13 @@ fn empty_disabled_card_final_check_requires_exact_live_facts() {
         .unwrap();
     assert_eq!(check(&root, &session, target, None, false), None);
     owner.abort_modification_fence(id(30)).unwrap();
+    assert_eq!(check(&root, &session, target, None, false), None);
+    let fresh_scope = RequestRootScope::new(owner.handle(), Default::default());
+    let root = fresh_scope.extension();
+    let session = authority
+        .verifier()
+        .verify_and_bind(&credential, now(), &root)
+        .unwrap();
     assert!(check(&root, &session, target, None, false).is_some());
 
     // A session verified at its issuance time must still be live at final time.

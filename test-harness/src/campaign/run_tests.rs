@@ -108,6 +108,7 @@ where
         snapshot,
         execute_command,
         paper: None,
+        darkstar: None,
     }
 }
 

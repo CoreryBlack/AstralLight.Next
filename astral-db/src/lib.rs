@@ -76,6 +76,10 @@ pub mod local_message_repository;
 pub mod local_projection_bus;
 pub mod local_projection_snapshot;
 pub mod memory_projection_hub;
+pub mod memory_v1_apply;
+pub mod memory_v1_apply_facts;
+pub mod memory_v1_apply_plan;
+pub mod memory_v1_apply_records;
 pub mod memory_v1_candidate_loader;
 pub mod memory_v1_schema;
 mod migration;
@@ -225,6 +229,19 @@ pub use local_projection_bus::{
 };
 pub use local_projection_snapshot::*;
 pub use memory_projection_hub::*;
+pub use memory_v1_apply::{
+    apply_memory_v1_deny_message, apply_memory_v1_deny_observation,
+    apply_memory_v1_mutation_message, claim_memory_v1_apply_lease,
+    initialize_memory_v1_apply_progress, read_memory_v1_apply_progress,
+    reconcile_memory_v1_unknown_commit, release_memory_v1_apply_lease, renew_memory_v1_apply_lease,
+    MemoryV1AppliedOperation, MemoryV1ApplyDenial, MemoryV1ApplyDenialReason,
+    MemoryV1ApplyDenyObservationRequest, MemoryV1ApplyDenyRequest, MemoryV1ApplyError,
+    MemoryV1ApplyFenceToken, MemoryV1ApplyFrameKind, MemoryV1ApplyIdentity, MemoryV1ApplyLease,
+    MemoryV1ApplyLeaseClaim, MemoryV1ApplyLeaseRenew, MemoryV1ApplyOutcome,
+    MemoryV1ApplyPredecessor, MemoryV1ApplyProgressInit, MemoryV1ApplyProgressRow,
+    MemoryV1ApplyReceipt, MemoryV1ApplyReconciliation, MemoryV1ApplyReconciliationInput,
+    MemoryV1ApplyRequest, MemoryV1ApplyVerifiedFrameContent,
+};
 pub use migration::*;
 pub use mq_idempotency_repository::{
     complete_lease_in_tx, MqConsumerLeaseStore, MqLeaseClaim, MqLeaseClaimOutcome, MqLeaseComplete,

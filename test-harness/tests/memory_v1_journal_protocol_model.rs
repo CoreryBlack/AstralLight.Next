@@ -111,10 +111,12 @@
 //!   commits can be uncertain and the belief is not reconciled (`NoReadBack`).
 //! * I3 (S-form, physical): every acked `k < S`, and an acked governance frame is `Published`.
 //! * I3d (d-form, serving states only): every acked `k < d`. This is the paper's `eq:success` and
-//!   `eq:deny` guard in 0-based form. `SyncAtOpen` satisfies it over the whole target graph.
-//!   `FromCheckpoint` refutes it at recovery (depth 7). `MarkDurable`, the implemented open, also
+//!   `eq:deny` guard in 0-based form. `SyncAtOpen` satisfies it over the whole target graph, and
+//!   the implemented open corresponds to it: since the 2026-11-21 reopen fix, the open
+//!   synchronizes the retained file before claiming the scanned prefix. `FromCheckpoint` refutes
+//!   it at recovery (depth 7). `MarkDurable`, the pre-sync open retained as a fault model, also
 //!   refutes it, at depth 7 after a second process crash that truncates an acked but unsynced frame
-//!   (`witness_current_open_without_sync_loses_an_acked_frame_on_a_second_crash`). The d-form
+//!   (`witness_mark_durable_open_without_sync_loses_an_acked_frame_on_a_second_crash`). The d-form
 //!   therefore cannot certify physical safety by itself; the S-form I3 catches the same flaw at the
 //!   ack (depth 5).
 //! * I4: an acked `Deny{obs}` at `k` has `obs <= k` and `R(obs) = false`.
@@ -145,17 +147,20 @@
 //! (445–448), and the watermark taken at registration (371–375). Durable journal,
 //! `astral-single-node/src/memory_v1_durable_journal.rs`: `ensure_durable` captures the target at
 //! 358, sets the confirmed end to the captured target at 383, and sets the sticky failure at
-//! 397–402; `flush_upto` calls `sync_data` at 424–425 and checks the length floor at 430–434;
-//! `open` sets the confirmed end to the scanned file end without a sync at 633; the replay receipts
-//! return `durable_end = file_position` at 736 and 864 and pass the `ensure_durable` check at
-//! 355–356 with no sync; the record cap is shared by governance and DENY appends at 741 and 869;
-//! `ensure_ready` refuses prepares after a known flush failure at 1036.
+//! 398; `flush_upto` calls `sync_data` at 425 and checks the length floor at 431–434; `open`
+//! synchronizes the verified retained file through `flush_upto` at 650 and plants the confirmed
+//! end at 651 (the 2026-11-21 reopen fix; the pre-fix open claimed the scanned end without a sync
+//! and is modeled by `MarkDurable`); the replay receipts return `durable_end = file_position` at
+//! 766 and 895 and pass the `ensure_durable` fast path at 355–356 with no sync; the record cap is
+//! shared by governance and DENY appends at 771 and 900; `ensure_ready` refuses prepares after a
+//! known flush failure at 1066. The durable-journal numbers were re-verified at the reopen fix;
+//! the governance-owner and root-writer numbers above were not re-verified.
 //!
 //! The file is one module of the test harness. Each test's comment lists what it establishes.
 //! `cargo test -p test-harness --locked --offline --test memory_v1_journal_protocol_model` runs
 //! the default suite. The ignored larger explorations document their command on the test.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{hash_map::Entry, HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 
 /// memory—v1: Frame slots in the packed state. The largest default configuration needs
@@ -303,9 +308,11 @@ enum SyncRetry {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Open {
-    /// The confirmed end is set to the scanned end with no sync (implemented).
+    /// The confirmed end is set to the scanned end with no sync (fault model
+    /// of the pre-2026-11-21 open; the implemented open now corresponds to
+    /// `SyncAtOpenMoment`).
     MarkDurable,
-    /// A sync at open makes the scanned prefix stable.
+    /// A sync at open makes the scanned prefix stable (the implemented open).
     SyncAtOpenMoment,
     /// The claim restarts at the database checkpoint.
     FromCheckpoint,
@@ -1350,25 +1357,73 @@ fn trace_of(parent: &HashMap<u128, Option<(u128, Step)>>, key: u128) -> String {
         .join(" -> ")
 }
 
+enum Visited {
+    Traced(HashMap<u128, Option<(u128, Step)>>),
+    Compact(HashSet<u128>),
+}
+
+impl Visited {
+    // memory—v1: Deduplicate by the same packed key; keep predecessors only for trace runs.
+    fn insert(&mut self, key: u128, previous: impl FnOnce() -> Option<(u128, Step)>) -> bool {
+        match self {
+            Self::Traced(parent) => match parent.entry(key) {
+                Entry::Occupied(_) => false,
+                Entry::Vacant(entry) => {
+                    entry.insert(previous());
+                    true
+                }
+            },
+            Self::Compact(seen) => seen.insert(key),
+        }
+    }
+
+    // memory—v1: A compact failure still records the exact packed state and BFS depth.
+    fn witness(&self, key: u128) -> String {
+        match self {
+            Self::Traced(parent) => trace_of(parent, key),
+            Self::Compact(_) => format!("state={key:032x} {:?}", St::unpack(key)),
+        }
+    }
+}
+
 // memory—v1: Breadth-first search over packed states. It stops at the first state whose violations intersect `stop` (`stop == 0` explores the whole graph) or, when given, at the first state satisfying `goal`.
 fn explore_with(cfg: Config, stop: u16, goal: Option<fn(&St) -> bool>) -> Run {
+    explore_with_visited(cfg, stop, goal, Visited::Traced(HashMap::new()), false)
+}
+
+// memory—v1: Share transitions, invariants and FIFO traversal between both storage modes.
+fn explore_with_visited(
+    cfg: Config,
+    stop: u16,
+    goal: Option<fn(&St) -> bool>,
+    mut visited: Visited,
+    progress: bool,
+) -> Run {
     assert!(
         usize::from(cfg.denies) <= PEND,
         "pending slots must cover the DENY budget"
     );
     let initial = St::initial();
     let mut run = Run::default();
-    let mut parent: HashMap<u128, Option<(u128, Step)>> = HashMap::new();
     let mut queue: VecDeque<(St, u32)> = VecDeque::new();
     let mut frontier: HashMap<(u8, u8, u8), u8> = HashMap::new();
     let mut frontier_w: HashMap<(u8, u8, u8, u8), u8> = HashMap::new();
     let mut seen_ids = 0u16;
     let mut buffer = Vec::new();
-    parent.insert(initial.pack(), None);
+    visited.insert(initial.pack(), || None);
     queue.push_back((initial, 0));
     while let Some((state, depth)) = queue.pop_front() {
         run.states += 1;
         run.max_depth = run.max_depth.max(depth);
+        if progress && run.states.is_multiple_of(1_000_000) {
+            eprintln!(
+                "repair full progress: states={} transitions={} depth={} queued={}",
+                run.states,
+                run.edges,
+                run.max_depth,
+                queue.len()
+            );
+        }
         if !state.crashed {
             let bit = 1u8 << u8::from(state.live);
             *frontier.entry((state.b, state.d, state.s)).or_default() |= bit;
@@ -1390,12 +1445,11 @@ fn explore_with(cfg: Config, stop: u16, goal: Option<fn(&St) -> bool>) -> Run {
             run.edges += 1;
             count_edge(&state, step, &next, &cfg, &mut run.witness);
             let key = next.pack();
-            if parent.contains_key(&key) {
+            if !visited.insert(key, || Some((state.pack(), step))) {
                 continue;
             }
             debug_assert!(next.well_formed(), "malformed model state {next:?}");
             debug_assert_eq!(St::unpack(key), next, "packing is not a bijection");
-            parent.insert(key, Some((state.pack(), step)));
             let ids = next.violations();
             if ids & I5 != 0 {
                 run.i5_states += 1;
@@ -1408,7 +1462,7 @@ fn explore_with(cfg: Config, stop: u16, goal: Option<fn(&St) -> bool>) -> Run {
                 run.found.push(Found {
                     ids,
                     depth: depth + 1,
-                    trace: trace_of(&parent, key),
+                    trace: visited.witness(key),
                 });
             }
             if ids & stop != 0 {
@@ -1416,7 +1470,7 @@ fn explore_with(cfg: Config, stop: u16, goal: Option<fn(&St) -> bool>) -> Run {
                 return run;
             }
             if goal.is_some_and(|reached| reached(&next)) {
-                run.goal = Some((depth + 1, trace_of(&parent, key)));
+                run.goal = Some((depth + 1, visited.witness(key)));
                 return run;
             }
             queue.push_back((next, depth + 1));
@@ -1666,13 +1720,29 @@ fn repair_abort_plus_ordered_publish_reduced_bounds_has_no_violation() {
         "pinned reduced repair graph"
     );
     assert_eq!(run.max_depth, 31, "pinned reduced repair depth");
+    let compact = explore_with_visited(cfg, 0, None, Visited::Compact(HashSet::new()), false);
+    assert_eq!(
+        (compact.states, compact.edges, compact.max_depth),
+        (run.states, run.edges, run.max_depth)
+    );
+    assert_eq!(compact.witness, run.witness);
+    assert_eq!(compact.violated_bits(), run.violated_bits());
+    assert!(!compact.stopped);
 }
 
-// memory—v1: Candidate repair at the full default bounds (M=3, D=2, C=2) under the abstract publish order. Ignored by default because the graph is far larger than the default budget. Run: `cargo test -p test-harness --locked --offline --test memory_v1_journal_protocol_model -- --ignored --exact repair_abort_plus_ordered_publish_full_bounds_has_no_violation --nocapture` (debug build; release builds of this crate are excluded on this machine). No counts are pinned: this exploration has not been run, so no result is reported from it.
+// memory—v1: Candidate repair at the full default bounds (M=3, D=2, C=2) under the same
+// abstract publish order. Store only the visited keys for this no-violation exploration;
+// a failure records its packed state and depth, not a predecessor chain. No result is pinned.
 #[test]
-#[ignore = "far larger than the default budget; see the doc comment for the command"]
+#[ignore = "far larger than the default budget; run explicitly with a resource limit"]
 fn repair_abort_plus_ordered_publish_full_bounds_has_no_violation() {
-    let run = explore(split(true, true), 0);
+    let run = explore_with_visited(
+        split(true, true),
+        0,
+        None,
+        Visited::Compact(HashSet::new()),
+        true,
+    );
     println!(
         "repair abort+ordered: {} states, {} transitions, depth {}",
         run.states, run.edges, run.max_depth
@@ -1801,9 +1871,13 @@ fn fault_capture_at_completion_puts_the_claim_beyond_the_stable_prefix() {
     );
 }
 
-// memory—v1: F5, the implemented open without a sync, with process crashes: the recovered claim is set beyond the stable prefix at recovery (I1 at depth 4). Asserts current behaviour disclosed as a gap; update when fixed. Gap: durable_journal.rs:633 sets the confirmed end to the scanned end without a sync, and replay receipts (736, 864) then pass ensure_durable (355–356).
+// memory—v1: F5, the MarkDurable fault model — the pre-2026-11-21 open that claimed the scanned
+// end without a sync — with process crashes: the recovered claim is set beyond the stable prefix
+// at recovery (I1 at depth 4). Pins the fault model, not the current build: the implemented open
+// now synchronizes the retained file at open and corresponds to `SyncAtOpenMoment`, whose full
+// target graph is pinned by `target_sync_on_open_satisfies_every_invariant_over_the_full_graph`.
 #[test]
-fn witness_current_open_without_sync_claims_an_unsynced_prefix() {
+fn witness_mark_durable_open_without_sync_claims_an_unsynced_prefix() {
     let cfg = Config::target(Open::MarkDurable);
     let found = stopping_violation(cfg, ALL);
     expect_violation(
@@ -1814,9 +1888,12 @@ fn witness_current_open_without_sync_claims_an_unsynced_prefix() {
     );
 }
 
-// memory—v1: F5 continued: after a process crash the recovered frame is acknowledged while still not stable; the claim (I1) and the ack (I3) are both violated at depth 5. Asserts current behaviour disclosed as a gap; update when fixed.
+// memory—v1: F5 continued: after a process crash the recovered frame is acknowledged while still
+// not stable; the claim (I1) and the ack (I3) are both violated at depth 5. Pins the MarkDurable
+// fault model after the 2026-11-21 reopen-sync fix; the implemented open is compared against
+// `SyncAtOpenMoment`.
 #[test]
-fn witness_current_open_without_sync_acks_a_recovered_unsynced_frame() {
+fn witness_mark_durable_open_without_sync_acks_a_recovered_unsynced_frame() {
     let cfg = Config::target(Open::MarkDurable);
     let run = explore(cfg, I3);
     assert!(run.stopped);
@@ -1829,9 +1906,14 @@ fn witness_current_open_without_sync_acks_a_recovered_unsynced_frame() {
     );
 }
 
-// memory—v1: The d-form and a second crash: under the implemented open an unsynced frame can be acked (the S-form fails at depth 5, see above). The d-form is only violated after a second process crash retains less than the acked frame: the claim resets to the scanned end, which lies below the acked position, so the acked frame is outside the log (I3d, with I3 and I5, at depth 7). The d-form therefore certifies the implemented open only up to the second crash. Asserts current behaviour disclosed as a gap; update when fixed. Gap: durable_journal.rs:633 and governance_owner.rs ack path, with process-crash retention (S unchanged).
+// memory—v1: The d-form and a second crash: under the MarkDurable fault model an unsynced frame
+// can be acked (the S-form fails at depth 5, see above). The d-form is only violated after a
+// second process crash retains less than the acked frame: the claim resets to the scanned end,
+// which lies below the acked position, so the acked frame is outside the log (I3d, with I3 and
+// I5, at depth 7). The d-form therefore certifies only an open that synchronizes before claiming;
+// the implemented open now does, and this fault model is retained for comparison.
 #[test]
-fn witness_current_open_without_sync_loses_an_acked_frame_on_a_second_crash() {
+fn witness_mark_durable_open_without_sync_loses_an_acked_frame_on_a_second_crash() {
     let cfg = Config::target(Open::MarkDurable);
     let found = stopping_violation(cfg, I3D);
     expect_violation(
@@ -1842,9 +1924,14 @@ fn witness_current_open_without_sync_loses_an_acked_frame_on_a_second_crash() {
     );
 }
 
-// memory—v1: The database outruns the retained log under the implemented open: a frame applied while only the claim (not the stable prefix) covers it is truncated by a process crash, so after the crash the checkpoint lies beyond the log (I1 in the crashed state) and the database policy no longer equals R(b) (I2b), at depth 6. Asserts current behaviour disclosed as a gap; update when fixed. Gap: the database gate uses the claim d, which MarkDurable sets without a sync (durable_journal.rs:633).
+// memory—v1: The database outruns the retained log under the MarkDurable fault model: a frame
+// applied while only the claim (not the stable prefix) covers it is truncated by a process
+// crash, so after the crash the checkpoint lies beyond the log (I1 in the crashed state) and the
+// database policy no longer equals R(b) (I2b), at depth 6. Pins the fault model after the
+// 2026-11-21 reopen-sync fix; the implemented open synchronizes before its confirmed end is used
+// by the database gate.
 #[test]
-fn witness_current_open_without_sync_lets_the_database_outrun_the_retained_log() {
+fn witness_mark_durable_open_without_sync_lets_the_database_outrun_the_retained_log() {
     let cfg = Config::target(Open::MarkDurable);
     let found = stopping_violation(cfg, I2B);
     expect_violation(

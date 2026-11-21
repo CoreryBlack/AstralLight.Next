@@ -1,12 +1,8 @@
 //! memory—v1: the unified loopback-only single-node service.
 //!
-//! This entry point currently adopts a MySQL snapshot at the experimental grade.
-//! Ten fact families, including persistence and recovery, remain unverified even
-//! when the operator acknowledges them. The listener is restricted to loopback;
-//! credentials come from an operator-supplied private file, and unadapted
-//! TrustGraph routes cannot fall back to legacy rows. The service has not yet
-//! implemented the journal verification and replay required before production
-//! authorization; readiness describes the running process, not that proof.
+//! Production admission precedes listener binding. A cold capture and a locally
+//! verified journal do not supply independent authorization or recovery facts;
+//! missing evidence stops startup rather than selecting a weaker grade.
 
 use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
@@ -17,23 +13,25 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
-use astral_authorization_root::memory_v1_adoption::{AdoptionLimit, ColdLoadFacts};
-use astral_authorization_root::memory_v1_db_rows::{CandidateRows, TableCounts};
-use astral_authorization_root::memory_v1_digest::MAX_ROOT_DIGEST_KEYS;
-use astral_authorization_root::memory_v1_hamt::CandidateBudget;
-use astral_authorization_root::memory_v1_registry::RegistryDeclaration;
-use astral_authorization_root::memory_v1_root::{install_process_root, RootHandle, RootOwner};
-use astral_common::config::{AppConfig, JwtValidationRole, MessageTransport};
-use astral_db::memory_v1_candidate_loader::{
-    capture_unverified_candidate_rows_with_schema_diagnostic, CaptureBudget,
-    UnverifiedCandidateRows,
+use astral_authorization_root::memory_v1_adoption::{
+    startup::AuthenticatedStartupEvidence, AdoptionLimit, ColdLoadFacts,
 };
+use astral_authorization_root::memory_v1_db_rows::CandidateRows;
+use astral_authorization_root::memory_v1_registry::RegistryDeclaration;
+use astral_authorization_root::memory_v1_root::{
+    install_process_root_with_headroom, RootHandle, RootOwner,
+};
+use astral_common::config::{AppConfig, JwtValidationRole, MessageTransport};
+use astral_db::memory_v1_candidate_loader::UnverifiedCandidateRows;
 use astral_identity::memory_v1_service::{memory_v1_auth_router, MemoryV1FileCredentials};
 use astral_identity::runtime::memory_v1::MemoryV1CredentialAuthenticator;
+use astral_single_node::memory_v1_cold_install::{ColdInstallError, ReconciledColdInstall};
 use astral_trustgraph::{build_memory_v1_offline_app_state, build_router, RouterIntegrationConfig};
+use astral_types::memory_v1::MemoryId;
+use astral_types::memory_v1_journal::JournalAnchor;
 use axum::Router;
 use policy_engine::PolicyEngine;
-use sqlx::mysql::MySqlPoolOptions;
+use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode};
 use tokio::net::TcpListener;
 
 use crate::memory_v1_composition::{require_serving_root, MemoryV1Composition};
@@ -43,17 +41,17 @@ const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9001";
 const CREDENTIALS_FILE_ENV: &str = "ASTRAL_MEMORY_V1_CREDENTIALS_FILE";
 const ACKNOWLEDGE_ENV: &str = "ASTRAL_MEMORY_V1_ACKNOWLEDGE_LIMITS";
 const JOURNAL_DIR_ENV: &str = "ASTRAL_MEMORY_V1_JOURNAL_DIR";
+const INSTALLATION_ID_ENV: &str = "ASTRAL_MEMORY_V1_INSTALLATION_ID";
 const JOURNAL_FILE_NAME: &str = "memory-v1-durable.bin";
+const CHECKPOINT_BASE: &str = "memory-v1-durable";
 
 /// Login lifetime fixed by the server; the client cannot request one. The
 /// Identity session authority enforces its own (longer) maximum on top of this.
 const SESSION_LIFETIME_SECONDS: i64 = 1_800;
-/// Cold-load caps. They equal the loader's implementation caps, so a larger
-/// database fails the capture instead of being truncated.
-const CAPTURE_MAX_ROWS: usize = 100_000;
-const CAPTURE_MAX_BYTES: usize = 16 * 1024 * 1024;
-/// A card bound to more rule sets than this fails closed rather than being clipped.
-const MAX_BINDINGS_PER_READ: usize = 256;
+#[path = "memory_v1_headroom.rs"]
+mod capacity;
+#[path = "memory_v1_startup_evidence.rs"]
+mod startup_evidence;
 /// One pool connection suffices for a single read-only snapshot transaction.
 const CAPTURE_POOL_CONNECTIONS: u32 = 2;
 const CAPTURE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -66,6 +64,8 @@ pub(crate) struct ServiceSettings {
     pub(crate) listen: SocketAddr,
     pub(crate) credentials_path: PathBuf,
     pub(crate) journal_dir: PathBuf,
+    /// Provisioned once outside the journal directory and retained across boots.
+    pub(crate) installation_id: MemoryId,
     /// Test-only acknowledgement surface of the experimental grade; the
     /// unified production path ignores it.
     #[allow(dead_code)]
@@ -98,12 +98,19 @@ impl ServiceSettings {
             Some(path) if !path.trim().is_empty() => PathBuf::from(path.trim()),
             _ => bail!("{JOURNAL_DIR_ENV} must name the durable journal directory"),
         };
+        let installation_id = get(INSTALLATION_ID_ENV)
+            .and_then(|value| value.parse::<MemoryId>().ok())
+            .filter(|id| *id.as_bytes() != [0; 16])
+            .ok_or_else(|| {
+                anyhow!("{INSTALLATION_ID_ENV} must name the provisioned nonzero installation UUID")
+            })?;
         let acknowledged = parse_acknowledged(get(ACKNOWLEDGE_ENV).as_deref().unwrap_or(""))?;
         #[allow(dead_code)] // test-only acknowledgement surface of the experimental grade
         Ok(Self {
             listen,
             credentials_path,
             journal_dir,
+            installation_id,
             acknowledged,
         })
     }
@@ -135,43 +142,30 @@ fn require_local_transport(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-// memory—v1: The durable journal identity constants of this process.
-//
-// The stream and epoch are fixed so a reopened journal verifies against the
-// same identity across restarts; the genesis anchor is a domain-separated hash
-// so an attacker cannot forge an empty baseline with a zero hash.
-fn journal_identity() -> (
-    astral_types::memory_v1::MemoryId,
-    astral_types::memory_v1::MemoryId,
-) {
+// memory—v1: Bootstrap and reopen derive the same initial history from an
+// independently provisioned installation ID. Only the checkpoint proves its tail.
+fn initial_history(installation_id: MemoryId) -> (MemoryId, MemoryId, JournalAnchor) {
     use sha2::{Digest, Sha256};
-    let stream: [u8; 16] = Sha256::digest(b"astrallight/memory-v1/journal-stream/1\0")[..16]
-        .try_into()
-        .expect("16-byte slice");
-    let epoch: [u8; 16] = Sha256::digest(b"astrallight/memory-v1/journal-epoch/1\0")[..16]
-        .try_into()
-        .expect("16-byte slice");
-    (
-        astral_types::memory_v1::MemoryId::from_bytes(stream),
-        astral_types::memory_v1::MemoryId::from_bytes(epoch),
-    )
+    let digest = |label: &[u8]| -> [u8; 32] {
+        Sha256::new()
+            .chain_update(label)
+            .chain_update(installation_id.as_bytes())
+            .finalize()
+            .into()
+    };
+    let id = |label| MemoryId::from_bytes(digest(label)[..16].try_into().expect("16-byte slice"));
+    let stream = id(b"astrallight/memory-v1/installation/stream/1\0");
+    let epoch = id(b"astrallight/memory-v1/installation/epoch/1\0");
+    let genesis = digest(b"astrallight/memory-v1/installation/genesis/1\0");
+    let baseline = JournalAnchor::new(stream, 0, 0, genesis).expect("well-formed genesis anchor");
+    (stream, epoch, baseline)
 }
 
-fn journal_genesis_anchor() -> astral_types::memory_v1_journal::JournalAnchor {
-    use astral_types::memory_v1_journal::JournalAnchor;
-    use sha2::{Digest, Sha256};
-    let (stream, _) = journal_identity();
-    let genesis: [u8; 32] = Sha256::digest(b"astrallight/memory-v1/journal-genesis/1\0").into();
-    JournalAnchor::new(stream, 0, 0, genesis).expect("the genesis anchor is well-formed")
-}
-
-// memory—v1: Open or create the durable journal under one controlled directory.
-//
-// The directory must exist and be private; the file is created on the first
-// run or reopened after a fresh read-only tail scan on later runs. No
-// truncation, repair, or replay is performed here.
+// memory—v1: Reopen a retained journal without creating a fresh baseline.
+// Normal startup cannot distinguish first bootstrap from a lost journal.
 pub(crate) fn open_durable_journal(
-    journal_dir: &PathBuf,
+    journal_dir: &std::path::Path,
+    installation_id: MemoryId,
 ) -> Result<(
     astral_single_node::memory_v1_durable_journal::MemoryV1DurableJournal,
     astral_single_node::memory_v1_durable_journal::JournalDurability,
@@ -194,76 +188,135 @@ pub(crate) fn open_durable_journal(
             bail!("{JOURNAL_DIR_ENV} must be private (no group/other access)");
         }
     }
-    let (stream, epoch) = journal_identity();
-    let anchor = journal_genesis_anchor();
+    let (stream, epoch, anchor) = initial_history(installation_id);
     let target = journal_dir.join(JOURNAL_FILE_NAME);
-    if target.exists() {
-        if std::fs::metadata(&target)
-            .map_err(|error| anyhow!("read the journal file: {error}"))?
-            .len()
-            == 0
-        {
-            bail!("the durable journal file is an untrusted empty baseline");
-        }
-        // Re-derive the verified tail by an independent read-only scan, then
-        // reopen against exactly that tail.
-        let tail = MemoryV1DurableJournal::scan_tail(
-            &target,
-            stream,
-            epoch,
-            anchor,
-            DurableJournalLimits::conservative(),
-        )
-        .map_err(|error| anyhow!("verify the durable journal chain: {error:?}"))?;
-        MemoryV1DurableJournal::open(
-            &target,
-            stream,
-            epoch,
-            anchor,
-            tail,
-            DurableJournalLimits::conservative(),
-        )
-        .map_err(|error| anyhow!("reopen the durable journal: {error:?}"))
-    } else {
-        MemoryV1DurableJournal::create(
-            &target,
-            stream,
-            epoch,
-            anchor,
-            DurableJournalLimits::conservative(),
-        )
-        .map_err(|error| anyhow!("create the durable journal: {error:?}"))
+    let metadata = std::fs::symlink_metadata(&target).context(
+        "the retained journal is missing or unreadable; bootstrap or reconciliation required",
+    )?;
+    if !metadata.is_file() {
+        bail!("the retained journal is not a regular file; reconciliation required");
     }
+    let install =
+        astral_single_node::memory_v1_durable_journal::CheckpointInstallId::from_install_uuid(
+            installation_id.into_bytes(),
+        )
+        .map_err(|error| anyhow!("invalid checkpoint installation: {error:?}"))?;
+    MemoryV1DurableJournal::open_checkpointed(
+        &target,
+        &journal_dir.join(CHECKPOINT_BASE),
+        install,
+        stream,
+        epoch,
+        anchor,
+        DurableJournalLimits::conservative(),
+    )
+    .map_err(|error| {
+        anyhow!("verify the retained journal against its installation checkpoint: {error:?}")
+    })
 }
 
-// memory—v1: Read the nine candidate tables in one consistent snapshot, then release the
-// pool. The database is not consulted again after this returns.
-pub(crate) async fn capture_from_database(database_url: &str) -> Result<UnverifiedCandidateRows> {
+// memory—v1: Remote addresses require a verified MySQL server identity.
+fn startup_database_options(database_url: &str) -> Result<MySqlConnectOptions> {
+    let options: MySqlConnectOptions = database_url
+        .parse()
+        .map_err(|_| anyhow!("invalid memory-v1 candidate database options"))?;
+    let local = options.get_socket().is_some()
+        || options
+            .get_host()
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if !local && !matches!(options.get_ssl_mode(), MySqlSslMode::VerifyIdentity) {
+        bail!("a nonlocal memory-v1 candidate database requires MySQL TLS verify-identity");
+    }
+    Ok(options)
+}
+
+// memory—v1: Offline operator handoff. Only inspect already-applied history;
+// never apply a suffix, publish Serving, mint authority, or bind a listener.
+pub(crate) async fn inspect_startup_subject() -> Result<()> {
+    let settings = ServiceSettings::from_env()?;
+    let config =
+        AppConfig::from_files_for_memory_v1_experimental("application", JwtValidationRole::Gateway)
+            .context("load the memory-v1 configuration")?;
+    let (journal, _durability) =
+        open_durable_journal(&settings.journal_dir, settings.installation_id)?;
+    let budget = capacity::capture_budget()
+        .ok_or_else(|| anyhow!("insufficient or unknown memory headroom for cold capture"))?;
+    let pool = MySqlPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(CAPTURE_CONNECT_TIMEOUT)
+        .connect_with(startup_database_options(&config.database_url)?)
+        .await
+        .context("connect for read-only memory-v1 startup inspection")?;
+    let captured = ReconciledColdInstall::capture_at_checkpoint(&pool, &journal, budget).await;
+    pool.close().await;
+    let subject = captured?.into_startup_subject(
+        capacity::headroom,
+        &registry_declarations(),
+        settings.installation_id,
+    )?;
+    println!("{}", serde_json::to_string(&subject)?);
+    Ok(())
+}
+
+// memory—v1: Verify the retained applied history and capture the candidate
+// snapshot bound to its reconciled governance position in one integrated step,
+// then release the pool. The database is not consulted again after this
+// returns. The returned value is sealed: the governance position, the rows and
+// the cold-load facts travel together, and the position never detaches as a
+// parameter on the formal path.
+pub(crate) async fn capture_from_database(
+    database_url: &str,
+    journal: &astral_single_node::memory_v1_durable_journal::MemoryV1DurableJournal,
+    durability: &astral_single_node::memory_v1_durable_journal::JournalDurability,
+    installation_id: MemoryId,
+) -> Result<(ReconciledColdInstall, Arc<AuthenticatedStartupEvidence>)> {
+    let budget = capacity::capture_budget()
+        .ok_or_else(|| anyhow!("insufficient or unknown memory headroom for cold capture"))?;
+    let evidence = startup_evidence::load(|name| std::env::var(name).ok())?;
+    evidence.check_checkpoint(installation_id, journal.epoch_id(), journal.position())?;
+    let options = startup_database_options(database_url)?;
+    let scope_check = Arc::new(evidence);
+    let connection_check = Arc::clone(&scope_check);
     let pool = MySqlPoolOptions::new()
         .max_connections(CAPTURE_POOL_CONNECTIONS)
         .acquire_timeout(CAPTURE_CONNECT_TIMEOUT)
-        .connect(database_url)
+        .after_connect(move |connection, _| {
+            let evidence = std::sync::Arc::clone(&connection_check);
+            Box::pin(async move {
+                let scope =
+                    astral_db::memory_v1_candidate_loader::read_startup_database_scope(connection)
+                        .await
+                        .map_err(|_| {
+                            sqlx::Error::Protocol(
+                                "cannot verify the startup database identity".into(),
+                            )
+                        })?;
+                let now = startup_evidence::unix_now()
+                    .map_err(|_| sqlx::Error::Protocol("invalid startup host clock".into()))?;
+                evidence.check_window(now).map_err(|_| {
+                    sqlx::Error::Protocol(
+                        "startup evidence expired before opening a recovery connection".into(),
+                    )
+                })?;
+                evidence.check_database_scope(&scope).map_err(|_| {
+                    sqlx::Error::Protocol("startup evidence does not bind this database".into())
+                })
+            })
+        })
+        .connect_with(options)
         .await
         .map_err(|error| anyhow!("connect the memory-v1 candidate database: {error}"))?;
-    let capture = capture_unverified_candidate_rows_with_schema_diagnostic(
-        &pool,
-        CaptureBudget {
-            max_rows: CAPTURE_MAX_ROWS,
-            max_bytes: CAPTURE_MAX_BYTES,
-        },
-    )
-    .await;
+    let cold = ReconciledColdInstall::capture_and_bind(&pool, journal, durability, budget).await;
     pool.close().await;
-    let capture = capture.context("capture the memory-v1 candidate snapshot")?;
-    if let Some(report) = &capture.capture.report {
-        tracing::info!(
-            capture_attempt = %report.attempt_id.as_uuid(),
-            schema_contract_version = capture.schema_diagnostic.contract_version(),
-            schema_diagnostic = ?capture.schema_diagnostic.fingerprint(),
-            "memory-v1 candidate schema metadata matched"
-        );
-    }
-    Ok(capture.capture)
+    let cold = cold.map_err(|error| match error {
+        ColdInstallError::AppliedHistoryDeadline => {
+            anyhow!("deadline verifying retained receipts before cold capture")
+        }
+        other => anyhow!("cold-install the memory-v1 candidate: {other}"),
+    })?;
+    Ok((cold, scope_check))
 }
 
 // memory—v1: Separate a capture into its candidate rows and the cold-load facts the root is
@@ -292,41 +345,18 @@ pub(crate) fn adopt_captured(
     adopt_rows(rows, &facts, acknowledged)
 }
 
-// memory—v1: The row capture has a separate, larger limit. A valid candidate
-// needs one digest key per row plus one per selected rule set; reject an
-// oversized snapshot before allocating the digest tree or occupying the root slot.
-fn check_root_digest_capacity(counts: &TableCounts) -> Result<()> {
-    let keys = counts
-        .total()
-        .and_then(|rows| rows.checked_add(counts.rule_sets))
-        .ok_or_else(|| anyhow!("memory-v1 root digest key count overflow"))?;
-    if keys > MAX_ROOT_DIGEST_KEYS {
-        bail!(
-            "memory-v1 root digest key capacity exceeded: {keys} keys, limit {MAX_ROOT_DIGEST_KEYS}"
-        );
-    }
-    Ok(())
-}
-
-// memory—v1: Install candidate rows as the process root without adopting them.
+// memory—v1: Recheck headroom with the archive resident; only the fully
+// constructed candidate and digest can occupy the one process slot.
 pub(crate) fn install_rows(rows: CandidateRows) -> Result<RootOwner> {
-    check_root_digest_capacity(&rows.table_counts())?;
     let selections = rows.current_version_selections().map_err(|error| {
         anyhow!("the candidate has no valid current rule-set version pointer: {error:?}")
     })?;
-    install_process_root(
-        rows,
-        selections,
-        CandidateBudget {
-            max_table_rows: CAPTURE_MAX_ROWS,
-            max_bindings_per_read: MAX_BINDINGS_PER_READ,
-        },
-    )
-    .context("install the memory-v1 process root")
+    install_process_root_with_headroom(rows, selections, capacity::headroom)
+        .context("install the memory-v1 process root")
 }
 
 // memory—v1: Adopt already captured rows with the adapter's cold-load facts.
-#[allow(dead_code)] // test-only experimental sequence; see adopt_rows_production
+#[allow(dead_code)] // test-only experimental sequence; the unified path uses production adoption
 pub(crate) fn adopt_rows(
     rows: CandidateRows,
     facts: &ColdLoadFacts,
@@ -342,87 +372,6 @@ pub(crate) fn adopt_rows(
         .adopt_experimental(facts, acknowledged)
         .context("adopt the memory-v1 root under the experimental grade")?;
     Ok(owner)
-}
-
-/// memory—v1: Assemble the sealed production evidence bundle for one capture.
-///
-/// Every sealed fact comes from a check this startup path has actually run:
-///
-/// * **source provenance / snapshot identity**: the candidate loader scanned
-///   every candidate table exactly once inside one consistent snapshot and
-///   produced a full cold-load report (split_capture refuses anything else);
-/// * **lifecycle and validity**: the candidate row validator enforced the
-///   tombstone pairs, references, windows and lengths before installation;
-/// * **confirmation authority**: the registry + structural adoption gate
-///   re-validated every current rule reference and both confirmation indexes
-///   against the exact candidate snapshot;
-/// * **resource ownership / eligibility**: the same structural gate validated
-///   the nine-table relationships the engine evaluates from;
-/// * **separation of duties**: the mounted governance routes refuse a
-///   serving-root write without the commit owner's proof chain, so no caller
-///   can bypass the engine on this loopback-only path;
-/// * **writer coverage**: exactly one `RootMutationWriter` exists, validated
-///   against the root-owned production admission;
-/// * **audit correlation**: every governed commit carries the complete T2
-///   audit candidate through the sealed commit seam;
-/// * **persistence and recovery**: the durable journal was opened after a
-///   complete chain verification (create) or an independent tail scan and
-///   exact-tail reopen (restart).
-///
-/// A future hardening pass replaces any of these startup checks with a
-/// stronger independent owner without changing this interface.
-pub(crate) fn sealed_production_input(
-    facts: &ColdLoadFacts,
-) -> Result<astral_authorization_root::memory_v1_adoption::ProductionEvidenceInput> {
-    use astral_authorization_root::memory_v1_adoption::{AdoptionLimit, ProvenFamily};
-    if facts.schema_contract_version == 0 || facts.schema_fingerprint == [0; 32] {
-        bail!("the capture report does not attest a usable schema");
-    }
-    if facts.captured_at_unix_seconds < 0 {
-        bail!("the capture report attests a negative capture time");
-    }
-    let sealed = ProvenFamily::proven_for;
-    let mut input =
-        astral_authorization_root::memory_v1_adoption::ProductionEvidenceInput::default();
-    input
-        .with_source_provenance(sealed(AdoptionLimit::SourceProvenance))
-        .with_snapshot_identity(sealed(AdoptionLimit::SnapshotIdentity))
-        .with_lifecycle_and_validity(sealed(AdoptionLimit::LifecycleAndValidity))
-        .with_confirmation_authority(sealed(AdoptionLimit::ConfirmationAuthority))
-        .with_resource_ownership(sealed(AdoptionLimit::ResourceOwnership))
-        .with_eligibility(sealed(AdoptionLimit::Eligibility))
-        .with_separation_of_duties(sealed(AdoptionLimit::SeparationOfDuties))
-        .with_writer_coverage(sealed(AdoptionLimit::WriterCoverage))
-        .with_audit_correlation(sealed(AdoptionLimit::AuditCorrelation))
-        .with_persistence_recovery(sealed(AdoptionLimit::PersistenceRecovery))
-        .with_trusted_time(facts.captured_at_unix_seconds);
-    Ok(input)
-}
-
-/// memory—v1: Install the captured rows and adopt the root at the production
-/// grade with the sealed startup bundle. The journal must already be open and
-/// chain-verified when this runs so the persistence fact covers it.
-pub(crate) fn adopt_rows_production(
-    rows: CandidateRows,
-    facts: &ColdLoadFacts,
-) -> Result<(
-    RootOwner,
-    Arc<astral_authorization_root::memory_v1_root::ProductionAdmission>,
-)> {
-    let owner = install_rows(rows)?;
-    // memory—v1 §4.9: the registry must be installed before adoption because
-    // adoption validates every current rule reference against route metadata.
-    owner
-        .install_registry(&registry_declarations())
-        .context("install the memory-v1 resource registry")?;
-    let input = sealed_production_input(facts)?;
-    let (metadata, admission) = owner
-        .adopt_with_production_evidence(facts, &input)
-        .context("adopt the memory-v1 root at the production grade")?;
-    if metadata.status != astral_authorization_root::memory_v1_root::RootStatus::Serving {
-        bail!("the production adoption published a non-serving root");
-    }
-    Ok((owner, Arc::new(admission)))
 }
 
 // memory—v1 §4.9: aggregate the adapted route metadata of every service into
@@ -577,13 +526,8 @@ async fn shutdown_signal() {
     }
 }
 
-/// memory—v1: Run the unified memory-v1 service until it is asked to stop.
-///
-/// Order: validate every input → open/verify the durable journal → cold-load
-/// the candidate → adopt at the production grade with the sealed startup
-/// bundle → validate the root-owned admission → bind loopback → announce
-/// readiness → serve → drain HTTP → drop the composition (journal, writer,
-/// commit owner and root owner) last.
+/// memory—v1: Validate the retained history before cold capture, require
+/// production adoption before binding loopback, and drain before owner drop.
 pub(crate) async fn run() -> Result<()> {
     let settings = ServiceSettings::from_env()?;
     let config =
@@ -599,52 +543,42 @@ pub(crate) async fn run() -> Result<()> {
         bail!("the memory-v1 credentials file defines no credentials");
     }
 
-    // The durable journal is opened before any capture so the persistence
-    // fact in the adoption bundle covers this exact handle.
-    let (journal, durability) = open_durable_journal(&settings.journal_dir)
-        .context("open the durable memory-v1 journal")?;
+    // Opening the retained journal verifies the local chain, not its coverage
+    // of this installation or the database's consumed prefix.
+    let (journal, durability) =
+        open_durable_journal(&settings.journal_dir, settings.installation_id)
+            .context("open the durable memory-v1 journal")?;
     tracing::info!(
         records = journal.record_count(),
         file_bytes = journal.file_position(),
         "memory-v1 durable journal verified"
     );
 
-    let capture = capture_from_database(&config.database_url).await?;
-    let (rows, facts) = split_capture(capture)?;
-    // A journal that carries mutation records is a restart after commits:
-    // replay them in order before adoption, exactly as the A/A1 contract
-    // requires. An empty journal is a fresh start.
-    let (owner, admission) = if journal
-        .recovery_records()
-        .iter()
-        .any(|record| record.kind == astral_types::memory_v1_journal::RecordKind::Mutation)
-    {
-        let owner = install_rows(rows)?;
-        owner
-            .install_registry(&registry_declarations())
-            .context("install the memory-v1 resource registry")?;
-        let input = sealed_production_input(&facts)?;
-        let recovered = astral_single_node::memory_v1_recovery_owner::recover_root(
-            owner, &journal, &facts, &input,
+    let (cold, evidence) = capture_from_database(
+        &config.database_url,
+        &journal,
+        &durability,
+        settings.installation_id,
+    )
+    .await?;
+    // memory—v1: Install only the exact applied-prefix snapshot covered by the
+    // independent reports. The verification and registry generation are
+    // checked before the root CAS and before opening any listener.
+    let (owner, admission) = cold
+        .install_and_adopt_signed_startup(
+            capacity::headroom,
+            &registry_declarations(),
+            settings.installation_id,
+            &evidence,
         )
-        .context("replay the memory-v1 durable journal")?;
-        tracing::info!(
-            mutations = recovered.replayed_mutations,
-            denies = recovered.observed_denies,
-            "memory-v1 journal replay complete"
-        );
-        let owner: std::sync::Arc<RootOwner> = recovered.owner;
-        let admission = recovered.admission;
-        (owner, admission)
-    } else {
-        let (owner, admission) = adopt_rows_production(rows, &facts)?;
-        (Arc::new(owner), admission)
-    };
+        .context("cold-install and adopt the memory-v1 root")?;
+    let owner = Arc::new(owner);
     let root = owner.handle();
     require_serving_root(&root).context("memory-v1 serving root admission")?;
 
     let composition =
         assemble_production(owner, admission, (journal, durability), config, credentials)?;
+    evidence.check_window(startup_evidence::unix_now()?)?;
     let listener = TcpListener::bind(settings.listen)
         .await
         .context("bind the memory-v1 listener")?;
@@ -653,6 +587,7 @@ pub(crate) async fn run() -> Result<()> {
         bail!("the memory-v1 listener bound a non-loopback address");
     }
     let ready = readiness_line(&root, bound)?;
+    evidence.check_window(startup_evidence::unix_now()?)?;
     tracing::info!(addr = %bound, "memory-v1 service ready");
     println!("{ready}");
 
@@ -683,33 +618,12 @@ mod tests {
     }
 
     #[test]
-    // memory—v1: Selection keys count toward the root digest limit; overflow
-    // and oversized captures fail before installation.
-    fn root_digest_capacity_counts_rows_and_selections() {
-        let mut counts = TableCounts {
-            users: MAX_ROOT_DIGEST_KEYS - 2,
-            rule_sets: 1,
-            ..TableCounts::default()
-        };
-        assert!(check_root_digest_capacity(&counts).is_ok());
-        counts.users += 1;
-        let error = check_root_digest_capacity(&counts).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("root digest key capacity exceeded"));
-        counts.users = usize::MAX;
-        assert!(check_root_digest_capacity(&counts)
-            .unwrap_err()
-            .to_string()
-            .contains("key count overflow"));
-    }
-
-    #[test]
     // memory—v1: The listener must be loopback; the default is loopback; garbage is refused.
     fn settings_require_a_loopback_listener() {
         let settings = ServiceSettings::from_lookup(lookup(&[
             (CREDENTIALS_FILE_ENV, "/private/credentials.json"),
             (JOURNAL_DIR_ENV, "/private/journal"),
+            (INSTALLATION_ID_ENV, "00000000-0000-4000-8000-000000000001"),
         ]))
         .unwrap();
         assert_eq!(settings.listen, "127.0.0.1:9001".parse().unwrap());
@@ -720,6 +634,7 @@ mod tests {
                 (LISTEN_ADDR_ENV, accepted),
                 (CREDENTIALS_FILE_ENV, "/private/credentials.json"),
                 (JOURNAL_DIR_ENV, "/private/journal"),
+                (INSTALLATION_ID_ENV, "00000000-0000-4000-8000-000000000001"),
             ]))
             .unwrap();
             assert!(settings.listen.ip().is_loopback());
@@ -736,12 +651,43 @@ mod tests {
                 (LISTEN_ADDR_ENV, refused),
                 (CREDENTIALS_FILE_ENV, "/private/credentials.json"),
                 (JOURNAL_DIR_ENV, "/private/journal"),
+                (INSTALLATION_ID_ENV, "00000000-0000-4000-8000-000000000001"),
             ]))
             .unwrap_err();
             assert!(
                 error.to_string().contains(LISTEN_ADDR_ENV),
                 "{refused:?} must be refused by name: {error}"
             );
+        }
+    }
+
+    #[test]
+    // memory—v1: Reboots retain the installation's history. Foreign histories must differ
+    // even at genesis, before either journal contains any frames.
+    fn installation_identity_binds_the_initial_history() {
+        let id = MemoryId::from_bytes([1; 16]);
+        let (stream, epoch, genesis) = initial_history(id);
+        assert_eq!(initial_history(id), (stream, epoch, genesis));
+        let foreign = initial_history(MemoryId::from_bytes([2; 16]));
+        assert_ne!(stream, epoch);
+        assert_ne!(stream, foreign.0);
+        assert_ne!(epoch, foreign.1);
+        assert_ne!(genesis.frame_hash(), foreign.2.frame_hash());
+        for value in [
+            None,
+            Some(""),
+            Some("bad"),
+            Some("00000000-0000-0000-0000-000000000000"),
+        ] {
+            let settings = ServiceSettings::from_lookup(|name| match name {
+                CREDENTIALS_FILE_ENV | JOURNAL_DIR_ENV => Some("/private/fixture".into()),
+                INSTALLATION_ID_ENV => value.map(str::to_owned),
+                _ => None,
+            });
+            assert!(settings
+                .unwrap_err()
+                .to_string()
+                .contains(INSTALLATION_ID_ENV));
         }
     }
 
@@ -802,11 +748,33 @@ mod tests {
         assert!(!production.contains("test-support"));
         assert!(!production.contains("0.0.0.0"));
     }
+
+    #[test]
+    // memory—v1: The cold-install slice binds the reconciled governance position
+    // inside the sealed capture instead of refusing a non-baseline journal: the
+    // old run-time refusal is gone and the sealed binding is the only formal
+    // prefix carrier.
+    fn cold_install_binds_the_reconciled_prefix_instead_of_refusing() {
+        let source = include_str!("memory_v1_service.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !production.contains("cold root installation requires the recovered governance prefix")
+        );
+        assert!(production.contains("ReconciledColdInstall::capture_and_bind("));
+        assert!(production.contains("install_and_adopt_signed_startup("));
+        assert!(!production.contains("install_and_adopt_production("));
+        // The prefix never appears as a detached parameter on the formal path.
+        assert!(!production.contains("prefix: Option<GovernancePrefix>"));
+    }
 }
 
 // memory—v1: The real-socket lifecycle acceptance tests. Declared after the unit tests so
 // source guards that slice this file at its first `#[cfg(test)]` keep the complete
 // production region.
+#[cfg(test)]
+#[path = "memory_v1_service_fixture.rs"]
+mod production_fixture;
+
 #[cfg(test)]
 #[path = "memory_v1_service_tests.rs"]
 mod lifecycle_tests;

@@ -270,10 +270,16 @@ pub(crate) fn record_sync_publish(outcome: SyncPublishMetricOutcome, elapsed: Du
 pub enum MemoryV1CommitPhase {
     /// Value-level binding validation before any side effect.
     Binding,
-    /// Journal identity allocation, ledger claim and request binding.
+    /// Root writer preparation, including acquisition of its write guard.
     Prepare,
+    /// Wait before acquiring the journal mutex (not the root writer guard).
+    JournalLockWait,
+    /// Time holding the journal mutex, including failed commits.
+    JournalLockHeld,
     /// Journal payload encode, frame write, file and directory fsync.
     JournalIo,
+    /// Wait for the local durable receipt after preparing the journal frame.
+    JournalDurability,
     /// Root CAS: candidate construction, digest, atomic publication.
     RootCas,
     /// Session-coordinated disable path (revocations inside the writer lock).
@@ -287,7 +293,10 @@ impl MemoryV1CommitPhase {
         match self {
             Self::Binding => "binding",
             Self::Prepare => "prepare",
+            Self::JournalLockWait => "journal_lock_wait",
+            Self::JournalLockHeld => "journal_lock_held",
             Self::JournalIo => "journal_io",
+            Self::JournalDurability => "journal_durability",
             Self::RootCas => "root_cas",
             Self::SessionDisable => "session_disable",
             Self::Total => "total",

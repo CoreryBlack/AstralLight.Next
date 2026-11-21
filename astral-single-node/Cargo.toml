@@ -21,11 +21,16 @@ hex = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
 policy-engine = { path = "../policy-engine" }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true }
+sysinfo = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 metrics-exporter-prometheus = { workspace = true }
@@ -38,7 +43,7 @@ astral-types = { path = "../astral-types" }
 async-trait = "0.1"
 reqwest = { workspace = true }
 url = { workspace = true }
-serde_json = { workspace = true }
+ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true }

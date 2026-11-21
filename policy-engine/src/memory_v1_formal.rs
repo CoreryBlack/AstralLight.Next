@@ -2691,8 +2691,34 @@ mod tests {
             Some(MemoryV1PendingSource::FenceActive)
         );
         owner.abort_modification_fence([16_u8; 16]).unwrap();
+        // memory—v1 §4.7: the released window stays recorded against this
+        // scope's read-phase stamp; the touched dependency is not re-allowed
+        // in the same read phase. A fresh read phase may evaluate again.
         let released = evaluate(11, Some(&tenant_bytes), Some(&user_bytes));
-        assert_eq!(released.decision, MemoryV1Decision::Allow);
+        assert_eq!(released.decision, MemoryV1Decision::Pending);
+        assert_eq!(
+            released.pending_source,
+            Some(MemoryV1PendingSource::ContextInvalid)
+        );
+        let fresh_scope = RequestRootScope::new(owner.handle(), Default::default());
+        let fresh_root = fresh_scope.extension();
+        let fresh_issued = authority
+            .identity_session_adapter()
+            .issue_unchecked_for_test(identity(11), 100, 100)
+            .unwrap();
+        let fresh_session = authority
+            .verifier()
+            .verify_and_bind(fresh_issued.credential(), 100, &fresh_root)
+            .unwrap();
+        let released_fresh = evaluate_with(
+            &fresh_root,
+            &fresh_session,
+            &contract_request(Some(&tenant_bytes), Some(&user_bytes)),
+            || Some(110),
+            || {},
+        );
+        assert_eq!(released_fresh.decision, MemoryV1Decision::Allow);
+        assert!(released_fresh.admission.is_some());
 
         // memory—v1 §3.6/§4.8: an unbound card is a deterministic denial.
         let unbound = evaluate(15, Some(&tenant_bytes), Some(&user_bytes));
@@ -4258,8 +4284,9 @@ mod tests {
             root_version: metadata.version,
             digest: metadata.digest,
         };
-        // memory—v1: An aborted window with no publication leaves the original
-        // dependencies valid, while an observed live window fails closed.
+        // memory—v1 §4.7: a window opened and released during the read phase is
+        // recorded against the reader's read-phase stamp, so the touched
+        // dependency stays refused in this phase even without a publication.
         let aborted = evaluate_with(
             &root,
             &long_session,
@@ -4272,7 +4299,7 @@ mod tests {
                 owner.abort_modification_fence([10; 16]).unwrap();
             },
         );
-        assert_eq!(aborted.decision, MemoryV1Decision::Allow);
+        assert_eq!(aborted.decision, MemoryV1Decision::Pending);
 
         // memory—v1: Even if the window closes before the final snapshot, a
         // sample taken inside it must not produce an admission at the edge of
@@ -4295,9 +4322,21 @@ mod tests {
             },
         );
         assert_pending(transient_at_final_time);
+        // An unrelated window (card 4 does not depend on rule set 13) leaves
+        // a fresh phase's decision available; the earlier touched [10;16]
+        // windows keep the shared reader refused regardless.
+        let unrelated_scope = RequestRootScope::new(owner.handle(), Default::default());
+        let unrelated_root = unrelated_scope.extension();
+        let unrelated_issued = adapter
+            .issue_unchecked_for_test(identity(4), 100, 100)
+            .unwrap();
+        let unrelated_session = authority
+            .verifier()
+            .verify_and_bind(unrelated_issued.credential(), 100, &unrelated_root)
+            .unwrap();
         let unrelated_at_final_time = evaluate_with_final(
-            &root,
-            &long_session,
+            &unrelated_root,
+            &unrelated_session,
             &request,
             || Some(110),
             || {},
@@ -4334,9 +4373,98 @@ mod tests {
         owner
             .begin_modification_fence([13; 16], &declaration)
             .unwrap();
+        // memory—v1 §4.7: this phase already observed windows on its touched
+        // dependency [10;16]; releasing them does not revive an ALLOW here,
+        // and the unrelated [13;16] window is isolated from fresh phases.
         let unrelated = evaluate_with(&root, &long_session, &request, || Some(110), || {});
-        assert_eq!(unrelated.decision, MemoryV1Decision::Allow);
+        assert_eq!(unrelated.decision, MemoryV1Decision::Pending);
         owner.abort_modification_fence([13; 16]).unwrap();
+        // A fresh reader does not depend on the unrelated open window.
+        let fresh_scope = RequestRootScope::new(owner.handle(), Default::default());
+        let fresh_root = fresh_scope.extension();
+        let fresh_issued = adapter
+            .issue_unchecked_for_test(identity(4), 100, 100)
+            .unwrap();
+        let fresh_session = authority
+            .verifier()
+            .verify_and_bind(fresh_issued.credential(), 100, &fresh_root)
+            .unwrap();
+        owner
+            .begin_modification_fence([13; 16], &declaration)
+            .unwrap();
+        let unrelated_fresh =
+            evaluate_with(&fresh_root, &fresh_session, &request, || Some(110), || {});
+        assert_eq!(unrelated_fresh.decision, MemoryV1Decision::Allow);
+        owner.abort_modification_fence([13; 16]).unwrap();
+    }
+
+    // memory—v1 §4.7: Guarded final-clock sampling and overlap semantics on a
+    // read phase whose dependency set was never fenced, so the Allow baseline
+    // holds and only the injected contention fails closed.
+    #[test]
+    fn final_check_lock_contention_fail_closed() {
+        const CHILD: &str = "ASTRAL_MEMORY_V1_LOCK_CONTENTION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "memory_v1_formal::tests::final_check_lock_contention_fail_closed",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let (rows, selections) = fixture();
+        let owner = install_process_root(
+            rows,
+            selections,
+            CandidateBudget {
+                max_table_rows: 128,
+                max_bindings_per_read: 8,
+            },
+        )
+        .unwrap();
+        owner
+            .install_registry(&[RegistryDeclaration {
+                resource: "document".to_owned(),
+                actions: vec!["read".to_owned()],
+            }])
+            .unwrap();
+        owner.adopt_serving_for_isolated_tests().unwrap();
+        let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
+        let adapter = authority.identity_session_adapter();
+        let scope = RequestRootScope::new(owner.handle(), Default::default());
+        let root = scope.extension();
+        let long_issued = adapter
+            .issue_unchecked_for_test(identity(4), 100, 100)
+            .unwrap();
+        let long_session = authority
+            .verifier()
+            .verify_and_bind(long_issued.credential(), 100, &root)
+            .unwrap();
+        let request = MemoryV1Request {
+            resource: "document",
+            action: "read",
+            target: None,
+            target_tenant: None,
+            target_owner: None,
+            operation_id: b"op",
+            operation_fingerprint: b"fp",
+        };
+        let assert_pending = |result: MemoryV1Evaluation| {
+            assert_eq!(result.decision, MemoryV1Decision::Pending);
+            assert!(result.admission.is_none());
+        };
 
         for lock in ["session", "root", "registry"] {
             let result = evaluate_with(&root, &long_session, &request, || Some(110), || {});
@@ -4385,12 +4513,14 @@ mod tests {
         }
         // memory—v1: Two final readers may overlap, but revocation cannot
         // linearize until both guarded clock observations have finished.
+        let raced_scope = RequestRootScope::new(owner.handle(), Default::default());
+        let raced_root = raced_scope.extension();
         let raced_issued = adapter
             .issue_unchecked_for_test(identity(4), 100, 100)
             .unwrap();
         let raced_session = authority
             .verifier()
-            .verify_and_bind(raced_issued.credential(), 100, &root)
+            .verify_and_bind(raced_issued.credential(), 100, &raced_root)
             .unwrap();
         std::thread::scope(|threads| {
             use std::sync::mpsc;
@@ -4405,7 +4535,7 @@ mod tests {
                 let entered = entered_tx.clone();
                 let (release_tx, release_rx) = mpsc::channel();
                 releases.push(release_tx);
-                let root_ref = &root;
+                let root_ref = &raced_root;
                 let session_ref = &raced_session;
                 let request_ref = &request;
                 readers.push(threads.spawn(move || {
@@ -4452,14 +4582,14 @@ mod tests {
             writer.join().unwrap();
         });
         assert_pending(evaluate_with(
-            &root,
+            &raced_root,
             &raced_session,
             &request,
             || Some(110),
             || {},
         ));
         assert_pending(evaluate_with(
-            &root,
+            &raced_root,
             &long_session,
             &request,
             || Some(110),
@@ -4969,8 +5099,7 @@ mod tests {
                 },
             )
             .unwrap();
-        // memory—v1: A decision already admitted is not retroactively canceled;
-        // a later request obtains a fresh root snapshot and sees the revocation.
+        // A later revoke does not retroactively cancel an admission.
         assert_eq!(already_admitted.decision, MemoryV1Decision::Allow);
         assert!(already_admitted.admission.is_some());
         let next_scope = RequestRootScope::new(owner.handle(), Default::default());
@@ -5015,5 +5144,172 @@ mod tests {
         );
     }
 
+    // memory—v1 §4.6/§4.7: The dependency read side follows the per-rule-set
+    // FenceRevision. A window opened and released on a touched rule set keeps
+    // the same read phase refused across a publication (the begin->abort ABA,
+    // even when the root version moves), while an unrelated rule set's window
+    // is isolated from its own phase.
+    #[test]
+    fn fence_revision_recheck_detects_aborted_window_across_publication() {
+        const CHILD: &str = "ASTRAL_MEMORY_V1_FENCE_REVISION_ABA_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "memory_v1_formal::tests::fence_revision_recheck_detects_aborted_window_across_publication",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let (rows, selections) = fixture();
+        let owner = install_process_root(
+            rows,
+            selections,
+            CandidateBudget {
+                max_table_rows: 128,
+                max_bindings_per_read: 8,
+            },
+        )
+        .unwrap();
+        owner
+            .install_registry(&[RegistryDeclaration {
+                resource: "document".to_owned(),
+                actions: vec!["read".to_owned()],
+            }])
+            .unwrap();
+        owner.adopt_serving_for_isolated_tests().unwrap();
+        let authority = MemoryV1SessionAuthority::new();
+        authority.bind_to_root(&owner).unwrap();
+        let adapter = authority.identity_session_adapter();
+        let request = MemoryV1Request {
+            resource: "document",
+            action: "read",
+            target: None,
+            target_tenant: None,
+            target_owner: None,
+            operation_id: b"op",
+            operation_fingerprint: b"fp",
+        };
+        let assert_pending = |result: &MemoryV1Evaluation| {
+            assert_eq!(result.decision, MemoryV1Decision::Pending);
+            assert!(result.admission.is_none());
+        };
+
+        let scope = RequestRootScope::new(owner.handle(), Default::default());
+        let root = scope.extension();
+        let issued = adapter
+            .issue_unchecked_for_test(identity(4), 100, 100)
+            .unwrap();
+        let session = authority
+            .verifier()
+            .verify_and_bind(issued.credential(), 100, &root)
+            .unwrap();
+
+        // 1. A live window on the touched rule set refuses reads immediately.
+        let before = owner.handle().metadata().unwrap();
+        let declaration = astral_authorization_root::memory_v1_fence::FenceDeclaration {
+            rule_set_version: vec![1],
+            root_version: before.version,
+            digest: before.digest,
+        };
+        owner
+            .begin_modification_fence([10; 16], &declaration)
+            .unwrap();
+        let active = evaluate_with(&root, &session, &request, || Some(110), || {});
+        assert_eq!(active.decision, MemoryV1Decision::Pending);
+        assert_eq!(
+            active.pending_source,
+            Some(MemoryV1PendingSource::FenceActive)
+        );
+        owner.abort_modification_fence([10; 16]).unwrap();
+
+        // 2. The released window is recorded against this phase's stamp: the
+        // same reader stays refused even though the root version did not move
+        // and nothing was published.
+        let after_abort = evaluate_with(&root, &session, &request, || Some(110), || {});
+        assert_pending(&after_abort);
+
+        // 3. The refusal survives a publication on the same rule set: an old
+        // ALLOW cannot be obtained across begin/abort + publish.
+        let content =
+            br#"{"rules":[{"ruleId":"R1","resource":"document","action":"read","effect":"ALLOW"}]}"#;
+        let version_bytes = vec![2];
+        let timestamp_bytes = vec![2];
+        let hash_input_bytes = canonical_version_bytes(&version_bytes, content, &timestamp_bytes);
+        let mutation = ManagementMutationV2::VersionPublish {
+            rule_set_id: [10; 16],
+            version_row: RuleSetVersionRow {
+                rule_set_id: [10; 16],
+                version_bytes: version_bytes.clone(),
+                content_bytes: content.to_vec(),
+                timestamp_bytes,
+                hash_bytes: astral_authorization_root::memory_v1_rules::version_digest(
+                    &hash_input_bytes,
+                ),
+                hash_input_bytes,
+            },
+            new_current_version: version_bytes.clone(),
+            change_confirmation: RuleSetChangeConfirmationRow {
+                confirmation_id: [95; 16],
+                rule_set_id: [10; 16],
+                version_bytes,
+                confirmer_user_id: [1; 16],
+                affected_scope_bytes: vec![1],
+                operation_id: vec![1],
+                confirmed_at_bytes: vec![1],
+                revoked_at: None,
+                revoked_by: None,
+            },
+        };
+        let before_publish = owner.handle().metadata().unwrap();
+        let published = evaluate_with(
+            &root,
+            &session,
+            &request,
+            || Some(110),
+            || {
+                owner
+                    .execute_mutation_with_precondition_for_isolated_tests(
+                        &mutation,
+                        &MutationPrecondition {
+                            evaluated_root_version: before_publish.version,
+                        },
+                    )
+                    .unwrap();
+            },
+        );
+        assert_pending(&published);
+        assert!(owner.handle().metadata().unwrap().version > before_publish.version);
+
+        // The fresh request sees the new ALLOW rule and its matching confirmation.
+        let fresh_scope = RequestRootScope::new(owner.handle(), Default::default());
+        let fresh_root = fresh_scope.extension();
+        let fresh_issued = adapter
+            .issue_unchecked_for_test(identity(4), 100, 100)
+            .unwrap();
+        let fresh_session = authority
+            .verifier()
+            .verify_and_bind(fresh_issued.credential(), 100, &fresh_root)
+            .unwrap();
+        let fresh = evaluate_with(&fresh_root, &fresh_session, &request, || Some(110), || {});
+        assert_eq!(fresh.decision, MemoryV1Decision::Allow);
+        assert!(fresh.admission.is_some());
+
+        // The old phase still cannot admit, even after the new phase has done so.
+        let still_refused = evaluate_with(&root, &session, &request, || Some(110), || {});
+        assert_pending(&still_refused);
+    }
+
+    mod abc_benchmark;
     mod paper_evidence;
 }

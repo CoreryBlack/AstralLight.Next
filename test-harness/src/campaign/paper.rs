@@ -19,7 +19,7 @@ pub(super) fn is_mysql_suite(suite: &TomlValue) -> bool {
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
 pub(super) fn cancelled(suite: &TomlValue) -> bool {
-    is_paper_suite(suite) && CANCELLED.load(Ordering::Relaxed)
+    (is_paper_suite(suite) || super::darkstar::is_suite(suite)) && CANCELLED.load(Ordering::Relaxed)
 }
 
 #[cfg(unix)]
@@ -118,6 +118,8 @@ struct PaperOptions {
     loopback: bool,
     repair: bool,
     mysql: bool,
+    // Set only by all_darkstar_suites; never a --paper CLI option.
+    all_lanes: bool,
     explicit_run: bool,
 }
 
@@ -213,6 +215,12 @@ impl PaperOptions {
     }
 
     fn includes_lane(&self, lane: &str) -> bool {
+        if self.all_lanes {
+            return matches!(
+                lane,
+                "core" | "controls" | "heavy" | "performance" | "loopback" | "repair" | "mysql"
+            );
+        }
         if self.mysql {
             return lane == "mysql";
         }
@@ -265,6 +273,25 @@ impl PaperOptions {
             "result_scope":"selected suites on the current source snapshot, not historical reproduction or production acceptance"}),
         ))
     }
+}
+
+/// DarkStar campaign selection: every registered paper suite, equivalent to
+/// --all-local --repair-full plus the dedicated MySQL fixture, which is always
+/// included; the darkstar runner blocks or skips it explicitly when its
+/// dedicated approval is missing. The missing historical boundaries stay in the
+/// returned plan under `unavailable`.
+pub(super) fn all_darkstar_suites(manifest: &Manifest) -> Result<(Vec<String>, Value), String> {
+    let options = PaperOptions {
+        controls: true,
+        heavy: true,
+        performance: true,
+        loopback: true,
+        repair: true,
+        mysql: true,
+        all_lanes: true,
+        ..PaperOptions::default()
+    };
+    options.plan(manifest)
 }
 
 fn validate_suite(suite: &TomlValue) -> Result<(), String> {
@@ -355,12 +382,11 @@ pub(super) fn is_paper_suite(suite: &TomlValue) -> bool {
     suite.get("paper_lane").is_some()
 }
 
-pub(super) fn environment(
-    suite: &TomlValue,
-    original: &[(OsString, OsString)],
-) -> (BTreeMap<OsString, OsString>, Option<String>) {
-    // Keep toolchain paths, not ambient DB URLs, credentials, integration flags,
-    // compiler wrappers or the child-process switches used by the fixtures.
+/// Allowlisted toolchain environment plus the offline-build constants shared by
+/// paper and darkstar suite children. Ambient DB URLs, credentials, integration
+/// flags, compiler wrappers and the fixture child-process switches are never
+/// forwarded.
+pub(super) fn clean_environment(original: &[(OsString, OsString)]) -> BTreeMap<OsString, OsString> {
     let mut result = original
         .iter()
         .filter(|(name, _)| {
@@ -378,6 +404,8 @@ pub(super) fn environment(
                         | "CARGO_HOME"
                         | "RUSTUP_HOME"
                         | "CARGO_TARGET_DIR"
+                        | "CARGO_BUILD_JOBS"
+                        | "CARGO_INCREMENTAL"
                 )
             )
         })
@@ -387,6 +415,14 @@ pub(super) fn environment(
     result.insert("CARGO_TERM_COLOR".into(), "never".into());
     result.insert("RUSTUP_AUTO_INSTALL".into(), "0".into());
     result.insert("ASTRAL_MESSAGE_TRANSPORT".into(), "local".into());
+    result
+}
+
+pub(super) fn environment(
+    suite: &TomlValue,
+    original: &[(OsString, OsString)],
+) -> (BTreeMap<OsString, OsString>, Option<String>) {
+    let mut result = clean_environment(original);
     match suite.get("paper_fixture").and_then(TomlValue::as_str) {
         Some("evaluator-load") => {
             result.insert("MEMORY_V1_LOAD_ITERATIONS".into(), "1000".into());
@@ -596,6 +632,7 @@ pub fn run_paper_options(root: &Path, args: &[String]) -> Result<i32, String> {
             snapshot: snapshot_hash,
             execute_command: super::execute,
             paper: Some(plan),
+            darkstar: None,
         },
     )
 }

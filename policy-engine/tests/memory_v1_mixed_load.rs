@@ -305,6 +305,16 @@ fn memory_v1_fence_and_session_controls_are_deterministic() {
         .owner
         .abort_modification_fence(TARGET_RULE_SET)
         .unwrap();
+    let held = engine.evaluate_memory_v1(&root, &session, &request(&target_owner));
+    assert_eq!(held.decision, MemoryV1Decision::Pending);
+    assert!(held.admission.is_none());
+    let fresh_scope = RequestRootScope::new(fixture.owner.handle(), Default::default());
+    let root = fresh_scope.extension();
+    let session = fixture
+        .authority
+        .verifier()
+        .verify_and_bind(&credential, now(), &root)
+        .unwrap();
     assert_allow(&engine.evaluate_memory_v1(&root, &session, &request(&target_owner)));
 
     fixture

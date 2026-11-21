@@ -1,0 +1,221 @@
+# Supplement the existing DarkStar-Papers entries in tests-suite/MANIFEST.toml.
+# Arguments are interpreted by the Rust campaign, never by a shell.
+
+[[case]]
+id = "darkstar-types"
+darkstar_lane = "core"
+args = ["test", "-p", "astral-types", "--lib", "memory_v1", "--", "--test-threads=1"]
+
+[[case]]
+id = "darkstar-database-offline"
+darkstar_lane = "core"
+args = ["test", "-p", "astral-db", "--lib", "memory_v1", "--", "--skip", "real_mysql_", "--test-threads=1"]
+
+[[case]]
+id = "darkstar-identity"
+darkstar_lane = "core"
+args = ["test", "-p", "astral-identity", "--lib", "memory_v1", "--", "--test-threads=1"]
+
+[[case]]
+id = "darkstar-gateway"
+darkstar_lane = "core"
+args = ["test", "-p", "astral-gateway", "--lib", "memory_v1", "--", "--test-threads=1"]
+
+[[case]]
+id = "darkstar-trustgraph"
+darkstar_lane = "core"
+args = ["test", "-p", "astral-trustgraph", "--lib", "memory_v1", "--", "--test-threads=1"]
+
+[[case]]
+id = "darkstar-trustgraph-governance-parity"
+darkstar_lane = "loopback"
+args = ["test", "-p", "astral-trustgraph", "--test", "memory_v1_governance_route_parity", "--", "--test-threads=1"]
+expected_tests = 2
+
+[[case]]
+id = "darkstar-single-node-library"
+darkstar_lane = "core"
+args = ["test", "-p", "astral-single-node", "--lib", "--", "--skip", "real_mysql_", "--skip", "scale_shards_and_requests_report", "--skip", "deny_proof_concurrency_curve", "--skip", "recheck_separation_arms_report_distributions", "--skip", "local_release_journal_curve", "--skip", "local_release_checkpoint_curve", "--test-threads=1"]
+
+[[case]]
+id = "darkstar-single-node-binary"
+darkstar_lane = "loopback"
+args = ["test", "-p", "astral-single-node", "--bin", "astral-single-node", "--", "--skip", "synthetic_scenarios::", "--skip", "writer_contention_tests::", "--skip", "soak_tests::", "--test-threads=1"]
+
+[[case]]
+id = "darkstar-process-refusals"
+darkstar_lane = "loopback"
+args = ["test", "-p", "astral-single-node", "--test", "memory_v1_service_process", "--", "--skip", "real_service_end_to_end", "--skip", "paper_mysql::", "--skip", "mysql_recovery::", "--test-threads=1"]
+
+[[case]]
+id = "darkstar-fence-and-session-controls"
+darkstar_lane = "core"
+args = ["test", "-p", "policy-engine", "--test", "memory_v1_mixed_load", "--", "--skip", "memory_v1_mixed_load", "--test-threads=1"]
+expected_tests = 1
+
+[[case]]
+id = "darkstar-binding-history"
+darkstar_lane = "performance"
+args = ["test", "--release", "--no-fail-fast", "-p", "astral-authorization-root", "--features", "test-support", "--test", "memory_v1_binding_scale", "--test", "memory_v1_confirmation_scale", "--test", "memory_v1_card_create_scale", "--", "--ignored", "--nocapture", "--test-threads=1"]
+# The three targets report 5 parent passes and forward 17 + 27 + 3 child summaries.
+expected_tests = 52
+
+[[case]]
+id = "darkstar-digest-capacity-and-scheduler"
+darkstar_lane = "performance"
+args = ["test", "--release", "-p", "astral-authorization-root", "--features", "test-support", "--lib", "cold_build", "--", "--ignored", "--nocapture", "--test-threads=1"]
+expected_tests = 2
+
+[[case]]
+id = "darkstar-reverse-target-scale"
+darkstar_lane = "performance"
+args = ["test", "--release", "-p", "astral-authorization-root", "--features", "test-support", "--lib", "dependency_recheck_reverse_target_scale", "--", "--ignored", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+
+[[case]]
+id = "darkstar-session-contention"
+darkstar_lane = "performance"
+darkstar_evidence = "contention"
+args = ["test", "--release", "-p", "astral-authorization-root", "--features", "test-support", "--lib", "login_contention_at_live_session_scale", "--", "--ignored", "--nocapture", "--test-threads=1"]
+# The parent deliberately forwards its isolated child's libtest summary too.
+expected_tests = 2
+
+[[case]]
+id = "darkstar-candidate-bench"
+darkstar_lane = "performance"
+acceptance = "command"
+required_output = '"case":"mixed_read_write"'
+args = ["bench", "-p", "astral-authorization-root", "--bench", "memory_v1_candidate"]
+boundary = "Candidate operations and measured output only; not an authorization or HTTP throughput claim."
+
+[[case]]
+id = "darkstar-confirmation-read-scale"
+darkstar_lane = "performance"
+args = ["test", "--release", "-p", "policy-engine", "--test", "memory_v1_confirmation_read_scale", "--test", "memory_v1_change_confirmation_read_scale", "--test", "memory_v1_combined_confirmation_read_scale", "--", "--ignored", "--nocapture", "--test-threads=1"]
+# Three top-level tests, each with four recorded size subprocess summaries.
+expected_tests = 15
+
+[[case]]
+id = "darkstar-mixed-unrelated"
+darkstar_lane = "performance"
+darkstar_evidence = "mixed"
+darkstar_env = { MEMORY_V1_MIXED_LOAD_FENCE_MODE = "unrelated" }
+args = ["test", "--release", "-p", "policy-engine", "--test", "memory_v1_mixed_load", "--", "--ignored", "--exact", "memory_v1_mixed_load", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+
+[[case]]
+id = "darkstar-mixed-target"
+darkstar_lane = "performance"
+darkstar_evidence = "mixed"
+darkstar_env = { MEMORY_V1_MIXED_LOAD_FENCE_MODE = "target" }
+args = ["test", "--release", "-p", "policy-engine", "--test", "memory_v1_mixed_load", "--", "--ignored", "--exact", "memory_v1_mixed_load", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+
+[[case]]
+id = "darkstar-mixed-alternating"
+darkstar_lane = "performance"
+darkstar_evidence = "mixed"
+darkstar_env = { MEMORY_V1_MIXED_LOAD_FENCE_MODE = "alternating" }
+args = ["test", "--release", "-p", "policy-engine", "--test", "memory_v1_mixed_load", "--", "--ignored", "--exact", "memory_v1_mixed_load", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+
+[[case]]
+id = "darkstar-journal-and-checkpoint-load"
+darkstar_lane = "performance"
+args = ["test", "--release", "-p", "astral-single-node", "--lib", "local_release_", "--", "--ignored", "--nocapture", "--test-threads=1"]
+expected_tests = 2
+
+[[case]]
+id = "darkstar-recheck-cost"
+darkstar_lane = "performance"
+args = ["test", "--release", "-p", "astral-single-node", "--lib", "recheck_separation_arms_report_distributions", "--", "--ignored", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+
+[[case]]
+id = "darkstar-http-login-matrix"
+darkstar_lane = "loopback"
+darkstar_evidence = "login"
+darkstar_env = { ASTRAL_MEMORY_V1_LOGIN_CURVE = "1", ASTRAL_MEMORY_V1_LOGIN_CURVE_ROUNDS = "4" }
+args = ["test", "-p", "astral-single-node", "--bin", "astral-single-node", "--", "--exact", "memory_v1_service::lifecycle_stress_tests::full_lifecycle_stress_collects_phase_timings_and_quantifies", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+
+[[case]]
+id = "darkstar-synthetic-paper-warm-governance"
+darkstar_lane = "loopback"
+darkstar_evidence = "synthetic-paper-warm-governance"
+args = ["test", "-p", "astral-single-node", "--bin", "astral-single-node", "--", "--ignored", "--exact", "memory_v1_service::lifecycle_tests::synthetic_scenarios::paper_warm_governance_with_synthetic_snapshot", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+boundary = "Synthetic 23-row snapshot; warm governance over loopback HTTP and a disposable local journal. No MySQL, SQL readback, production adoption, or substitute for paper-usenix-mysql."
+
+[[case]]
+id = "darkstar-synthetic-binary-lifecycle"
+darkstar_lane = "loopback"
+darkstar_evidence = "synthetic-binary-lifecycle"
+args = ["test", "-p", "astral-single-node", "--bin", "astral-single-node", "--", "--ignored", "--exact", "memory_v1_service::lifecycle_tests::synthetic_scenarios::binary_lifecycle_with_synthetic_snapshot", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+boundary = "Synthetic snapshot in the binary's Rust test target; exercises the assembled service over loopback, not executable startup, MySQL recovery, or production readiness. Not a substitute for darkstar-mysql-binary-e2e."
+
+[[case]]
+id = "darkstar-synthetic-writer-contention"
+darkstar_lane = "loopback"
+args = ["test", "-p", "astral-single-node", "--bin", "astral-single-node", "--", "--ignored", "--exact", "memory_v1_service::lifecycle_tests::writer_contention_tests::writer_contention_same_and_distinct_targets_measurements", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+darkstar_postcondition = "writer_contention commit_phases"
+darkstar_evidence = "synthetic-writer-contention"
+boundary = "Four concurrent authorized writers and four read controls over loopback, with a synthetic root and private durable journal. Measures owner and journal phases; not production write throughput."
+
+[[case]]
+id = "darkstar-synthetic-soak-smoke"
+darkstar_lane = "loopback"
+args = ["test", "-p", "astral-single-node", "--bin", "astral-single-node", "--", "--exact", "memory_v1_service::lifecycle_tests::soak_tests::soak_smoke_bounded_mixed_windows_report_and_bounded_growth", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+darkstar_postcondition = "soak_evidence scenario=soak-smoke"
+boundary = "Four one-second windows of mixed loopback load on a synthetic root. Not an hour, external dependency test or production stability evidence."
+
+[[case]]
+id = "darkstar-synthetic-soak-hour"
+darkstar_lane = "loopback"
+explicit_only = true
+darkstar_env = { ASTRAL_MEMORY_V1_SOAK_HOURS = "1" }
+timeout_seconds = 3750
+args = ["test", "-p", "astral-single-node", "--bin", "astral-single-node", "--", "--ignored", "--exact", "memory_v1_service::lifecycle_tests::soak_tests::soak_one_hour_sustained_mixed_load_bounded_growth", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+darkstar_postcondition = "soak_evidence scenario=soak-one-hour windows=360"
+boundary = "Explicit one-hour synthetic load at fixed pacing; measures outcomes and RSS and verifies journal growth and clean drain. Not external recovery or production capacity."
+
+[[case]]
+id = "darkstar-mysql-apply"
+darkstar_lane = "mysql-apply"
+args = ["test", "-p", "astral-db", "--lib", "memory_v1_apply::", "--", "--ignored", "--nocapture", "--test-threads=1"]
+expected_tests = 3
+boundary = "Fresh, operator-prepared 13-table MySQL fixture; exercises apply, deduplication, reconciliation and rollback."
+
+[[case]]
+id = "darkstar-mysql-cold-install"
+darkstar_lane = "mysql-cold"
+args = ["test", "-p", "astral-single-node", "--lib", "real_mysql_cold_install_backfills_suffix_binds_and_reverifies", "--", "--ignored", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+boundary = "Real MySQL recovery, exact tail, candidate adoption and independent audit/tamper readback against a synthetic fixture."
+
+[[case]]
+id = "darkstar-mysql-recovery-curve"
+darkstar_lane = "mysql-apply"
+darkstar_evidence = "recovery"
+args = ["test", "--release", "-p", "astral-single-node", "--lib", "real_mysql_recovery_history_curve", "--", "--ignored", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+boundary = "Three real MySQL recovery datasets; isolated stage timings, not a production boot SLA."
+
+[[case]]
+id = "darkstar-mysql-binary-e2e"
+darkstar_lane = "mysql-e2e"
+args = ["test", "-p", "astral-single-node", "--test", "memory_v1_service_process", "--", "--ignored", "--exact", "real_service_end_to_end_against_a_run_scoped_database", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+boundary = "Disposable MySQL schema, retained genesis checkpoint and a run-scoped external fixture issuer; exercises the real binary's signed startup gate and HTTP lifecycle. Not production issuer, rollout, or recovery-time evidence."
+
+[[case]]
+id = "darkstar-mysql-transport-recovery"
+darkstar_lane = "mysql-e2e"
+args = ["test", "-p", "astral-single-node", "--test", "memory_v1_service_process", "--", "--ignored", "--exact", "mysql_recovery::real_service_recovers_after_mysql_transport_loss", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+darkstar_postcondition = "mysql_transport_recovery warm_correct_ms="
+boundary = "Numeric loopback MySQL and a disposable schema. Checks warm authorization, pre-listener cold refusal, first correct response and durable receipt/audit after one DENY replay. Fault is transport loss, not a MySQL process crash, production signer or production RTO."

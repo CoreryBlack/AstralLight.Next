@@ -448,6 +448,33 @@ fn row_change(table: Table, id: BinaryId, fields: Fields) -> Change {
     }
 }
 
+// memory—v1: Canonical single-ID rows shared by cold build and context additions.
+pub(super) fn user_change(row: &UserRow) -> Change {
+    row_change(Table::User, row.user_id, vec![Some(row.user_id.to_vec())])
+}
+
+pub(super) fn identity_change(row: &IdentityCardRow) -> Change {
+    row_change(
+        Table::IdentityCard,
+        row.identity_card_id,
+        vec![
+            Some(row.identity_card_id.to_vec()),
+            Some(row.user_id.to_vec()),
+        ],
+    )
+}
+
+pub(super) fn tenant_change(row: &TenantRow) -> Change {
+    row_change(
+        Table::Tenant,
+        row.tenant_id,
+        vec![
+            Some(row.tenant_id.to_vec()),
+            row.parent_tenant_id.map(|id| id.to_vec()),
+        ],
+    )
+}
+
 // memory—v1: The same row encoders serve full rebuilds and incremental updates.
 pub(crate) fn card_change(row: &UserCardRow) -> Change {
     row_change(
@@ -557,7 +584,7 @@ pub(crate) fn digest_rows(
     selections: &[CurrentSelection],
 ) -> Result<DigestIndex, RuntimeError> {
     let mut builder = ColdDigestBuilder::new();
-    visit_context_changes(rows, selections, |change| {
+    visit_context_changes(rows, selections, version_change, |change| {
         let Change::Put { key, fields } = change else {
             unreachable!("row encoders only produce puts");
         };
@@ -570,34 +597,17 @@ pub(crate) fn digest_rows(
 pub(crate) fn visit_context_changes(
     rows: &CandidateRows,
     selections: &[CurrentSelection],
+    encode_version: impl Fn(&RuleSetVersionRow) -> Change,
     mut push: impl FnMut(Change) -> Result<(), RuntimeError>,
 ) -> Result<(), RuntimeError> {
     for row in &rows.users {
-        push(row_change(
-            Table::User,
-            row.user_id,
-            vec![Some(row.user_id.to_vec())],
-        ))?;
+        push(user_change(row))?;
     }
     for row in &rows.identity_cards {
-        push(row_change(
-            Table::IdentityCard,
-            row.identity_card_id,
-            vec![
-                Some(row.identity_card_id.to_vec()),
-                Some(row.user_id.to_vec()),
-            ],
-        ))?;
+        push(identity_change(row))?;
     }
     for row in &rows.tenants {
-        push(row_change(
-            Table::Tenant,
-            row.tenant_id,
-            vec![
-                Some(row.tenant_id.to_vec()),
-                row.parent_tenant_id.map(|id| id.to_vec()),
-            ],
-        ))?;
+        push(tenant_change(row))?;
     }
     for row in &rows.user_cards {
         push(card_change(row))?;
@@ -606,7 +616,7 @@ pub(crate) fn visit_context_changes(
         push(rule_set_change(row))?;
     }
     for row in &rows.rule_set_versions {
-        push(version_change(row))?;
+        push(encode_version(row))?;
     }
     for row in &rows.bindings {
         push(binding_change(row))?;
@@ -626,8 +636,8 @@ pub(crate) fn visit_context_changes(
     Ok(())
 }
 
-/// memory—v1: Rebuild the candidate digest for tests and test-support diagnostics.
-#[cfg(any(test, feature = "test-support"))]
+/// memory—v1: Rebuild the archive-shaped diagnostic digest for tests.
+#[cfg(test)]
 pub(crate) fn digest_candidate(
     rows: &CandidateRows,
     selections: &[CurrentSelection],

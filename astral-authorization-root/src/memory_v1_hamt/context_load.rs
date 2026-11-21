@@ -3,11 +3,13 @@
 //! Equal facts are not writes. The delta is the exact set inserted into the
 //! candidate and is also the only input to digest preparation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::memory_v1_digest::{
-    DigestError, MAX_ROOT_DIGEST_KEYS, MAX_ROW_BYTES, MAX_VERSION_BYTES,
-};
+use crate::memory_v1_digest::{DigestError, MAX_ROW_BYTES, MAX_VERSION_BYTES};
+
+// Per submitted load, including repeated facts; never a resident-root limit.
+const MAX_LOAD_ITEMS: usize = 4096;
+const MAX_LOAD_BYTES: usize = 128 * 1024 * 1024;
 
 use super::{
     count_rows, index, Arc, BinaryId, BindingConfirmationState, CandidateError, CandidateRows,
@@ -133,14 +135,13 @@ impl ContextDelta {
         before: &HamtCandidate,
         rows: &CandidateRows,
         selections: &[CurrentSelection],
-        remaining_bytes: usize,
     ) -> Result<Self, ContextLoadError> {
-        let limit = before.budget.max_table_rows.min(MAX_ROOT_DIGEST_KEYS);
+        let limit = before.budget.max_table_rows.min(MAX_LOAD_ITEMS);
         let row_count = count_rows(rows, limit)?;
-        if selections.len() > MAX_ROOT_DIGEST_KEYS.saturating_sub(row_count) {
+        if selections.len() > MAX_LOAD_ITEMS - row_count {
             return Err(ContextLoadError::Digest(DigestError::LimitExceeded));
         }
-        validate_batch_bytes(rows, selections, remaining_bytes)?;
+        validate_batch_bytes(rows, selections, MAX_LOAD_BYTES)?;
         let rows = CandidateRows {
             users: additions(&rows.users, |r| r.user_id, |r| before.user(r.user_id))?,
             identity_cards: additions(
@@ -184,10 +185,13 @@ impl ContextDelta {
                 |r| before.change_confirmation(r.confirmation_id),
             )?,
         };
-        let mut current = BTreeSet::new();
+        let mut current = BTreeMap::new();
         let mut select = Vec::new();
         for selection in selections {
-            if !current.insert(selection.rule_set_id) {
+            if current
+                .insert(selection.rule_set_id, selection.version_bytes.as_slice())
+                .is_some()
+            {
                 return Err(ContextLoadError::Conflict(
                     "duplicate context load selection",
                 ));
@@ -201,6 +205,17 @@ impl ContextDelta {
                 }
                 None => select.push(selection.clone()),
             }
+        }
+        if before.uses_source_slots()
+            && rows.rule_set_versions.iter().any(|row| {
+                before.was_archived(row.rule_set_id, &row.version_bytes)
+                    || before.selections.contains_key(&row.rule_set_id)
+                    || current.get(&row.rule_set_id).copied() != Some(row.version_bytes.as_slice())
+            })
+        {
+            return Err(ContextLoadError::Conflict(
+                "context load cannot install an archival version",
+            ));
         }
         if count_rows(&rows, limit)? == 0 && select.is_empty() {
             return Err(ContextLoadError::Conflict("context load adds nothing"));
@@ -246,6 +261,8 @@ impl ContextDelta {
         serving: bool,
     ) -> Result<HamtCandidate, CandidateError> {
         let mut next = before.clone();
+        // memory—v1: Do not pin pre-load map nodes in the newly grown root.
+        next.checked_bindings = None;
         let rows = &self.rows;
         next.row_count = before
             .row_count
@@ -418,7 +435,12 @@ impl HamtCandidate {
         card: BinaryId,
         rule_set: BinaryId,
     ) -> Result<bool, CandidateError> {
-        for id in self.bindings_by_card.get(&card).into_iter().flatten() {
+        for id in self
+            .bindings_by_card
+            .get(&card)
+            .into_iter()
+            .flat_map(|ids| ids.iter())
+        {
             let row = self
                 .binding_for_digest(*id)
                 .ok_or(CandidateError::InconsistentBinding)?;

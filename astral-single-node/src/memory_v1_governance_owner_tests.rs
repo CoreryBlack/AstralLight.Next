@@ -391,6 +391,210 @@ fn commit_refuses_an_operation_replay_without_a_second_write() {
     assert_eq!(root.metadata().unwrap().version, before.version + 1);
 }
 
+// memory—v1: The fixed refusal reason for a recorded operation identity,
+// asserted as a literal so the production constant cannot drift silently.
+const RECORDED_IDENTITY_REASON: &str = "governance operation identity is already \
+     recorded in the retained durable journal; no record was written for this request and the \
+     recorded result requires reconciliation";
+
+// memory—v1: Rebuild a second-boot owner over the same durable journal: a
+// fresh candidate, the verified reopen, the real recovery replay, and a new
+// writer and owner over the retained file. Returns the owner, the recovered
+// serving metadata, and the retained file length.
+fn second_boot(
+    root: &TestRoot,
+) -> (
+    MemoryV1DurableCommitOwner,
+    astral_authorization_root::memory_v1_root::RootMetadata,
+    u64,
+) {
+    use crate::memory_v1_recovery_owner::recover_root;
+
+    let (rows, _) = fixture_rows();
+    let counts = rows.table_counts();
+    let fresh = install_isolated_test_root(
+        rows,
+        vec![CurrentSelection {
+            rule_set_id: [5; 16],
+            version_bytes: vec![1],
+        }],
+        CandidateBudget {
+            max_table_rows: 32,
+            max_bindings_per_read: 4,
+        },
+    )
+    .unwrap();
+    fresh.install_registry(&registry_declarations()).unwrap();
+    let facts = cold_facts(counts);
+    let input = sealed_input();
+    let (journal, durability) = reopened_journal(root);
+    let recovered = recover_root(fresh, &journal, &facts, &input).unwrap();
+    let metadata = recovered.owner.handle().metadata().unwrap();
+    let writer = RootMutationWriter::new(
+        Arc::clone(&recovered.owner),
+        Arc::clone(&recovered.admission),
+    )
+    .unwrap();
+    let owner = MemoryV1DurableCommitOwner::new((journal, durability), writer);
+    let retained_bytes = std::fs::metadata(root.dir.join("journal.bin"))
+        .unwrap()
+        .len();
+    (owner, metadata, retained_bytes)
+}
+
+// memory—v1: A second boot over the reopened journal must refuse a retained
+// operation identity without any durable write and while staying Ready; the
+// refusal reason is the fixed literal and claims no outcome or provenance.
+#[test]
+fn reopened_owner_refuses_a_prior_boot_operation_id_without_a_write() {
+    let root = production_root();
+    let first = assembled_owner(&root);
+    let before = root.metadata().unwrap();
+    first
+        .commit(enable_request(
+            before,
+            "op-1",
+            "ab".repeat(32),
+            1_700_000_000,
+        ))
+        .unwrap();
+    drop(first);
+    let target = root.dir.join("journal.bin");
+    let boot1_bytes = std::fs::metadata(&target).unwrap().len();
+
+    let (second, metadata_after, retained_bytes) = second_boot(&root);
+    assert_eq!(metadata_after.version, before.version + 1);
+    assert_eq!(retained_bytes, boot1_bytes);
+
+    let retry = enable_request(metadata_after, "op-1", "ab".repeat(32), 1_700_000_000);
+    let error = second.commit(retry).unwrap_err();
+    let reason = match &error {
+        astral_types::AstralError::Pending(reason) => reason.clone(),
+        other => panic!("the cross-boot replay must fail closed, got {other:?}"),
+    };
+    assert_eq!(reason, RECORDED_IDENTITY_REASON);
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().len(),
+        boot1_bytes,
+        "the refused retry must not append or sync any byte"
+    );
+
+    // The owner stays Ready: an unrelated operation commits normally. The
+    // refused retry published nothing, so the observation is still live.
+    let next = enable_request(metadata_after, "op-2", "cd".repeat(32), 1_700_000_001);
+    let response = second.commit(next).unwrap();
+    assert_eq!(response.root.version, metadata_after.version + 1);
+    assert!(std::fs::metadata(&target).unwrap().len() > boot1_bytes);
+    drop(second);
+
+    // The durable file holds exactly the two committed mutations.
+    let (journal, _) = reopened_journal(&root);
+    assert_eq!(journal.position().journal_sequence(), 2);
+    assert_eq!(journal.position().mutation_sequence(), 2);
+    assert_eq!(journal.recovery_records().len(), 2);
+}
+
+// memory—v1: A retained operation identity resubmitted with different content
+// is refused with the same fixed reason and no write.
+#[test]
+fn reopened_owner_refuses_an_altered_prior_boot_operation_without_a_write() {
+    let root = production_root();
+    let first = assembled_owner(&root);
+    let before = root.metadata().unwrap();
+    first
+        .commit(enable_request(
+            before,
+            "op-1",
+            "ab".repeat(32),
+            1_700_000_000,
+        ))
+        .unwrap();
+    drop(first);
+    let target = root.dir.join("journal.bin");
+    let boot1_bytes = std::fs::metadata(&target).unwrap().len();
+
+    let (second, metadata_after, retained_bytes) = second_boot(&root);
+    assert_eq!(retained_bytes, boot1_bytes);
+
+    let altered = enable_request(metadata_after, "op-1", "cd".repeat(32), 1_700_000_000);
+    let error = second.commit(altered).unwrap_err();
+    let reason = match &error {
+        astral_types::AstralError::Pending(reason) => reason.clone(),
+        other => panic!("the altered replay must fail closed, got {other:?}"),
+    };
+    assert_eq!(reason, RECORDED_IDENTITY_REASON);
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().len(),
+        boot1_bytes,
+        "the refused altered replay must not append or sync any byte"
+    );
+    drop(second);
+
+    // The retained file is unchanged: exactly the one boot-1 record.
+    let (journal, _) = reopened_journal(&root);
+    assert_eq!(journal.position().journal_sequence(), 1);
+    assert_eq!(journal.position().mutation_sequence(), 1);
+    assert_eq!(journal.recovery_records().len(), 1);
+}
+
+// memory—v1: An operation identity already recorded as a DENY in the same
+// boot is refused for a governance mutation with the same fixed reason and
+// no second record; the refusal must not assume a foreign or earlier boot.
+#[test]
+fn commit_refuses_an_operation_id_already_recorded_as_a_deny() {
+    use astral_trustgraph::service::memory_v1_governance_commit::MemoryV1DenyProofPort;
+    use astral_trustgraph::service::memory_v1_mutation_coordinator::DenyResponse;
+
+    let root = production_root();
+    let owner = assembled_owner(&root);
+    let before = root.metadata().unwrap();
+    owner
+        .commit(enable_request(
+            before,
+            "op-1",
+            "ab".repeat(32),
+            1_700_000_000,
+        ))
+        .unwrap();
+    assert_eq!(
+        owner
+            .prove_deny(deny_observation(&root, "shared-op-1".into()))
+            .unwrap(),
+        DenyResponse::Forbidden
+    );
+    let target = root.dir.join("journal.bin");
+    let recorded_bytes = std::fs::metadata(&target).unwrap().len();
+
+    let error = owner
+        .commit(enable_request(
+            root.metadata().unwrap(),
+            "shared-op-1",
+            "cd".repeat(32),
+            1_700_000_001,
+        ))
+        .unwrap_err();
+    let reason = match &error {
+        astral_types::AstralError::Pending(reason) => reason.clone(),
+        other => panic!("the cross-kind identity conflict must fail closed, got {other:?}"),
+    };
+    assert_eq!(reason, RECORDED_IDENTITY_REASON);
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().len(),
+        recorded_bytes,
+        "the refused mutation must not append or sync any byte"
+    );
+
+    // The owner stays Ready for an unrelated operation.
+    let next = enable_request(
+        root.metadata().unwrap(),
+        "op-2",
+        "ef".repeat(32),
+        1_700_000_002,
+    );
+    let response = owner.commit(next).unwrap();
+    assert_eq!(response.root.version, before.version + 2);
+}
+
 // memory—v1: A stale root observation is refused before any journal write.
 #[test]
 fn commit_refuses_a_stale_root_observation() {
@@ -748,4 +952,163 @@ fn recovery_refuses_a_sequence_gap() {
     let (journal, _durability) = reopened_journal(&root);
     let error = recover_root(advanced, &journal, &facts, &input).unwrap_err();
     assert!(matches!(error, RecoveryError::ReplayConflict), "{error:?}");
+}
+
+// memory—v1: The published snapshot carries the complete reserved record:
+// the facts, the governance position and the frame are retrievable from the
+// snapshot itself, the decoded frame binds the exact operation after the
+// request and the temporary encoding are gone, and the durable file holds
+// exactly the published bytes at the reserved span.
+#[test]
+fn commit_publishes_facts_position_and_reserved_frame_under_one_cas() {
+    use astral_types::memory_v1_journal::decode_record;
+
+    let root = production_root();
+    let owner = assembled_owner(&root);
+    let before = root.metadata().unwrap();
+    let request = enable_request(before, "op-1", "ab".repeat(32), 1_700_000_000);
+    let operation_id = request.operation_id.clone();
+
+    let response = owner.commit(request).unwrap();
+
+    // The published metadata is the root's serving snapshot.
+    assert_eq!(root.metadata().unwrap(), response.root);
+    // The governance position anchors the first mutation of the journal epoch.
+    let frontier = root
+        .owner
+        .current_governance_frontier(&root.admission, &response.root)
+        .unwrap();
+    match frontier {
+        astral_authorization_root::memory_v1_root::GovernanceFrontier::Published(prefix) => {
+            assert_eq!(prefix.epoch(), MemoryId::from_bytes([11; 16]));
+            assert_eq!(prefix.anchor().journal_sequence(), 1);
+            assert_eq!(prefix.anchor().mutation_sequence(), 1);
+        }
+        other => panic!("the published frontier must be Published, got {other:?}"),
+    }
+    // The snapshot carries the complete reserved frame, decodable after the
+    // request and the temporary encoding are gone.
+    let record = root
+        .owner
+        .published_governance_record(&root.admission, &response.root)
+        .unwrap()
+        .expect("the governed publication carries its reserved record");
+    assert_eq!(record.journal_sequence(), 1);
+    assert_eq!(record.mutation_sequence(), 1);
+    assert_eq!(record.start_offset(), 0);
+    let decoded = decode_record(record.frame()).unwrap();
+    assert_eq!(decoded.record.operation_id, operation_id.as_str());
+    assert_eq!(decoded.digest, record.tail_hash());
+    assert_eq!(decoded.record.mutation_sequence, 1);
+    // The durable file holds exactly the published bytes at the reserved span.
+    let bytes = std::fs::read(root.dir.join("journal.bin")).unwrap();
+    assert_eq!(record.end_offset() as usize, bytes.len());
+    assert_eq!(
+        &bytes[record.start_offset() as usize..record.end_offset() as usize],
+        record.frame()
+    );
+    // The chain tail of the reopened journal is the reserved record's digest.
+    // The owner is dropped first so the writer lock is released for the
+    // verified reopen.
+    drop(owner);
+    let (journal, _) = reopened_journal(&root);
+    assert_eq!(journal.position().frame_hash(), &record.tail_hash());
+    assert_eq!(journal.position().journal_sequence(), 1);
+    assert_eq!(journal.recovery_records().len(), 1);
+}
+
+// memory—v1: The baseline snapshot publishes no reservation; only the governed
+// publication path attaches one.
+#[test]
+fn the_baseline_snapshot_publishes_no_reservation() {
+    let root = production_root();
+    let before = root.metadata().unwrap();
+    assert!(root
+        .owner
+        .published_governance_record(&root.admission, &before)
+        .unwrap()
+        .is_none());
+}
+
+// memory—v1: An exhausted journal refuses the reservation before the CAS:
+// nothing is published, no byte is written, no sync is spent, and the
+// operation claim is not retained, so a retry is refused by the reservation
+// again with the same precise reason.
+#[test]
+fn a_capacity_exhausted_reservation_refuses_before_any_publication() {
+    use crate::memory_v1_durable_journal::DurableJournalLimits;
+
+    let root = production_root();
+    let writer =
+        RootMutationWriter::new(Arc::clone(&root.owner), Arc::clone(&root.admission)).unwrap();
+    let limits = DurableJournalLimits {
+        max_records: 1,
+        ..DurableJournalLimits::conservative()
+    };
+    let (journal, durability) = {
+        let anchor = astral_types::memory_v1_journal::JournalAnchor::new(
+            MemoryId::from_bytes([10; 16]),
+            0,
+            0,
+            [5; 32],
+        )
+        .unwrap();
+        crate::memory_v1_durable_journal::MemoryV1DurableJournal::create(
+            &root.dir.join("journal.bin"),
+            MemoryId::from_bytes([10; 16]),
+            MemoryId::from_bytes([11; 16]),
+            anchor,
+            limits,
+        )
+        .unwrap()
+    };
+    let owner = MemoryV1DurableCommitOwner::new((journal, durability), writer);
+    let before = root.metadata().unwrap();
+    owner
+        .commit(enable_request(
+            before,
+            "cap-g1",
+            "ab".repeat(32),
+            1_700_000_000,
+        ))
+        .unwrap();
+    let after = root.metadata().unwrap();
+    let target = root.dir.join("journal.bin");
+    let length = std::fs::metadata(&target).unwrap().len();
+
+    let refused = owner
+        .commit(enable_request(
+            after,
+            "cap-g2",
+            "cd".repeat(32),
+            1_700_000_001,
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(&refused, astral_types::AstralError::Pending(reason) if reason.contains("CapacityExceeded")),
+        "{refused:?}"
+    );
+    assert_eq!(root.metadata().unwrap(), after, "nothing was published");
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().len(),
+        length,
+        "no byte was written"
+    );
+    assert_eq!(owner.journal_sync_calls(), 1, "the refusal never synced");
+
+    // The retry is refused by the reservation again: the claim was never
+    // retained, and no byte appears for either attempt.
+    let retry = owner
+        .commit(enable_request(
+            after,
+            "cap-g2",
+            "cd".repeat(32),
+            1_700_000_001,
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(&retry, astral_types::AstralError::Pending(reason) if reason.contains("CapacityExceeded")),
+        "{retry:?}"
+    );
+    assert_eq!(std::fs::metadata(&target).unwrap().len(), length);
 }

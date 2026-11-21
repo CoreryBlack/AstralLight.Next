@@ -61,26 +61,27 @@ impl RootOwner {
             return Err(MutationError::ConcurrentModification);
         }
         phase("start_prepare");
-        let delta = ContextDelta::prepare(
-            &before.objects,
-            rows,
-            selections,
-            before.digest_index.remaining_bytes(),
-        )
-        .map_err(|error| match error {
-            ContextLoadError::Candidate(error) => MutationError::Candidate(error),
-            ContextLoadError::Conflict(reason) => {
-                MutationError::Runtime(RuntimeError::UnsafeMerge(reason))
-            }
-            ContextLoadError::Digest(error) => MutationError::Runtime(RuntimeError::Digest(error)),
-        })?;
+        super::capacity::mutation_fits(&before.objects, mutation)
+            .map_err(MutationError::Candidate)?;
+        let delta =
+            ContextDelta::prepare(&before.objects, rows, selections).map_err(
+                |error| match error {
+                    ContextLoadError::Candidate(error) => MutationError::Candidate(error),
+                    ContextLoadError::Conflict(reason) => {
+                        MutationError::Runtime(RuntimeError::UnsafeMerge(reason))
+                    }
+                    ContextLoadError::Digest(error) => {
+                        MutationError::Runtime(RuntimeError::Digest(error))
+                    }
+                },
+            )?;
         phase("merge");
         let serving = before.metadata.status == RootStatus::Serving;
         let objects = delta
             .apply(&before.objects, serving)
             .map_err(MutationError::Candidate)?;
         phase("index");
-        let digest_index = prepare_context_load_digest(&before.digest_index, &delta)?;
+        let digest_index = prepare_context_load_digest(&before.digest_index, &delta, &objects)?;
         phase("digest");
         let (budget, row_count) = objects.budget_and_row_count();
         let next = Arc::new(RootSnapshot {
@@ -96,6 +97,9 @@ impl RootOwner {
                 LoadScope::VerifiedColdFixture(_) => before.frontier,
                 _ => GovernanceFrontier::Unproven,
             },
+            // Context loading produces no new governance frame. Preserve the
+            // published bytes for the writer that is still confirming them.
+            reservation: before.reservation.clone(),
             objects,
             digest_index,
             adoption: before.adoption.clone(),

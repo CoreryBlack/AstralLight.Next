@@ -5,10 +5,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod memory_v1_cold_install;
 pub mod memory_v1_durable_journal;
 pub mod memory_v1_governance_owner;
 pub mod memory_v1_recovery_owner;
 pub mod memory_v1_root_writer;
+
+// memory—v1: The in-memory reservation of one governed mutation's complete
+// immutable journal payload; internal to the commit owner.
+mod memory_v1_governance_payload;
 
 #[cfg(test)]
 mod memory_v1_governance_owner_tests;

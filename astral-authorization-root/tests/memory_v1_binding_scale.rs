@@ -3,7 +3,7 @@
 //! Run explicitly with `cargo test --offline --locked -p astral-authorization-root
 //! --features test-support --test memory_v1_binding_scale -- --ignored --nocapture`.
 //! `MEMORY_V1_SCALE_MAX_HISTORY` may lower (never raise) the largest fixture.
-//! The last size also verifies that the digest's bounded row limit fails closed.
+//! The largest fixture checks the explicit row budget separately from digest capacity.
 //! The management call combines candidate construction, validation, hashing and
 //! CAS publication. A separate pass measures binding and confirmation index
 //! validation and complete digest reconstruction on the resulting immutable
@@ -19,13 +19,11 @@ use astral_authorization_root::memory_v1_db_rows::{
     IdentityCardRow, RuleSetChangeConfirmationRow, RuleSetRow, RuleSetVersionRow, TenantRow,
     UserCardRow, UserCardStatus, UserRow,
 };
-use astral_authorization_root::memory_v1_digest::DigestError;
-use astral_authorization_root::memory_v1_hamt::CandidateBudget;
-use astral_authorization_root::memory_v1_hamt_runtime::RuntimeError;
+use astral_authorization_root::memory_v1_hamt::{CandidateBudget, CandidateError};
 use astral_authorization_root::memory_v1_registry::RegistryDeclaration;
 use astral_authorization_root::memory_v1_root::{
-    install_process_root, ManagementMutationV2, MutationPrecondition, RequestRootReader, RootError,
-    RootStatus,
+    install_process_root, process_root_handle, ManagementMutationV2, MutationPrecondition,
+    RequestRootReader, RootError, RootStatus,
 };
 use astral_authorization_root::memory_v1_rules::{
     canonical_version_bytes, MemoryV1OwnerScope, MemoryV1TenantScope,
@@ -300,31 +298,33 @@ fn rule_set_retirement_history_scale() {
     }
 }
 
+// memory—v1: Refusing an explicit row budget must leave the one-shot slot unused.
+fn assert_row_budget_refusal(history: usize) {
+    let (rows, selections, mut budget) = fixture(history);
+    let max = rows.table_counts().total().unwrap() - 1;
+    budget.max_table_rows = max;
+    assert!(matches!(
+        install_process_root(rows, selections, budget),
+        Err(RootError::Candidate(CandidateError::RowBudgetExceeded { max: rejected })) if rejected == max
+    ));
+    assert!(matches!(
+        process_root_handle(),
+        Err(RootError::NotInstalled)
+    ));
+    println!("history={history} max_table_rows={max} row_budget_refused_before_publication=true");
+}
+
 // memory—v1: Build one fixture per process because the public root slot is write-once.
 fn measure_history(history: usize) {
+    if history == HISTORY_SIZES[HISTORY_SIZES.len() - 1] {
+        assert_row_budget_refusal(history);
+    }
     let started = Instant::now();
     let (rows, selections, budget) = fixture(history);
     let fixture_ns = started.elapsed().as_nanos();
     let started = Instant::now();
-    let installed = install_process_root(rows, selections, budget);
+    let owner = install_process_root(rows, selections, budget).expect("install within row budget");
     let install_ns = started.elapsed().as_nanos();
-    if history == 5_000 {
-        assert!(matches!(
-            installed,
-            Err(RootError::Runtime(RuntimeError::Digest(
-                DigestError::LimitExceeded
-            )))
-        ));
-        let (small_rows, small_selections, small_budget) = fixture(0);
-        let owner = install_process_root(small_rows, small_selections, small_budget).unwrap();
-        assert_eq!(
-            owner.handle().metadata().unwrap().status,
-            RootStatus::Candidate
-        );
-        println!("history={history} fixture_ns={fixture_ns} install_candidate_ns={install_ns} outcome=SKIP_MUTATION_DIGEST_ROW_LIMIT");
-        return;
-    }
-    let owner = installed.unwrap();
     owner
         .install_registry(&[RegistryDeclaration {
             resource: "document".to_owned(),

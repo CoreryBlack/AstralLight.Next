@@ -192,7 +192,7 @@ async fn ready(running: &mut Running) -> (SocketAddr, u64) {
     let ready = running
         .wait_ready(Duration::from_secs(90))
         .await
-        .unwrap_or_else(|_| panic!("real service did not announce readiness"));
+        .unwrap_or_else(|failure| panic!("{failure}"));
     let field = |key: &str| {
         ready
             .split_whitespace()
@@ -388,7 +388,7 @@ async fn scenario(run: &str, schema: &str, mut url: Url) {
 }
 
 #[tokio::test]
-#[ignore = "requires an operator-approved isolated, pre-provisioned empty MySQL 8.0 fixture"]
+#[ignore = "production adoption gate: needs independent evidence, reconciled bootstrap and an operator-approved pre-provisioned MySQL fixture"]
 async fn cold_snapshot_and_warm_governance() {
     let (run, schema, url) = fixture();
     if timeout(Duration::from_secs(300), scenario(&run, &schema, url))

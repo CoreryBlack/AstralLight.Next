@@ -270,6 +270,115 @@ fn report_skip(reason: &str) {
     let _ = writeln!(std::io::stderr(), "[SKIP] {reason}");
 }
 
+// memory—v1: Archived bodies count towards cold capture coverage, not the
+// live source-key count. Missing even one archived row invalidates adoption.
+#[test]
+fn cold_archive_coverage_is_distinct_from_live_digest_capacity() {
+    use astral_authorization_root::memory_v1_digest::MAX_ROOT_DIGEST_KEYS;
+    use astral_authorization_root::memory_v1_rules::{canonical_version_bytes, version_digest};
+
+    if !in_isolated_child(
+        "memory_v1_service::lifecycle_tests::cold_archive_coverage_is_distinct_from_live_digest_capacity",
+        "ASTRAL_MEMORY_V1_ARCHIVE_COVERAGE_CHILD",
+    ) {
+        return;
+    }
+    let (mut rows, _) = fixture();
+    let current = rows.rule_set_versions[0].clone();
+    for n in 0..MAX_ROOT_DIGEST_KEYS {
+        let mut archived = current.clone();
+        archived.version_bytes = u64::try_from(n).unwrap().to_be_bytes().to_vec();
+        archived.hash_input_bytes = canonical_version_bytes(
+            &archived.version_bytes,
+            &archived.content_bytes,
+            &archived.timestamp_bytes,
+        );
+        archived.hash_bytes = version_digest(&archived.hash_input_bytes);
+        rows.rule_set_versions.push(archived);
+    }
+    // The binding's original confirmation remains valid even though the
+    // version it names is no longer the rule set's current source.
+    rows.binding_confirmations[0].version_bytes =
+        rows.rule_set_versions.last().unwrap().version_bytes.clone();
+    let facts = attested_facts(&rows);
+    let owner = super::install_rows(rows).unwrap();
+    owner
+        .install_registry(&super::registry_declarations())
+        .unwrap();
+    let mut short = facts;
+    short.scanned_counts.rule_set_versions -= 1;
+    short.snapshot_counts = short.scanned_counts;
+    assert!(owner
+        .adopt_experimental(&short, &AdoptionLimit::EXPERIMENTAL)
+        .is_err());
+    assert_eq!(
+        owner.handle().metadata().unwrap().status,
+        RootStatus::Candidate
+    );
+    let live = owner
+        .adopt_experimental(&facts, &AdoptionLimit::EXPERIMENTAL)
+        .unwrap();
+    assert_eq!(live.status, RootStatus::Serving);
+    let record = owner.handle().adoption_record().unwrap().unwrap();
+    assert_eq!(record.counts, Some(facts.snapshot_counts));
+}
+
+// memory—v1: Active cards, bindings and confirmations coexist in one serving root.
+#[test]
+fn cold_install_serves_active_keys_above_the_old_digest_limit() {
+    if !in_isolated_child(
+        "memory_v1_service::lifecycle_tests::cold_install_serves_active_keys_above_the_old_digest_limit",
+        "ASTRAL_MEMORY_V1_LIVE_CAPACITY_CHILD",
+    ) {
+        return;
+    }
+    let (mut rows, _) = fixture();
+    let card = rows.user_cards[0].clone();
+    let binding = rows.bindings[0].clone();
+    let confirmation = rows.binding_confirmations[0].clone();
+    for n in 1..=1500u128 {
+        let id = n.to_be_bytes();
+        let mut card = card.clone();
+        card.user_card_id = id;
+        rows.user_cards.push(card);
+        let mut binding = binding.clone();
+        binding.binding_id = id;
+        binding.user_card_id = id;
+        rows.bindings.push(binding);
+        let mut confirmation = confirmation.clone();
+        confirmation.confirmation_id = id;
+        confirmation.binding_id = id;
+        rows.binding_confirmations.push(confirmation);
+    }
+    let facts = attested_facts(&rows);
+    let owner = adopt_rows(rows, &facts, &AdoptionLimit::EXPERIMENTAL).unwrap();
+    let root = owner.handle();
+    assert_eq!(
+        Some(root.metadata().unwrap().row_count),
+        facts.snapshot_counts.total()
+    );
+    let reader = root.begin_request(uuid::Uuid::new_v4()).unwrap();
+    let impact = reader.read_impact(binding.rule_set_id).unwrap();
+    assert_eq!(impact.binding_ids.len(), 1503);
+    for n in 1..=1500u128 {
+        assert!(impact.card_ids.contains(&n.to_be_bytes()));
+    }
+    for id in [1u128.to_be_bytes(), 1500u128.to_be_bytes()] {
+        reader
+            .read_card(id, |context| {
+                assert_eq!(context.user.user_id, ALICE);
+                assert_eq!(context.card.user_card_id, id);
+                assert_eq!(context.bindings.len(), 1);
+                let entry = &context.bindings[0];
+                assert_eq!(entry.binding.binding_id, id);
+                assert_eq!(entry.selected.unwrap().rule_set_id, binding.rule_set_id);
+                assert_eq!(entry.confirmations.len(), 1);
+                assert_eq!(entry.confirmations[0].binding_id, id);
+            })
+            .unwrap();
+    }
+}
+
 // memory—v1: Adoption acknowledgements do not prove recovery or formal readiness.
 #[test]
 fn readiness_reports_unverified_recovery_without_opening_a_listener() {
@@ -529,11 +638,8 @@ fn unacknowledged_limits_refuse_adoption_isolated_process() {
     }
 }
 
-// memory—v1: The production startup sequence with a real durable journal:
-// open/verify journal → production adoption with the sealed bundle → validated
-// capability → a real loopback listener that serves requests. This is the
-// isolated-process acceptance run for the unified path; it uses the same
-// public production functions as `run()` with a fixture instead of MySQL.
+// memory—v1: A process-root refusal and the positive production-port control
+// in the same binary. Only the isolated owner accepts synthetic evidence.
 #[test]
 fn production_service_opens_a_verified_journal_and_admits_a_listener_isolated_process() {
     if !cfg!(unix) {
@@ -567,16 +673,40 @@ async fn production_service_lifecycle() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&journal_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let (journal, durability) = super::open_durable_journal(&journal_dir).unwrap();
+    // Ordinary startup never creates genesis when an acknowledged journal
+    // could have disappeared. The fixture bootstrap is separate and explicit.
+    assert!(
+        super::open_durable_journal(&journal_dir, super::production_fixture::INSTALLATION).is_err()
+    );
+    assert!(!journal_dir.join(super::JOURNAL_FILE_NAME).exists());
+    let (journal, durability) = super::production_fixture::journal(&journal_dir);
     assert_eq!(journal.record_count(), 0);
     assert_eq!(journal.file_position(), 0);
 
-    // 2. Install and adopt at the production grade with the sealed bundle.
-    let owner = super::install_rows(rows).unwrap();
+    // 2. The same synthetic declarations must fail on the process root even
+    // in a test-support build. A refusal cannot publish an adoption record.
+    let input = super::production_fixture::input(facts.captured_at_unix_seconds);
+    let process_owner = super::install_rows(rows.clone()).unwrap();
+    process_owner
+        .install_registry(&super::registry_declarations())
+        .unwrap();
+    assert!(matches!(
+        process_owner.adopt_with_production_evidence(&facts, &input),
+        Err(RootError::AdoptionEvidence(
+            astral_authorization_root::memory_v1_adoption::AdoptionEvidenceError::Missing(
+                "source provenance"
+            )
+        ))
+    ));
+    assert_eq!(
+        process_owner.handle().metadata().unwrap().status,
+        RootStatus::Candidate
+    );
+    assert_eq!(process_owner.handle().adoption_record().unwrap(), None);
+    let owner = super::production_fixture::owner(rows);
     owner
         .install_registry(&super::registry_declarations())
         .unwrap();
-    let input = super::sealed_production_input(&facts).unwrap();
     use std::sync::Arc;
     let (metadata, admission) = owner
         .adopt_with_production_evidence(&facts, &input)
@@ -634,10 +764,19 @@ async fn production_service_lifecycle() {
     )
     .await;
     assert_eq!(reply.status, 200, "{}", reply.body);
-    let _alice = reply.body["data"]["accessToken"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let alice = reply.body["data"]["accessToken"].as_str().unwrap();
+    let allowed = http(addr, "GET", REGISTRY, Some(alice), None, &[]).await;
+    assert_eq!(allowed.status, 200, "{}", allowed.body);
+    let unbound = login(addr, "alice", "alice-secret", CARD_UNBOUND).await;
+    let denied = http(addr, "GET", REGISTRY, Some(&unbound), None, &[]).await;
+    assert_eq!(denied.status, 403, "{}", denied.body);
+    assert_eq!(denied.body["decision"], "AUTHORIZATION_CARD_UNBOUND");
+    let target = journal_dir.join(super::JOURNAL_FILE_NAME);
+    let first_end = std::fs::metadata(&target).unwrap().len();
+    assert!(first_end > 0);
+    let second_deny = http(addr, "GET", REGISTRY, Some(&unbound), None, &[]).await;
+    assert_eq!(second_deny.status, 403, "{}", second_deny.body);
+    assert!(std::fs::metadata(&target).unwrap().len() > first_end);
     assert_eq!(budget.active(), 0);
 
     // 6. Graceful stop.
@@ -649,5 +788,60 @@ async fn production_service_lifecycle() {
         .unwrap();
     drop(composition);
     assert!(matches!(root.metadata(), Err(RootError::OwnerGone)));
+    assert!(super::open_durable_journal(&journal_dir, MemoryId::from_bytes([62; 16])).is_err());
+    let (retained, sync) =
+        super::open_durable_journal(&journal_dir, super::production_fixture::INSTALLATION).unwrap();
+    assert_eq!(retained.record_count(), 2);
+    for frame in retained.recovery_records() {
+        use astral_trustgraph::service::memory_v1_mutation_coordinator::{
+            decode_deny_journal_payload_with_origin, journal_producer_boot_id,
+        };
+        let (origin, observation) =
+            decode_deny_journal_payload_with_origin(&frame.payload).unwrap();
+        assert_eq!(origin, Some(journal_producer_boot_id()));
+        assert_eq!(observation.operation_id(), frame.operation_id.as_bytes());
+    }
+    assert_eq!(retained.position().mutation_sequence(), 0);
+    // The two valid, checkpointed frames alone cannot satisfy the recovery gate.
+    let unavailable = sqlx::mysql::MySqlPoolOptions::new()
+        .connect_lazy_with(sqlx::mysql::MySqlConnectOptions::new());
+    unavailable.close().await;
+    assert!(
+        astral_single_node::memory_v1_recovery_owner::verify_applied_history(
+            &unavailable,
+            &retained,
+            &sync,
+        )
+        .await
+        .is_err()
+    );
+    drop((retained, sync));
+    // Lose exactly the last acknowledged DENY. The remaining nonempty prefix
+    // is internally valid, so only an independent tail can detect its loss.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .unwrap();
+    file.set_len(first_end).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    assert!(
+        super::open_durable_journal(&journal_dir, super::production_fixture::INSTALLATION).is_err()
+    );
+    assert_eq!(std::fs::metadata(&target).unwrap().len(), first_end);
     std::fs::remove_dir_all(&journal_dir).unwrap();
 }
+
+// memory—v1: Separate synthetic evidence from the real MySQL suites.
+#[cfg(unix)]
+#[path = "memory_v1_synthetic_scenarios.rs"]
+mod synthetic_scenarios;
+
+// memory—v1: Keep contention and soak measurements independently selectable.
+#[cfg(unix)]
+#[path = "memory_v1_writer_contention_tests.rs"]
+mod writer_contention_tests;
+
+#[cfg(unix)]
+#[path = "memory_v1_soak_tests.rs"]
+mod soak_tests;

@@ -17,5 +17,12 @@ use astral_common::tracing::init_tracing;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
-    memory_v1_service::run().await
+    let mut args = std::env::args_os().skip(1);
+    match (args.next(), args.next()) {
+        (None, None) => memory_v1_service::run().await,
+        (Some(command), None) if command == "inspect-startup-subject" => {
+            memory_v1_service::inspect_startup_subject().await
+        }
+        _ => anyhow::bail!("usage: astral-single-node [inspect-startup-subject]"),
+    }
 }

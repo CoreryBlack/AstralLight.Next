@@ -14,16 +14,21 @@
 //! authorized, journal-persisted, database-committed, acknowledged, or
 //! recoverable. Missing facts are represented as typed unresolved conditions;
 //! the card-disable session hand-off is a typed blocked condition.
+//!
+//! The root's service-period [`ManagementMutationV2::ContextLoad`] variant is
+//! not a governed change: the mutation-digest contract refuses to encode it
+//! and no fact, receipt, or audit-apply contract exists for it, so it is
+//! always reported as [`UnresolvedCondition::ContextLoadNotGoverned`]; its
+//! plan exposes no operations at all, not even the durable tail.
 
 use astral_authorization_root::memory_v1_db_rows::{
-    BinaryId, BindingConfirmationRow, BindingRow, RuleSetChangeConfirmationRow, RuleSetRow,
-    RuleSetVersionRow, UserCardRow, UserCardStatus,
+    BinaryId, RuleSetChangeConfirmationRow, RuleSetRow, RuleSetVersionRow, UserCardStatus,
 };
 use astral_authorization_root::memory_v1_mutation_digest::{digest_mutation, MutationDigest};
 use astral_authorization_root::memory_v1_root::ManagementMutationV2;
 use astral_types::memory_v1::MemoryId;
 use astral_types::memory_v1_audit::{
-    MemoryV1AuditDecision, MemoryV1AuditDecisionInput, MemoryV1AuditEvent, MemoryV1AuditObject,
+    MemoryV1AuditDecision, MemoryV1AuditEvent, MemoryV1AuditObject,
 };
 use astral_types::memory_v1_journal::JournalAnchor;
 
@@ -141,29 +146,6 @@ pub struct FactOperation {
 }
 
 impl FactOperation {
-    // memory—v1
-    fn new(
-        ordinal: usize,
-        owner: TableOwner,
-        kind: OperationKind,
-        target: LogicalTarget,
-        affected_rows: AffectedRows,
-        cas: CasRequirement,
-        tombstone: TombstoneRequirement,
-        preconditions: Vec<Precondition>,
-    ) -> Self {
-        Self {
-            ordinal,
-            owner,
-            kind,
-            target,
-            affected_rows,
-            cas,
-            tombstone,
-            preconditions,
-        }
-    }
-
     /// Zero-based transaction order; this is not a database sequence.
     // memory—v1
     pub const fn ordinal(&self) -> usize {
@@ -266,6 +248,10 @@ pub enum UnresolvedCondition {
     BatchDuplicateBinding,
     BatchDuplicateConfirmation,
     MutationDigestUnavailable,
+    /// The mutation is a service-period context load, not a governed change.
+    /// It has no mutation digest, receipt, or audit-apply contract, so no
+    /// database-apply plan exists for it.
+    ContextLoadNotGoverned,
 }
 
 /// A condition that blocks a plan even when its shape is otherwise known.
@@ -296,7 +282,11 @@ pub enum TransactionAtomicity {
     AllOrNothing,
 }
 
-/// The eleven closed mutation variants currently accepted by the root.
+/// The eleven governed mutation variants this planner models.
+///
+/// The root's twelfth variant, [`ManagementMutationV2::ContextLoad`], is a
+/// service-period context load rather than a governed change; it is never
+/// planned here (see [`UnresolvedCondition::ContextLoadNotGoverned`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutationKind {
     BindingCreate,
@@ -351,7 +341,7 @@ pub struct ApplyPlanInput<'a> {
 #[derive(Clone)]
 pub struct MemoryV1ApplyPlan<'a> {
     mutation: &'a ManagementMutationV2,
-    kind: MutationKind,
+    kind: Option<MutationKind>,
     audit: Option<&'a MemoryV1AuditEvent>,
     flow: Option<JournalAnchor>,
     mutation_digest: Option<MutationDigest>,
@@ -364,8 +354,13 @@ impl<'a> MemoryV1ApplyPlan<'a> {
     /// Build a pure candidate. All validation is value-level and conservative.
     // memory—v1
     pub fn build(input: ApplyPlanInput<'a>) -> Self {
-        let kind = mutation_kind(input.mutation);
+        let kind = governed_mutation_kind(input.mutation);
         let mut issues = Vec::new();
+        if kind.is_none() {
+            issues.push(PlanIssue::Unresolved(
+                UnresolvedCondition::ContextLoadNotGoverned,
+            ));
+        }
         let mutation_digest = match digest_mutation(input.mutation) {
             Ok(digest) => Some(digest),
             Err(_) => {
@@ -375,10 +370,15 @@ impl<'a> MemoryV1ApplyPlan<'a> {
                 None
             }
         };
-        let mut operations = build_fact_operations(input.mutation, kind, &mut issues);
-        validate_batch_shape(input.mutation, &mut issues);
-        validate_mutation_shape(input.mutation, &mut issues);
-        validate_audit(kind, input.mutation, input.audit, &mut issues);
+        let mut operations = match kind {
+            Some(kind) => build_fact_operations(input.mutation, kind, &mut issues),
+            None => Vec::new(),
+        };
+        if let Some(kind) = kind {
+            validate_batch_shape(input.mutation, &mut issues);
+            validate_mutation_shape(input.mutation, &mut issues);
+            validate_audit(kind, input.mutation, input.audit, &mut issues);
+        }
         validate_flow(input.flow, &mut issues);
         if matches!(
             input.mutation,
@@ -391,7 +391,11 @@ impl<'a> MemoryV1ApplyPlan<'a> {
                 BlockedCondition::ExternalSessionCoordinatorRequired,
             ));
         }
-        append_required_tail(&mut operations);
+        // Only a governed mutation kind carries the audit/receipt/progress
+        // tail. An ungoverned context load exposes no operations at all.
+        if kind.is_some() {
+            append_required_tail(&mut operations);
+        }
         Self {
             mutation: input.mutation,
             kind,
@@ -409,8 +413,11 @@ impl<'a> MemoryV1ApplyPlan<'a> {
         self.mutation
     }
 
+    /// The governed mutation kind, or `None` for a service-period context
+    /// load, which no plan covers (see
+    /// [`UnresolvedCondition::ContextLoadNotGoverned`]).
     // memory—v1
-    pub const fn kind(&self) -> MutationKind {
+    pub const fn kind(&self) -> Option<MutationKind> {
         self.kind
     }
 
@@ -472,7 +479,9 @@ impl<'a> MemoryV1ApplyPlan<'a> {
         self.status() == PlanStatus::Complete
     }
 
-    /// The three required durable tail roles are always present in order.
+    /// True when the governed plan ends with the audit, receipt, and progress
+    /// tail in order. An ungoverned context load exposes no operations, so it
+    /// is false there.
     // memory—v1
     pub fn has_required_tail(&self) -> bool {
         self.operations
@@ -518,21 +527,25 @@ impl PlanCorrelation<'_> {
 }
 
 // memory—v1
-fn mutation_kind(mutation: &ManagementMutationV2) -> MutationKind {
+fn governed_mutation_kind(mutation: &ManagementMutationV2) -> Option<MutationKind> {
     match mutation {
-        ManagementMutationV2::BindingCreate { .. } => MutationKind::BindingCreate,
-        ManagementMutationV2::BindingRemove { .. } => MutationKind::BindingRemove,
-        ManagementMutationV2::ConfirmationCreate { .. } => MutationKind::ConfirmationCreate,
-        ManagementMutationV2::ConfirmationRevoke { .. } => MutationKind::ConfirmationRevoke,
+        ManagementMutationV2::BindingCreate { .. } => Some(MutationKind::BindingCreate),
+        ManagementMutationV2::BindingRemove { .. } => Some(MutationKind::BindingRemove),
+        ManagementMutationV2::ConfirmationCreate { .. } => Some(MutationKind::ConfirmationCreate),
+        ManagementMutationV2::ConfirmationRevoke { .. } => Some(MutationKind::ConfirmationRevoke),
         ManagementMutationV2::RuleSetChangeConfirmationRevoke { .. } => {
-            MutationKind::RuleSetChangeConfirmationRevoke
+            Some(MutationKind::RuleSetChangeConfirmationRevoke)
         }
-        ManagementMutationV2::ConfirmationBatch { .. } => MutationKind::ConfirmationBatch,
-        ManagementMutationV2::UserCardCreate { .. } => MutationKind::UserCardCreate,
-        ManagementMutationV2::UserCardStatus { .. } => MutationKind::UserCardStatus,
-        ManagementMutationV2::RuleSetCreate { .. } => MutationKind::RuleSetCreate,
-        ManagementMutationV2::RuleSetRetire { .. } => MutationKind::RuleSetRetire,
-        ManagementMutationV2::VersionPublish { .. } => MutationKind::VersionPublish,
+        ManagementMutationV2::ConfirmationBatch { .. } => Some(MutationKind::ConfirmationBatch),
+        ManagementMutationV2::UserCardCreate { .. } => Some(MutationKind::UserCardCreate),
+        ManagementMutationV2::UserCardStatus { .. } => Some(MutationKind::UserCardStatus),
+        ManagementMutationV2::RuleSetCreate { .. } => Some(MutationKind::RuleSetCreate),
+        ManagementMutationV2::RuleSetRetire { .. } => Some(MutationKind::RuleSetRetire),
+        ManagementMutationV2::VersionPublish { .. } => Some(MutationKind::VersionPublish),
+        // A service-period context load is not a governed change; it has no
+        // mutation digest, receipt, or audit-apply contract and is never
+        // planned here.
+        ManagementMutationV2::ContextLoad { .. } => None,
     }
 }
 
@@ -551,16 +564,16 @@ fn fact_insert(
     target: LogicalTarget,
     preconditions: Vec<Precondition>,
 ) -> FactOperation {
-    FactOperation::new(
+    FactOperation {
         ordinal,
         owner,
-        OperationKind::Insert,
+        kind: OperationKind::Insert,
         target,
-        AffectedRows::Exactly(1),
-        CasRequirement::NotApplicable,
-        TombstoneRequirement::NotApplicable,
+        affected_rows: AffectedRows::Exactly(1),
+        cas: CasRequirement::NotApplicable,
+        tombstone: TombstoneRequirement::NotApplicable,
         preconditions,
-    )
+    }
 }
 
 // memory—v1
@@ -572,16 +585,16 @@ fn fact_update(
     tombstone: TombstoneRequirement,
     preconditions: Vec<Precondition>,
 ) -> FactOperation {
-    FactOperation::new(
+    FactOperation {
         ordinal,
         owner,
-        OperationKind::Update,
+        kind: OperationKind::Update,
         target,
-        AffectedRows::Exactly(1),
-        cas_target(fence),
+        affected_rows: AffectedRows::Exactly(1),
+        cas: cas_target(fence),
         tombstone,
         preconditions,
-    )
+    }
 }
 
 // memory—v1
@@ -592,16 +605,16 @@ fn fact_verify(
     affected_rows: AffectedRows,
     preconditions: Vec<Precondition>,
 ) -> FactOperation {
-    FactOperation::new(
+    FactOperation {
         ordinal,
         owner,
-        OperationKind::Verify,
+        kind: OperationKind::Verify,
         target,
         affected_rows,
-        CasRequirement::NotApplicable,
-        TombstoneRequirement::PreserveExisting,
+        cas: CasRequirement::NotApplicable,
+        tombstone: TombstoneRequirement::PreserveExisting,
         preconditions,
-    )
+    }
 }
 
 // memory—v1
@@ -908,6 +921,11 @@ fn build_fact_operations(
     operations
 }
 
+/// Append the durable audit, receipt, and progress tail.
+///
+/// Called only for a governed mutation kind. An ungoverned context load has no
+/// audit, receipt, or progress contract, so its plan exposes no operations at
+/// all rather than a tail a reader could mistake for an applicable sequence.
 // memory—v1
 fn append_required_tail(operations: &mut Vec<FactOperation>) {
     let ordinal = operations.len();
@@ -918,44 +936,44 @@ fn append_required_tail(operations: &mut Vec<FactOperation>) {
         Precondition::StableOperationIdentity,
         Precondition::FlowAnchorMustBePresent,
     ];
-    operations.push(FactOperation::new(
+    operations.push(FactOperation {
         ordinal,
-        TableOwner::AuditLog,
-        OperationKind::AppendAudit,
-        LogicalTarget::Flow,
-        AffectedRows::Exactly(1),
-        CasRequirement::NotApplicable,
-        TombstoneRequirement::NotApplicable,
-        tail_preconditions,
-    ));
-    operations.push(FactOperation::new(
-        ordinal + 1,
-        TableOwner::ApplyReceipt,
-        OperationKind::AppendReceipt,
-        LogicalTarget::Flow,
-        AffectedRows::Exactly(1),
-        CasRequirement::NotApplicable,
-        TombstoneRequirement::NotApplicable,
-        vec![
+        owner: TableOwner::AuditLog,
+        kind: OperationKind::AppendAudit,
+        target: LogicalTarget::Flow,
+        affected_rows: AffectedRows::Exactly(1),
+        cas: CasRequirement::NotApplicable,
+        tombstone: TombstoneRequirement::NotApplicable,
+        preconditions: tail_preconditions,
+    });
+    operations.push(FactOperation {
+        ordinal: ordinal + 1,
+        owner: TableOwner::ApplyReceipt,
+        kind: OperationKind::AppendReceipt,
+        target: LogicalTarget::Flow,
+        affected_rows: AffectedRows::Exactly(1),
+        cas: CasRequirement::NotApplicable,
+        tombstone: TombstoneRequirement::NotApplicable,
+        preconditions: vec![
             Precondition::StableOperationIdentity,
             Precondition::ReceiptMustBindOperationSequenceAndDigest,
             Precondition::AuditReceiptProgressSameTransaction,
         ],
-    ));
-    operations.push(FactOperation::new(
-        ordinal + 2,
-        TableOwner::ApplyProgress,
-        OperationKind::AdvanceProgress,
-        LogicalTarget::Flow,
-        AffectedRows::Exactly(1),
-        cas_target(CasFence::ProgressPrefix),
-        TombstoneRequirement::NotApplicable,
-        vec![
+    });
+    operations.push(FactOperation {
+        ordinal: ordinal + 2,
+        owner: TableOwner::ApplyProgress,
+        kind: OperationKind::AdvanceProgress,
+        target: LogicalTarget::Flow,
+        affected_rows: AffectedRows::Exactly(1),
+        cas: cas_target(CasFence::ProgressPrefix),
+        tombstone: TombstoneRequirement::NotApplicable,
+        preconditions: vec![
             Precondition::ProgressMustAdvanceContiguously,
             Precondition::ReceiptMustBindOperationSequenceAndDigest,
             Precondition::AuditReceiptProgressSameTransaction,
         ],
-    ));
+    });
 }
 
 // memory—v1
@@ -1029,21 +1047,34 @@ fn validate_mutation_shape(mutation: &ManagementMutationV2, issues: &mut Vec<Pla
             version_row,
             new_current_version,
             change_confirmation,
-        } => {
-            if version_row.rule_set_id != *rule_set_id
-                || version_row.version_bytes.as_slice() != new_current_version.as_slice()
-                || change_confirmation.rule_set_id != *rule_set_id
-                || change_confirmation.version_bytes.as_slice() != new_current_version.as_slice()
-                || change_confirmation.revoked_at.is_some()
-                || change_confirmation.revoked_by.is_some()
-            {
-                issues.push(PlanIssue::Unresolved(
-                    UnresolvedCondition::MutationShapeMismatch,
-                ));
-            }
+        } if !version_publish_shape_matches(
+            *rule_set_id,
+            version_row,
+            new_current_version,
+            change_confirmation,
+        ) =>
+        {
+            issues.push(PlanIssue::Unresolved(
+                UnresolvedCondition::MutationShapeMismatch,
+            ));
         }
         _ => {}
     }
+}
+
+// memory—v1
+fn version_publish_shape_matches(
+    rule_set_id: BinaryId,
+    version_row: &RuleSetVersionRow,
+    new_current_version: &[u8],
+    change_confirmation: &RuleSetChangeConfirmationRow,
+) -> bool {
+    version_row.rule_set_id == rule_set_id
+        && version_row.version_bytes.as_slice() == new_current_version
+        && change_confirmation.rule_set_id == rule_set_id
+        && change_confirmation.version_bytes.as_slice() == new_current_version
+        && change_confirmation.revoked_at.is_none()
+        && change_confirmation.revoked_by.is_none()
 }
 
 // memory—v1
@@ -1195,10 +1226,18 @@ fn audit_target_matches_non_binding(
             ManagementMutationV2::VersionPublish { rule_set_id, .. },
             MemoryV1AuditObject::RuleSet(id),
         ) => id == MemoryId::from_bytes(*rule_set_id),
-        (MutationKind::ConfirmationBatch, ManagementMutationV2::ConfirmationBatch { rows }, _) => {
-            // Batch targets are validated by the batch audit payload by the
-            // future executor. A single target is insufficient evidence here.
-            rows.len() == 1
+        (
+            MutationKind::ConfirmationBatch,
+            ManagementMutationV2::ConfirmationBatch { rows },
+            MemoryV1AuditObject::Confirmation(id),
+        ) => {
+            // A one-row batch inserts one confirmation and must bind the same
+            // change target as ConfirmationCreate; any other target object
+            // would let an audit that does not bind this mutation report
+            // Complete. A multi-row batch has several targets, and one change
+            // target is insufficient evidence for the whole payload, so the
+            // plan stays unresolved instead of guessing the payload binding.
+            rows.len() == 1 && id == MemoryId::from_bytes(rows[0].confirmation_id)
         }
         _ => false,
     }
@@ -1207,12 +1246,14 @@ fn audit_target_matches_non_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astral_authorization_root::memory_v1_db_rows::{BindingLayer, RuleSetStatus};
+    use astral_authorization_root::memory_v1_db_rows::{
+        BindingConfirmationRow, BindingLayer, BindingRow, CandidateRows, RuleSetStatus, UserCardRow,
+    };
     use astral_types::memory_v1_audit::{
         MemoryV1AuditAction, MemoryV1AuditActor, MemoryV1AuditChange, MemoryV1AuditChangeSummary,
         MemoryV1AuditConfirmationRef, MemoryV1AuditConfirmations, MemoryV1AuditContext,
-        MemoryV1AuditOperation, MemoryV1AuditRootObservation, MemoryV1AuditRootStatus,
-        MemoryV1AuditRootVersion, MemoryV1AuditTime,
+        MemoryV1AuditDecisionInput, MemoryV1AuditOperation, MemoryV1AuditRootObservation,
+        MemoryV1AuditRootStatus, MemoryV1AuditRootVersion, MemoryV1AuditTime,
     };
 
     // memory—v1
@@ -1516,6 +1557,9 @@ mod tests {
                 ManagementMutationV2::VersionPublish { rule_set_id, .. } => {
                     MemoryV1AuditObject::RuleSet(memory_id(rule_set_id[0]))
                 }
+                ManagementMutationV2::ContextLoad { .. } => {
+                    unreachable!("valid_mutations contains no service-period context load")
+                }
             };
             let is_retire = matches!(mutation, ManagementMutationV2::RuleSetRetire { .. });
             let event = audit(target, is_retire);
@@ -1526,7 +1570,7 @@ mod tests {
                 TableOwner::ApplyProgress
             );
             assert!(plan.has_required_tail());
-            assert_eq!(plan.operations().len() >= 4, true);
+            assert!(plan.operations().len() >= 4);
         }
     }
 
@@ -1629,6 +1673,80 @@ mod tests {
 
     #[test]
     // memory—v1
+    fn single_row_batch_requires_matching_confirmation_target() {
+        let mutation = ManagementMutationV2::ConfirmationBatch {
+            rows: vec![confirmation(11, 10, 5)],
+        };
+        let event = audit(MemoryV1AuditObject::Confirmation(memory_id(11)), false);
+        let plan = MemoryV1ApplyPlan::build(input(&mutation, Some(&event)));
+        assert_eq!(plan.status(), PlanStatus::Complete);
+    }
+
+    #[test]
+    // memory—v1
+    fn single_row_batch_rejects_foreign_confirmation_id_and_wrong_target_kind() {
+        let mutation = ManagementMutationV2::ConfirmationBatch {
+            rows: vec![confirmation(11, 10, 5)],
+        };
+        let wrong_id = audit(MemoryV1AuditObject::Confirmation(memory_id(12)), false);
+        let plan = MemoryV1ApplyPlan::build(input(&mutation, Some(&wrong_id)));
+        assert!(plan.issues().contains(&PlanIssue::Unresolved(
+            UnresolvedCondition::AuditTargetMismatch
+        )));
+        assert_ne!(plan.status(), PlanStatus::Complete);
+
+        let wrong_kind = audit(MemoryV1AuditObject::UserCard(memory_id(11)), false);
+        let plan = MemoryV1ApplyPlan::build(input(&mutation, Some(&wrong_kind)));
+        assert!(plan.issues().contains(&PlanIssue::Unresolved(
+            UnresolvedCondition::AuditTargetMismatch
+        )));
+        assert_ne!(plan.status(), PlanStatus::Complete);
+    }
+
+    #[test]
+    // memory—v1
+    fn multi_row_batch_stays_unresolved_on_single_target_evidence() {
+        let mutation = ManagementMutationV2::ConfirmationBatch {
+            rows: vec![confirmation(11, 10, 5), confirmation(12, 13, 5)],
+        };
+        let event = audit(MemoryV1AuditObject::Confirmation(memory_id(11)), false);
+        let plan = MemoryV1ApplyPlan::build(input(&mutation, Some(&event)));
+        assert!(plan.issues().contains(&PlanIssue::Unresolved(
+            UnresolvedCondition::AuditTargetMismatch
+        )));
+        assert_eq!(plan.status(), PlanStatus::Unresolved);
+    }
+
+    #[test]
+    // memory—v1
+    fn context_load_is_never_planned_or_complete() {
+        let mutation = ManagementMutationV2::ContextLoad {
+            rows: CandidateRows::default(),
+            selections: Vec::new(),
+        };
+        let event = audit(MemoryV1AuditObject::RuleSet(memory_id(5)), false);
+        let plan = MemoryV1ApplyPlan::build(ApplyPlanInput {
+            mutation: &mutation,
+            audit: Some(&event),
+            flow: Some(flow()),
+        });
+        assert_eq!(plan.status(), PlanStatus::Unresolved);
+        assert!(plan.issues().contains(&PlanIssue::Unresolved(
+            UnresolvedCondition::ContextLoadNotGoverned
+        )));
+        assert!(plan.issues().contains(&PlanIssue::Unresolved(
+            UnresolvedCondition::MutationDigestUnavailable
+        )));
+        assert_eq!(plan.kind(), None);
+        // No fact operations and no durable tail: a read-only consumer of
+        // operations() cannot mistake an ungoverned context load for an
+        // applicable audit/receipt/progress sequence.
+        assert!(plan.operations().is_empty());
+        assert!(!plan.has_required_tail());
+    }
+
+    #[test]
+    // memory—v1
     fn requires_audit_receipt_progress_and_never_fakes_before_images() {
         let mutation = ManagementMutationV2::BindingRemove {
             binding_id: id(10),
@@ -1708,5 +1826,170 @@ mod tests {
         let plan = MemoryV1ApplyPlan::build(input(&mutation, Some(&event)));
         assert_eq!(plan.status(), PlanStatus::Complete);
         assert!(plan.correlation().is_some());
+    }
+}
+
+/// Shared test-only sample values for sibling memory_v1_apply* modules.
+///
+/// This lives behind `cfg(test)` and never enters the production build; it
+/// constructs a complete ALLOW change event with the same value-level shapes
+/// the planner validates.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use astral_authorization_root::memory_v1_db_rows::{UserCardRow, UserCardStatus};
+    use astral_types::memory_v1::MemoryId;
+    use astral_types::memory_v1_audit::{
+        MemoryV1AuditAction, MemoryV1AuditActor, MemoryV1AuditChange, MemoryV1AuditChangeSummary,
+        MemoryV1AuditConfirmationRef, MemoryV1AuditConfirmations, MemoryV1AuditContext,
+        MemoryV1AuditDecisionInput, MemoryV1AuditEvent, MemoryV1AuditObject,
+        MemoryV1AuditObjectState, MemoryV1AuditOperation, MemoryV1AuditRootObservation,
+        MemoryV1AuditRootStatus, MemoryV1AuditRootVersion, MemoryV1AuditSource, MemoryV1AuditTime,
+    };
+
+    // memory—v1
+    pub(crate) fn binary_id(n: u8) -> [u8; 16] {
+        [n; 16]
+    }
+
+    // memory—v1
+    pub(crate) fn memory_id(n: u8) -> MemoryId {
+        MemoryId::from_bytes(binary_id(n))
+    }
+
+    // memory—v1
+    pub(crate) fn sample_user_card_row() -> UserCardRow {
+        UserCardRow {
+            user_card_id: binary_id(20),
+            user_id: binary_id(1),
+            tenant_id: binary_id(4),
+            status: UserCardStatus::Active,
+        }
+    }
+
+    // memory—v1
+    pub(crate) fn version(n: u8) -> Vec<u8> {
+        vec![n]
+    }
+
+    /// A complete ALLOW T2 event with the requested target, mirroring the
+    /// planner's own sample builder so sibling modules share one shape. The
+    /// retirement flag selects explicit ACTIVE→RETIRED rule-set observations.
+    // memory—v1
+    pub(crate) fn sample_audit_event(
+        target: MemoryV1AuditObject,
+        retirement: bool,
+    ) -> MemoryV1AuditEvent {
+        sample_audit_event_with_operation(
+            target,
+            retirement,
+            MemoryV1AuditOperation::new("op-records", [7; 32]).unwrap(),
+        )
+    }
+
+    pub(crate) fn sample_audit_event_with_operation(
+        target: MemoryV1AuditObject,
+        retirement: bool,
+        operation: MemoryV1AuditOperation,
+    ) -> MemoryV1AuditEvent {
+        use astral_types::memory_v1_audit::{
+            MemoryV1AuditBindingState, MemoryV1AuditCardState, MemoryV1AuditConfirmationState,
+            MemoryV1AuditRuleSetState, MemoryV1AuditRuleSetStatus,
+        };
+        let root_before = MemoryV1AuditRootVersion::new(memory_id(8), 1);
+        let root_after = MemoryV1AuditRootVersion::new(memory_id(8), 2);
+        let (before, after) = if retirement {
+            (
+                MemoryV1AuditObjectState::RuleSet(
+                    MemoryV1AuditRuleSetState::new_with_status(
+                        &version(1),
+                        [5; 32],
+                        MemoryV1AuditRuleSetStatus::Active,
+                    )
+                    .unwrap(),
+                ),
+                MemoryV1AuditObjectState::RuleSet(
+                    MemoryV1AuditRuleSetState::new_with_status(
+                        &version(1),
+                        [5; 32],
+                        MemoryV1AuditRuleSetStatus::Retired,
+                    )
+                    .unwrap(),
+                ),
+            )
+        } else {
+            match target {
+                MemoryV1AuditObject::Binding(_) => (
+                    MemoryV1AuditObjectState::Absent,
+                    MemoryV1AuditObjectState::Binding(MemoryV1AuditBindingState::Active),
+                ),
+                MemoryV1AuditObject::Confirmation(_) => (
+                    MemoryV1AuditObjectState::Absent,
+                    MemoryV1AuditObjectState::Confirmation(MemoryV1AuditConfirmationState::Active),
+                ),
+                MemoryV1AuditObject::UserCard(_) => (
+                    MemoryV1AuditObjectState::Absent,
+                    MemoryV1AuditObjectState::UserCard(MemoryV1AuditCardState::Active),
+                ),
+                MemoryV1AuditObject::RuleSet(_) => (
+                    MemoryV1AuditObjectState::RuleSet(
+                        MemoryV1AuditRuleSetState::new_with_status(
+                            &version(1),
+                            [5; 32],
+                            MemoryV1AuditRuleSetStatus::Active,
+                        )
+                        .unwrap(),
+                    ),
+                    MemoryV1AuditObjectState::RuleSet(
+                        MemoryV1AuditRuleSetState::new_with_status(
+                            &version(2),
+                            [6; 32],
+                            MemoryV1AuditRuleSetStatus::Active,
+                        )
+                        .unwrap(),
+                    ),
+                ),
+                MemoryV1AuditObject::Tenant(_) | MemoryV1AuditObject::User(_) => (
+                    MemoryV1AuditObjectState::Absent,
+                    MemoryV1AuditObjectState::Absent,
+                ),
+            }
+        };
+        let change = MemoryV1AuditChange::new(
+            Some(memory_id(1)),
+            Some(target),
+            Some(MemoryV1AuditObject::Tenant(memory_id(4))),
+            Some(MemoryV1AuditChangeSummary::new(&[9]).unwrap()),
+            Some(before),
+            Some(after),
+            Some(
+                MemoryV1AuditConfirmations::references(&[MemoryV1AuditConfirmationRef::Binding(
+                    memory_id(6),
+                )])
+                .unwrap(),
+            ),
+            Some(root_before),
+            Some(root_after),
+            MemoryV1AuditSource::Ordinary,
+        );
+        let context = MemoryV1AuditContext::new(
+            MemoryV1AuditActor::new(memory_id(1), memory_id(2)),
+            MemoryV1AuditTime::new(30).unwrap(),
+            MemoryV1AuditAction::new("memory_v1", "apply").unwrap(),
+            "MANAGEMENT_MUTATION",
+            operation,
+            MemoryV1AuditRootObservation::new(
+                root_before,
+                [4; 32],
+                MemoryV1AuditRootStatus::Serving,
+            ),
+        )
+        .unwrap();
+        MemoryV1AuditEvent::change(context, MemoryV1AuditDecisionInput::Allow, change).unwrap()
+    }
+
+    /// A complete ALLOW T2 event binding the user-card-create sample mutation.
+    // memory—v1
+    pub(crate) fn sample_allow_change_event() -> MemoryV1AuditEvent {
+        sample_audit_event(MemoryV1AuditObject::UserCard(memory_id(20)), false)
     }
 }

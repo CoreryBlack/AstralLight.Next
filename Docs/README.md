@@ -62,7 +62,7 @@ All tracked Rust test assets are published with the standalone workspace: crate 
 - Organization-scope preflight: [`../scripts/org_scope_preflight.sh`](../scripts/org_scope_preflight.sh)
 - Integration compose file: [`../docker-compose.test.yml`](../docker-compose.test.yml)
 - Login probe: [`../test_login.ps1`](../test_login.ps1)
-- Historical reports: [`../integration_test_result_20260707_174605.txt`](../integration_test_result_20260707_174605.txt), [`../integration_test_result_20260707_192539.txt`](../integration_test_result_20260707_192539.txt), [`../integration_test_result_20260707_193124.txt`](../integration_test_result_20260707_193124.txt)
+- Historical reports: 2026-07-07 integration result logs were retained in git history and removed from the working tree.
 
 ## Authorization Validation Code
 

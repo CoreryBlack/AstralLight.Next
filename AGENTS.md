@@ -36,6 +36,16 @@
 4. 只有在存在稳定 `operationId`/`messageId`、幂等、CAS/lease 且已完成对账时才可重试；应设置有限的 dispatch/retry 预算，连续失败后由主 Agent 接管或报告 `BLOCKED`，不得无限重复派发。
 5. 所有执行共用一份可追溯证据记录。发生委派时记录子 Agent 回报；未委派时由责任 Agent 填写等价字段。发生委派时主 Agent 审查通过，未委派时责任 Agent 完成等同审查和最终验收，之后才可向用户汇报。
 
+### 0A.3 动态工作流使用门禁
+
+- 用户明确要求使用 workflow 时，必须使用动态工作流工具；不得用普通 Agent 委派替代。工作流不要求等到完成后才能调整。
+- 运行中的工作流需要修改脚本、阶段、门禁或验收逻辑时，使用 `AmendWorkflow`。它会停止旧运行并创建修订运行，复用已完成步骤的缓存；不得先用 `TaskStop`/其他停止动作再自行重建，也不得把运行中的工作流当作只能等待的不可变任务。
+- `AmendWorkflow` 的脚本来源必须严格二选一：直接传完整 `script`，或先编辑草稿文件后只传 `path`。不得同时传入 `script` 与 `path`，不得用空字符串、空白字符串或 `null` 作为未使用字段的占位。只修改 `max_concurrency`、`name` 或模型等设置时，省略 `script` 和 `path`，让原脚本保持不变。
+- 工作流停在 `hole` 等待补充逻辑时，使用 `FillWorkflowHole`；其 body 来源同样严格二选一，只传 `script` 或 `path`。填充内容只包含 hole 函数体，不得重复提交 `hole(...)` 外壳或同时传两个来源。先前已完成的阶段不因 hole 填充失败而自动重跑。
+- `ResumeWorkflowRun` 只用于按原脚本继续一个被停止、被中断或需要恢复的运行；它不用于修改脚本。用户停止的运行只有在用户明确要求继续时才能恢复；需要改逻辑时使用 `AmendWorkflow`。
+- 调整请求在工具参数校验阶段失败时，记为“工作流提交失败”，不得记为 Cargo、测试、业务断言或安全控制失败。子 Agent 的 `credentials-unavailable`、stream 断流、传输超时、空返回或宿主状态不同步时，记为“工作流执行/传输失败”或 `UNKNOWN`；只有实际收到命令、退出码、断言和 postcondition 证据后，才能记为 Rust 实验 `PASS`/`FAIL`。
+- 发现工作流显示“失败”但运行记录仍为 `running`，先核对运行 ID、phase、subagent 状态、宿主传输日志和 durable postcondition；不得仅凭 UI 卡片重复派发、恢复或重试。对未知结果必须先完成对账；重试仍须遵守稳定 operation/message id、有限预算和本文件的 Exec-L* 门禁。
+
 ---
 
 ## 0B. 变更五链审查（按适用范围强制）

@@ -16,12 +16,12 @@
 //! Identity handler is reachable through this router. Passwords and hashes are
 //! never logged, formatted or echoed.
 
+use astral_authorization_root::memory_v1_policy_time::PolicyTime;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use axum::extract::{Request, State};
@@ -318,19 +318,44 @@ struct LoginData {
     expires_in: i64,
 }
 
-// memory—v1: The Gateway's clock source; one clock keeps issue and verify consistent.
-fn now_unix_seconds() -> Option<i64> {
-    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
-    i64::try_from(elapsed.as_secs()).ok()
-}
+// memory—v1: Wait only on the login path and before insertion. Keep the first
+// observed tick for the TTL; do not backdate to the lower uncertainty bound.
+async fn wait_for_issuance_time(
+    lifetime_seconds: i64,
+    sample: impl Fn() -> Option<PolicyTime>,
+) -> Option<i64> {
+    use tokio::time::{sleep_until, Duration, Instant};
 
-// memory—v1: Round response time up so whole-second expires_in never
-// overstates the remaining lifetime because of subsecond truncation.
-fn response_now_unix_seconds() -> Option<(i64, i64)> {
-    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
-    let seconds = i64::try_from(elapsed.as_secs()).ok()?;
-    let rounded_up = seconds.checked_add(i64::from(elapsed.subsec_nanos() != 0))?;
-    Some((seconds, rounded_up))
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(600);
+    let observe = || {
+        let time = sample();
+        if time.is_none() {
+            tracing::debug!(target: "memory_v1_login_diagnostics", phase = "issuance_clock_unavailable", "memory-v1 login refused");
+        }
+        time
+    };
+    let mut time = observe()?;
+    let issued_at = time.observed();
+    let expires_at = issued_at.checked_add(lifetime_seconds)?;
+    loop {
+        let now = Instant::now();
+        if time.latest().checked_add(1)? >= expires_at {
+            tracing::debug!(target: "memory_v1_login_diagnostics", phase = "issuance_window_expiry", "memory-v1 login refused");
+            return None;
+        }
+        // The timer bounds another wait, not the validity of a fresh sample.
+        // A busy executor may resume us after the deadline with new proof.
+        if time.earliest_later() >= issued_at {
+            return Some(issued_at);
+        }
+        if now >= deadline {
+            tracing::debug!(target: "memory_v1_login_diagnostics", phase = "issuance_wait_deadline", elapsed_ms = now.duration_since(started).as_millis(), ready = false, "memory-v1 login refused");
+            return None;
+        }
+        sleep_until(deadline.min(now + Duration::from_millis(25))).await;
+        time = observe()?;
+    }
 }
 
 // memory—v1: One failure envelope with a machine-readable reason, no internals.
@@ -401,28 +426,39 @@ async fn login(State(state): State<AuthRouteState>, request: Request) -> Respons
             )
         }
     };
-    match state
-        .session
-        .login_with_clock(
-            &state.authenticator,
-            &root,
-            MemoryV1LoginInput {
-                identifier: &body.identifier,
-                password: &body.password,
-                user_card_id: body.user_card_id,
-                lifetime_seconds: state.session_lifetime_seconds,
-            },
-            now_unix_seconds,
-        )
+    login_exchange(
+        &state.session,
+        &state.authenticator,
+        &root,
+        MemoryV1LoginInput {
+            identifier: &body.identifier,
+            password: &body.password,
+            user_card_id: body.user_card_id,
+            lifetime_seconds: state.session_lifetime_seconds,
+        },
+    )
+    .await
+}
+
+// memory—v1: Keep login's timestamp choice and its response gate together.
+pub(crate) async fn login_exchange(
+    session: &MemoryV1IdentitySession,
+    authenticator: &MemoryV1CredentialAuthenticator,
+    root: &RequestRootExtension,
+    input: MemoryV1LoginInput<'_>,
+) -> Response {
+    let lifetime = input.lifetime_seconds;
+    match session
+        .login_with_issuance_time(authenticator, root, input, || {
+            wait_for_issuance_time(lifetime, || session.policy_time())
+        })
         .await
     {
-        Ok((issued, issued_at)) => login_success(
-            &state.session,
-            issued,
-            issued_at,
-            state.session_lifetime_seconds,
-            response_now_unix_seconds,
-        ),
+        Ok((issued, issued_at)) => login_success(session, issued, issued_at, lifetime, || {
+            let sample = session.policy_time()?;
+            // Advertise only whole seconds guaranteed to remain.
+            Some((sample.earliest(), sample.latest().checked_add(1)?))
+        }),
         Err(error) => login_failure(error),
     }
 }
@@ -446,6 +482,7 @@ pub(crate) fn login_success(
             .filter(|remaining| *remaining > 0)
     });
     let Some(expires_in) = remaining else {
+        tracing::debug!(target: "memory_v1_login_diagnostics", phase = "response_time", "memory-v1 login refused");
         if session.revoke(issued.credential()).is_err() {
             tracing::warn!("memory-v1 undelivered session revocation failed");
         }
@@ -693,6 +730,52 @@ mod tests {
         assert_eq!(bearer_credential(&headers("Basic dXNlcjpwdw==")), None);
         assert_eq!(bearer_credential(&headers("bearer m1.abc")), None);
         assert_eq!(bearer_credential(&HeaderMap::new()), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_login_wake_requires_a_new_usable_time_sample() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        type Clock = fn() -> Option<(i128, i128)>;
+        let cases: [(Clock, Option<i64>); 4] = [
+            (|| Some((100_750_000_000, 200_000_000)), Some(100)),
+            (|| Some((100_250_000_000, 200_000_000)), None),
+            (|| None, None),
+            (|| Some((130_000_000_000, 200_000_000)), None),
+        ];
+        for (late, expected) in cases {
+            let early = MemoryV1SessionAuthority::with_clock_for_test(|| {
+                Some((100_100_000_000, 200_000_000))
+            })
+            .identity_session_adapter()
+            .policy_time();
+            let late = MemoryV1SessionAuthority::with_clock_for_test(late)
+                .identity_session_adapter()
+                .policy_time();
+            let samples = std::cell::Cell::new(0);
+            let mut wait = std::pin::pin!(wait_for_issuance_time(30, || {
+                let count = samples.get();
+                samples.set(count + 1);
+                if count == 0 {
+                    early
+                } else {
+                    late
+                }
+            }));
+            poll_fn(|cx| {
+                assert!(wait.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(tokio::time::Duration::from_millis(650)).await;
+            assert_eq!(wait.await, expected);
+            assert_eq!(
+                samples.get(),
+                2,
+                "must not schedule another wait after the deadline"
+            );
+        }
     }
 
     #[test]

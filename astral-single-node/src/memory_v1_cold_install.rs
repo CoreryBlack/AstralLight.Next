@@ -25,11 +25,11 @@
 //! gate over the bound facts. Without complete capture evidence the
 //! installation still refuses.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use astral_authorization_root::memory_v1_adoption::{
     startup::{AuthenticatedStartupEvidence, StartupEvidenceContext},
-    ColdLoadFacts,
+    AdoptionEvidenceError, ColdLoadFacts,
 };
 use astral_authorization_root::memory_v1_db_rows::CandidateRows;
 use astral_authorization_root::memory_v1_registry::RegistryDeclaration;
@@ -48,6 +48,10 @@ use crate::memory_v1_durable_journal::{JournalDurability, MemoryV1DurableJournal
 /// The startup deadline for verifying the retained applied history; the
 /// candidate snapshot loader enforces its own internal deadline.
 const APPLIED_HISTORY_DEADLINE: Duration = Duration::from_secs(30);
+// Only a freshly captured snapshot with an overlapping policy tick may wait.
+const CAPTURE_SETTLE_FRESHNESS: Duration = Duration::from_secs(5);
+const CAPTURE_SETTLE_BUDGET: Duration = Duration::from_secs(2);
+const CAPTURE_SETTLE_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Why a cold installation refused; every variant stops the startup before
 /// any listener exists.
@@ -93,6 +97,7 @@ pub struct ReconciledColdInstall {
     database_scope: Option<[u8; 32]>,
     epoch: MemoryId,
     checkpoint_tail: JournalAnchor,
+    capture_started: Option<Instant>,
 }
 
 impl std::fmt::Debug for ReconciledColdInstall {
@@ -133,6 +138,7 @@ impl ReconciledColdInstall {
         journal: &MemoryV1DurableJournal,
         budget: CaptureBudget,
     ) -> Result<Self, ColdInstallError> {
+        let capture_started = Instant::now();
         let capture =
             capture_startup_candidate(pool, budget, journal.epoch_id(), journal.position())
                 .await
@@ -154,6 +160,7 @@ impl ReconciledColdInstall {
         let facts = Self::cold_facts_of(report.as_ref())?;
         let mut bound = Self::bind_verified(journal, rows, facts)?;
         bound.database_scope = Some(capture.database_scope);
+        bound.capture_started = Some(capture_started);
         Ok(bound)
     }
 
@@ -210,6 +217,7 @@ impl ReconciledColdInstall {
             database_scope: None,
             epoch: journal.epoch_id(),
             checkpoint_tail: journal.position(),
+            capture_started: None,
         })
     }
 
@@ -231,6 +239,28 @@ impl ReconciledColdInstall {
         self.install_candidate(probe, declarations)?
             .startup_subject(&facts, installation_id, scope, epoch, tail)
             .map_err(ColdInstallError::Install)
+    }
+
+    /// memory—v1: Settle only a fresh, overlapping capture before installing the
+    /// root. Each sample rechecks the entire signed window and the shared C06
+    /// rollback latch; the adoption gate independently samples again.
+    pub async fn settle_capture_time(
+        &self,
+        evidence: &AuthenticatedStartupEvidence,
+    ) -> Result<(), ColdInstallError> {
+        settle_capture_time_with(
+            self.facts.captured_at_unix_seconds,
+            self.capture_started,
+            CAPTURE_SETTLE_BUDGET,
+            CAPTURE_SETTLE_INTERVAL,
+            || {
+                let sample = evidence.check_current_window().map_err(|error| {
+                    ColdInstallError::Install(RootError::AdoptionEvidence(error.into()))
+                })?;
+                Ok((sample.earliest(), sample.latest()))
+            },
+        )
+        .await
     }
 
     /// memory—v1: Verify externally signed evidence against this cold capture
@@ -310,6 +340,50 @@ impl ReconciledColdInstall {
     }
 }
 
+// memory—v1: The only retryable case is an unchanged capture tick inside the
+// current trusted interval. Timeouts use the monotonic clock, never wall time.
+async fn settle_capture_time_with(
+    captured_at: i64,
+    capture_started: Option<Instant>,
+    budget: Duration,
+    interval: Duration,
+    mut sample: impl FnMut() -> Result<(i64, i64), ColdInstallError>,
+) -> Result<(), ColdInstallError> {
+    let invalid_time = || {
+        ColdInstallError::Install(RootError::AdoptionEvidence(
+            AdoptionEvidenceError::InvalidTrustedTime,
+        ))
+    };
+    if captured_at <= 0 {
+        return Err(invalid_time());
+    }
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .ok_or_else(invalid_time)?;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(invalid_time());
+        }
+        let (earliest, latest) = sample()?;
+        if Instant::now() >= deadline || earliest > latest || earliest < 0 {
+            return Err(invalid_time());
+        }
+        if captured_at <= earliest {
+            return Ok(());
+        }
+        if captured_at > latest
+            || capture_started.is_none_or(|start| start.elapsed() > CAPTURE_SETTLE_FRESHNESS)
+        {
+            return Err(invalid_time());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(invalid_time());
+        }
+        tokio::time::sleep(interval.min(remaining)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +413,98 @@ mod tests {
     };
     use astral_types::memory_v1_journal::JournalAnchor;
     use uuid::Uuid;
+
+    // memory—v1: An overlapping fresh capture may settle without changing its timestamp.
+    #[tokio::test]
+    async fn capture_time_settles_only_overlapping_fresh_ticks() {
+        let mut samples = [(99, 100), (100, 101)].into_iter();
+        let mut calls = 0;
+        settle_capture_time_with(
+            100,
+            Some(Instant::now()),
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            || {
+                calls += 1;
+                Ok(samples.next().unwrap())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls, 2);
+
+        for (captured, start, bounds) in [
+            (101, Some(Instant::now()), (99, 100)),
+            (100, None, (99, 100)),
+            (
+                100,
+                Instant::now().checked_sub(Duration::from_secs(6)),
+                (99, 100),
+            ),
+            (0, Some(Instant::now()), (0, 1)),
+            (100, Some(Instant::now()), (101, 100)),
+        ] {
+            let mut calls = 0;
+            assert!(settle_capture_time_with(
+                captured,
+                start,
+                Duration::from_millis(50),
+                Duration::from_millis(1),
+                || {
+                    calls += 1;
+                    Ok(bounds)
+                },
+            )
+            .await
+            .is_err());
+            assert!(calls <= 1, "an invalid capture must not retry");
+        }
+    }
+
+    // memory—v1: Expired evidence, unavailable or rolled-back time, and a
+    // stuck overlapping interval stop without creating an admission.
+    #[tokio::test]
+    async fn capture_time_refuses_sample_error_and_monotonic_timeout() {
+        let mut calls = 0;
+        let failed = settle_capture_time_with(
+            100,
+            Some(Instant::now()),
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Ok((99, 100))
+                } else {
+                    Err(ColdInstallError::Install(RootError::AdoptionEvidence(
+                        astral_authorization_root::memory_v1_adoption::startup::StartupEvidenceError::InvalidWindow.into(),
+                    )))
+                }
+            },
+        )
+        .await;
+        assert!(matches!(
+            failed,
+            Err(ColdInstallError::Install(RootError::AdoptionEvidence(
+                AdoptionEvidenceError::Startup(_)
+            )))
+        ));
+        assert_eq!(calls, 2);
+        let mut attempts = 0;
+        assert!(settle_capture_time_with(
+            100,
+            Some(Instant::now()),
+            Duration::from_millis(12),
+            Duration::from_millis(2),
+            || {
+                attempts += 1;
+                Ok((99, 100))
+            },
+        )
+        .await
+        .is_err());
+        assert!(attempts > 1);
+    }
 
     /// Sufficient additional bytes for the fixture candidate.
     fn test_probe() -> Option<usize> {

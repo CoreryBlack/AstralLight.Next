@@ -4,8 +4,8 @@
 //! as ordinary authorization. The result is not a commit authorization: ordered
 //! mutation binding, replay control and persistent audit remain separate duties.
 
+use crate::memory_v1_read_clock::ReadClock;
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use astral_authorization_root::memory_v1_db_rows::BinaryId;
 use astral_authorization_root::memory_v1_request::RequestRootExtension;
@@ -13,7 +13,7 @@ use astral_authorization_root::memory_v1_root::{
     DependencyRecord, RootError, RootMetadata, RootStatus,
 };
 use astral_authorization_root::memory_v1_session::{
-    FinalCheckTimeConstraints, FinalCheckWindow, RequestSessionExtension, SessionFinalCheck,
+    FinalCheckTimeConstraints, RequestSessionExtension, SessionFinalCheck,
 };
 use astral_types::memory_v1::CandidateIdentity;
 
@@ -316,7 +316,7 @@ fn evaluate_with(
                     }
                     CardOutcome::Allow {
                         dependencies,
-                        winning_allows,
+                        winning_windows,
                         future_boundaries,
                         tree_version,
                         registry_version,
@@ -338,13 +338,7 @@ fn evaluate_with(
                             record = Some(dependency);
                         }
                         boundaries.extend(future_boundaries);
-                        windows.extend(winning_allows.into_iter().map(|winning| {
-                            FinalCheckWindow {
-                                entry_validity: winning.entry_validity,
-                                binding_from: winning.binding_from,
-                                binding_until: winning.binding_until,
-                            }
-                        }));
+                        windows.extend(winning_windows);
                     }
                 }
             }
@@ -415,19 +409,25 @@ pub(crate) fn evaluate_memory_v1_batch(
     session: &RequestSessionExtension,
     request: &MemoryV1BatchRequest<'_>,
 ) -> MemoryV1BatchEvaluation {
-    evaluate_with(
+    let clock = ReadClock::default();
+    let result = evaluate_with(
         root,
         session,
         request,
-        || {
-            let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-            i64::try_from(seconds).ok()
-        },
+        || clock.start(session),
         || {},
         |check, record, constraints, metadata, targets| {
             check.try_final_time_exact_batch(record, constraints, metadata, targets)
         },
-    )
+    );
+    if result.decision == MemoryV1Decision::Deny && !clock.supports_deny() {
+        return non_allow(
+            MemoryV1Decision::Pending,
+            None,
+            Some(MemoryV1PendingSource::ContextInvalid),
+        );
+    }
+    result
 }
 
 #[cfg(test)]

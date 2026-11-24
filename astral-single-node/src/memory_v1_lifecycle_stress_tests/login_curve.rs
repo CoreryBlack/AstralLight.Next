@@ -80,6 +80,7 @@ pub(super) fn run_matrix(child: &mut Command, rounds: usize) {
                 .expect("start the login curve stress child");
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
             let stdout = String::from_utf8_lossy(&output.stdout);
+            super::report_login_diagnostics(&stdout);
             assert!(
                 output.status.success() && stdout.contains("1 passed"),
                 "login curve child failed for round {round}, readers {readers}, logins {logins}:\n{stdout}"

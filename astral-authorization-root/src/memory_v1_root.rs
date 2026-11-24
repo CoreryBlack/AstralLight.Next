@@ -483,7 +483,10 @@ pub use governed::PreparedGovernedMutation;
 #[cfg(feature = "test-support")]
 mod abc_lock_timing;
 #[cfg(feature = "test-support")]
-pub use abc_lock_timing::measure_abc_lock_for_test;
+pub use abc_lock_timing::{
+    measure_abc_lock_for_test, with_abc_locked_recheck_for_test,
+    with_abc_whole_root_bracket_for_test,
+};
 
 struct PreparedSnapshot<'a> {
     snapshot: Arc<RootSnapshot>,
@@ -2750,8 +2753,9 @@ impl RequestRootReader {
         self.try_with_rechecked_dependencies_and_target(record, None, None, f)
     }
 
-    // memory—v1: Exact-root governance checks share the same lock boundary as
-    // ordinary dependencies; target fences are independent of actor bindings.
+    // memory—v1: Keep the writer excluded for exact-target checks and the
+    // compatibility observation. A live-session ordinary read brackets its
+    // final sample with immutable root observations instead.
     pub(crate) fn try_with_rechecked_dependencies_and_target<T>(
         &self,
         record: &DependencyRecord,
@@ -2764,31 +2768,35 @@ impl RequestRootReader {
             .owner
             .upgrade()
             .ok_or(RootError::OwnerGone)?;
-        // memory—v1: test-support-only LOCAL ABC probe. Captures the native
-        // attempt start only when this thread is armed; a failed `try_read`
-        // (normal run contention) records no sample.
+        let bracket_root = exact_target.is_none() && authority_id.is_some();
         #[cfg(feature = "test-support")]
-        let abc_read_wait_started = abc_lock_timing::wait_probe_start();
-        let Ok(guard) = runtime.mutation_lock.try_read() else {
-            return Ok(None);
+        let bracket_root = bracket_root && !abc_lock_timing::locked_recheck_for_test();
+        let guard = if bracket_root {
+            if runtime.mutation_lock.is_poisoned() {
+                return Ok(None);
+            }
+            None
+        } else {
+            #[cfg(feature = "test-support")]
+            let started = abc_lock_timing::wait_probe_start();
+            let Ok(guard) = runtime.mutation_lock.try_read() else {
+                return Ok(None);
+            };
+            #[cfg(feature = "test-support")]
+            let guard = abc_lock_timing::TimedGuard::wrap(guard, started);
+            Some(guard)
         };
-        // memory—v1: probe shadow binding (test-support only). Wraps the
-        // native read guard so timing ends at the actual guard drop — the
-        // explicit early `drop(guard)` below and normal scope exit included.
-        // Purely observational; no logic or authorization change.
-        #[cfg(feature = "test-support")]
-        let guard = abc_lock_timing::TimedGuard::wrap(guard, abc_read_wait_started);
-        let current = runtime.current.load_full();
-        if current.metadata.status == RootStatus::Serving && current.metadata.version == u64::MAX {
+        let initial = runtime.current.load_full();
+        if initial.metadata.status == RootStatus::Serving && initial.metadata.version == u64::MAX {
             drop(guard);
-            RootOwner::try_publish_exhausted_snapshot(&runtime, &current);
+            RootOwner::try_publish_exhausted_snapshot(&runtime, &initial);
             return Ok(None);
         }
-        if current.metadata.instance_id != record.instance_id
+        if initial.metadata.instance_id != record.instance_id
             || self.snapshot.metadata.instance_id != record.instance_id
             || self.snapshot.metadata.status != RootStatus::Serving
-            || current.metadata.status != RootStatus::Serving
-            || !current.objects.is_user_card_active(record.card_id)
+            || initial.metadata.status != RootStatus::Serving
+            || !initial.objects.is_user_card_active(record.card_id)
             || self.snapshot.objects.user_card(record.card_id).is_none()
         {
             return Ok(None);
@@ -2810,28 +2818,43 @@ impl RequestRootReader {
         else {
             return Ok(None);
         };
-        let mut fence_dependencies = Vec::new();
-        if self.snapshot.objects.check_read_workspace(items).is_err()
-            || fence_dependencies.try_reserve_exact(items).is_err()
-        {
+        if self.snapshot.objects.check_read_workspace(items).is_err() {
             return Ok(None);
         }
-        fence_dependencies.extend(
-            actor_card
-                .bindings
-                .iter()
-                .filter(|binding| binding_is_active(binding, Some(actor_card.card)))
-                .map(|binding| binding.rule_set_id),
-        );
-        fence_dependencies.extend(
-            record
-                .bindings
-                .iter()
-                .map(|binding| binding.rule_set_id)
-                .chain(targets.iter().copied()),
-        );
-        fence_dependencies.sort_unstable();
-        fence_dependencies.dedup();
+        let ids = actor_card
+            .bindings
+            .iter()
+            .filter(|binding| binding_is_active(binding, Some(actor_card.card)))
+            .map(|binding| binding.rule_set_id)
+            .chain(record.bindings.iter().map(|binding| binding.rule_set_id))
+            .chain(targets.iter().copied());
+        let mut inline = [[0; 16]; 8];
+        let mut overflow = Vec::new();
+        let fence_dependencies = if bracket_root && items <= inline.len() {
+            let mut len = 0;
+            for id in ids {
+                inline[len] = id;
+                len += 1;
+            }
+            let ids = &mut inline[..len];
+            ids.sort_unstable();
+            let mut unique = 0;
+            for index in 0..ids.len() {
+                if unique == 0 || ids[index] != ids[unique - 1] {
+                    ids[unique] = ids[index];
+                    unique += 1;
+                }
+            }
+            &ids[..unique]
+        } else {
+            if overflow.try_reserve_exact(items).is_err() {
+                return Ok(None);
+            }
+            overflow.extend(ids);
+            overflow.sort_unstable();
+            overflow.dedup();
+            overflow.as_slice()
+        };
         // memory—v1 §4.7: the read-phase stamp is mandatory at the single
         // ALLOW decision point. A reader without a stamp (poisoned fence
         // table at capture time) can never pass the final recheck.
@@ -2843,7 +2866,7 @@ impl RequestRootReader {
             .try_with_active_version(record.registry_version, || {
                 runtime.fences.try_with_unfenced_since_stamp(
                     stamp,
-                    &fence_dependencies,
+                    fence_dependencies,
                     |unfenced| {
                         let current = runtime.current.load_full();
                         if authority_id.is_some_and(|authority_id| {
@@ -2879,22 +2902,23 @@ impl RequestRootReader {
                         else {
                             return Ok(None);
                         };
-                        if self
-                            .snapshot
-                            .objects
-                            .card_dependency_exhausted(record.card_id)
-                            || current.objects.card_dependency_generation(record.card_id)
-                                != Some(card_generation)
-                            || current.objects.card_dependency_exhausted(record.card_id)
-                            || self
-                                .snapshot
-                                .objects
-                                .card_authorization_dependency_exhausted(record.card_id)
-                                .unwrap_or(true)
-                            || current
-                                .objects
-                                .card_authorization_dependency_exhausted(record.card_id)
-                                .unwrap_or(true)
+                        // On the same immutable snapshot, the already validated
+                        // actor index covers both observations. The loop below
+                        // still checks every active set, not only winning rules.
+                        let same_snapshot = bracket_root && Arc::ptr_eq(&self.snapshot, &current);
+                        if card_generation == u64::MAX
+                            || (!same_snapshot
+                                && (current.objects.card_dependency_generation(record.card_id)
+                                    != Some(card_generation)
+                                    || self
+                                        .snapshot
+                                        .objects
+                                        .card_authorization_dependency_exhausted(record.card_id)
+                                        .unwrap_or(true)
+                                    || current
+                                        .objects
+                                        .card_authorization_dependency_exhausted(record.card_id)
+                                        .unwrap_or(true)))
                         {
                             return Ok(None);
                         }
@@ -2909,12 +2933,13 @@ impl RequestRootReader {
                                 .is_some_and(|row| {
                                     row.status == crate::memory_v1_db_rows::RuleSetStatus::Active
                                 })
-                                || !current.objects.rule_set(binding.rule_set_id).is_some_and(
-                                    |row| {
-                                        row.status
-                                            == crate::memory_v1_db_rows::RuleSetStatus::Active
-                                    },
-                                )
+                                || (!same_snapshot
+                                    && !current.objects.rule_set(binding.rule_set_id).is_some_and(
+                                        |row| {
+                                            row.status
+                                                == crate::memory_v1_db_rows::RuleSetStatus::Active
+                                        },
+                                    ))
                             {
                                 return Ok(None);
                             }
@@ -2925,17 +2950,12 @@ impl RequestRootReader {
                             else {
                                 return Ok(None);
                             };
-                            if self
-                                .snapshot
-                                .objects
-                                .rule_set_dependency_exhausted(binding.rule_set_id)
-                                || current
-                                    .objects
-                                    .rule_set_dependency_generation(binding.rule_set_id)
-                                    != Some(generation)
-                                || current
-                                    .objects
-                                    .rule_set_dependency_exhausted(binding.rule_set_id)
+                            if generation == u64::MAX
+                                || (!same_snapshot
+                                    && current
+                                        .objects
+                                        .rule_set_dependency_generation(binding.rule_set_id)
+                                        != Some(generation))
                                 || !unfenced(binding.rule_set_id)
                             {
                                 return Ok(None);
@@ -2953,18 +2973,22 @@ impl RequestRootReader {
                             else {
                                 return Ok(None);
                             };
-                            let Some(selected) = current
-                                .objects
-                                .selected_version(binding.rule_set_id)
-                                .map_err(RootError::Candidate)?
-                            else {
+                            if observed.hash_bytes.is_empty() {
                                 return Ok(None);
-                            };
-                            if observed.version_bytes != selected.version_bytes
-                                || observed.hash_bytes.is_empty()
-                                || observed.hash_bytes != selected.hash_bytes
-                            {
-                                return Ok(None);
+                            }
+                            if !same_snapshot {
+                                let Some(selected) = current
+                                    .objects
+                                    .selected_version(binding.rule_set_id)
+                                    .map_err(RootError::Candidate)?
+                                else {
+                                    return Ok(None);
+                                };
+                                if observed.version_bytes != selected.version_bytes
+                                    || observed.hash_bytes != selected.hash_bytes
+                                {
+                                    return Ok(None);
+                                }
                             }
                         }
                         // Governance can touch a rule set outside the actor's card.
@@ -3049,7 +3073,45 @@ impl RequestRootReader {
                                 return Ok(None);
                             }
                         }
-                        Ok(Some(f()))
+                        let result = f();
+                        if bracket_root {
+                            let after = runtime.current.load();
+                            if runtime.mutation_lock.is_poisoned() {
+                                return Ok(None);
+                            }
+                            if !Arc::ptr_eq(&current, &after) {
+                                #[cfg(feature = "test-support")]
+                                if abc_lock_timing::whole_root_bracket_for_test() {
+                                    return Ok(None);
+                                }
+                                // Publications never reuse a live dependency generation.
+                                // Equal endpoints therefore cover the clock sample even
+                                // across several unrelated publications. Membership is
+                                // covered by the card generation; the set IDs come from
+                                // the complete actor index, not just the supplied record.
+                                if after.metadata.instance_id != record.instance_id
+                                    || after.metadata.status != RootStatus::Serving
+                                    || after.metadata.version <= current.metadata.version
+                                    || after.metadata.version == u64::MAX
+                                    || after.objects.tenant_tree_version()
+                                        != record.tenant_tree_version
+                                    || after.objects.card_dependency_generation(record.card_id)
+                                        != Some(card_generation)
+                                    || !after.objects.is_user_card_active(record.card_id)
+                                    || fence_dependencies.iter().any(|id| {
+                                        let observed =
+                                            current.objects.rule_set_dependency_generation(*id);
+                                        observed.is_none()
+                                            || observed == Some(u64::MAX)
+                                            || after.objects.rule_set_dependency_generation(*id)
+                                                != observed
+                                    })
+                                {
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                        Ok(Some(result))
                     },
                 )
             })
@@ -3486,6 +3548,7 @@ mod source_slot_tests;
 
 #[cfg(test)]
 mod tests {
+    mod ordinary_recheck_tests;
     mod startup_tests;
 
     use super::*;

@@ -173,9 +173,20 @@ impl MemoryV1Composition {
         F: FnOnce(Arc<MemoryV1IdentitySession>) -> Router,
     {
         let root_handle = root.handle();
-        Self::assemble(
+        // The in-process composition fixtures exercise mediation, not the
+        // host's C06 status. Keep signed/HTTP process tests on the real clock.
+        let authority = Arc::new(MemoryV1SessionAuthority::with_clock_for_test(|| {
+            let elapsed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            Some((i128::try_from(elapsed.as_nanos()).ok()?, 0))
+        }));
+        authority.bind_to_root(&root)?;
+        Self::assemble_with_authority(
             Arc::new(root),
             RootAdmission::Experimental { root: root_handle },
+            Some(authority),
+            None,
             |adapter| Arc::new(MemoryV1IdentitySession::from_session_adapter(adapter)),
             build_identity,
             trustgraph,

@@ -293,9 +293,7 @@ pub(crate) async fn capture_from_database(
                                 "cannot verify the startup database identity".into(),
                             )
                         })?;
-                let now = startup_evidence::unix_now()
-                    .map_err(|_| sqlx::Error::Protocol("invalid startup host clock".into()))?;
-                evidence.check_window(now).map_err(|_| {
+                evidence.check_current_window().map_err(|_| {
                     sqlx::Error::Protocol(
                         "startup evidence expired before opening a recovery connection".into(),
                     )
@@ -561,6 +559,11 @@ pub(crate) async fn run() -> Result<()> {
         settings.installation_id,
     )
     .await?;
+    // The capture transaction and pool have closed. Only a fresh capture whose
+    // timestamp overlaps the current trusted interval may settle before install.
+    cold.settle_capture_time(&evidence)
+        .await
+        .context("settle the cold capture against trusted time")?;
     // memory—v1: Install only the exact applied-prefix snapshot covered by the
     // independent reports. The verification and registry generation are
     // checked before the root CAS and before opening any listener.
@@ -578,7 +581,7 @@ pub(crate) async fn run() -> Result<()> {
 
     let composition =
         assemble_production(owner, admission, (journal, durability), config, credentials)?;
-    evidence.check_window(startup_evidence::unix_now()?)?;
+    evidence.check_current_window()?;
     let listener = TcpListener::bind(settings.listen)
         .await
         .context("bind the memory-v1 listener")?;
@@ -587,7 +590,7 @@ pub(crate) async fn run() -> Result<()> {
         bail!("the memory-v1 listener bound a non-loopback address");
     }
     let ready = readiness_line(&root, bound)?;
-    evidence.check_window(startup_evidence::unix_now()?)?;
+    evidence.check_current_window()?;
     tracing::info!(addr = %bound, "memory-v1 service ready");
     println!("{ready}");
 

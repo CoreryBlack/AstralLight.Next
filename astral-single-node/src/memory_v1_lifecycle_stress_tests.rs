@@ -304,6 +304,16 @@ async fn measure_allow_reads(addr: std::net::SocketAddr, extra_resources: usize)
     }
 }
 
+// memory—v1: Retain only credential-free admission diagnostics from a passing child.
+fn report_login_diagnostics(stdout: &str) {
+    for line in stdout.lines().filter(|line| {
+        line.contains(r#""target":"memory_v1_login_diagnostics""#)
+            || line.contains(r#""target":"memory_v1_read_diagnostics""#)
+    }) {
+        eprintln!("{line}");
+    }
+}
+
 // memory—v1: Reuse the composed stress fixture for isolated opt-in curve cells.
 #[test]
 fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
@@ -322,7 +332,8 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
                 "memory_v1_service::lifecycle_stress_tests::full_lifecycle_stress_collects_phase_timings_and_quantifies",
                 "--nocapture",
             ])
-            .env(CHILD, "1");
+            .env(CHILD, "1")
+            .env("RUST_LOG", "off,memory_v1_login_diagnostics=debug,memory_v1_read_diagnostics=debug");
         if let Some(rounds) = login_curve::rounds() {
             login_curve::run_matrix(&mut child, rounds);
             return;
@@ -334,7 +345,9 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("1 passed"));
+        report_login_diagnostics(&stdout);
         // The child writes measurements to stderr; keep its nested libtest summary private.
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
         return;
@@ -343,6 +356,7 @@ fn full_lifecycle_stress_collects_phase_timings_and_quantifies() {
     // memory—v1: Serve one stress mode and drain its loopback composition.
     async fn run() {
         let login_cell = login_curve::selected_cell();
+        astral_common::tracing::init_tracing();
         // The stress process installs its own Prometheus recorder so the commit
         // owner's phase histograms can be rendered and quantified after the run.
         let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()

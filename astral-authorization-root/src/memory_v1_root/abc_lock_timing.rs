@@ -34,6 +34,42 @@ thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
     // memory—v1: latest completed `(wait_ns, held_ns)` sample on this thread.
     static LAST: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
+    static LOCKED_RECHECK: Cell<bool> = const { Cell::new(false) };
+    static WHOLE_ROOT_BRACKET: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(super) fn whole_root_bracket_for_test() -> bool {
+    WHOLE_ROOT_BRACKET.with(Cell::get)
+}
+
+/// memory—v1: Preserve the whole-root bracket as an experiment control.
+#[doc(hidden)]
+pub fn with_abc_whole_root_bracket_for_test<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WHOLE_ROOT_BRACKET.with(|bracket| bracket.set(self.0));
+        }
+    }
+    let _restore = Restore(WHOLE_ROOT_BRACKET.with(|bracket| bracket.replace(true)));
+    f()
+}
+
+pub(super) fn locked_recheck_for_test() -> bool {
+    LOCKED_RECHECK.with(Cell::get)
+}
+
+/// memory—v1: Run the old locked final observation on this thread for comparison.
+#[doc(hidden)]
+pub fn with_abc_locked_recheck_for_test<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LOCKED_RECHECK.with(|locked| locked.set(self.0));
+        }
+    }
+    let _restore = Restore(LOCKED_RECHECK.with(|locked| locked.replace(true)));
+    f()
 }
 
 /// memory—v1: Capture the native wait start only when this thread is armed.

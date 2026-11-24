@@ -2,7 +2,6 @@
 
 use std::io::Read;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use astral_authorization_root::memory_v1_adoption::startup::{
@@ -36,7 +35,7 @@ pub(super) fn load(get: impl Fn(&str) -> Option<String>) -> Result<Authenticated
         .read_to_end(&mut bytes)
         .context("read signed startup evidence")?;
     let evidence = AuthenticatedStartupEvidence::authenticate(&pinned, &bytes)?;
-    evidence.check_window(unix_now()?)?;
+    evidence.check_current_window()?;
     Ok(evidence)
 }
 
@@ -64,12 +63,4 @@ fn open_regular(path: &Path) -> Result<std::fs::File> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn open_regular(_path: &Path) -> Result<std::fs::File> {
     bail!("secure startup evidence file handling is not supported on this host")
-}
-
-// memory—v1: The startup host clock must be maintained by the provisioner.
-pub(super) fn unix_now() -> Result<i64> {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("invalid startup host clock")?;
-    i64::try_from(elapsed.as_secs()).context("startup host clock exceeds Unix seconds range")
 }

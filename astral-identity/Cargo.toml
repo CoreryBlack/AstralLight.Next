@@ -52,4 +52,4 @@ urlencoding = "2"
 [dev-dependencies]
 astral-authorization-root = { path = "../astral-authorization-root", features = ["test-support"] }
 sqlx = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }

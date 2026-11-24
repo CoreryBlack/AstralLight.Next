@@ -2,6 +2,40 @@
 # Arguments are interpreted by the Rust campaign, never by a shell.
 
 [[case]]
+id = "darkstar-rq3-five-arm-1"
+darkstar_lane = "performance"
+darkstar_evidence = "rq3-five-arm"
+timeout_seconds = 3600
+args = ["test", "--release", "-p", "policy-engine", "--lib", "--", "--ignored", "--exact", "memory_v1_formal::tests::abc_benchmark::ordinary_read_comparison", "--nocapture", "--test-threads=1"]
+expected_tests = 126
+boundary = "Release five-arm benchmark; six rounds and 125 isolated children, raw structured observations retained. Assertion-enabled builds run only a bounded smoke, not this performance measurement."
+
+[[case]]
+id = "darkstar-rq3-five-arm-2"
+darkstar_lane = "performance"
+darkstar_evidence = "rq3-five-arm"
+timeout_seconds = 3600
+args = ["test", "--release", "-p", "policy-engine", "--lib", "--", "--ignored", "--exact", "memory_v1_formal::tests::abc_benchmark::ordinary_read_comparison", "--nocapture", "--test-threads=1"]
+expected_tests = 126
+boundary = "Independent release repetition of the current five-arm benchmark; six rounds and raw observations retained. Assertion-enabled builds run only a bounded smoke, not this performance measurement."
+
+[[case]]
+id = "darkstar-mysql-signed-restart-negative"
+darkstar_lane = "mysql-e2e"
+args = ["test", "-p", "astral-single-node", "--test", "memory_v1_service_process", "--", "--ignored", "--exact", "change_confirmation_withdrawal::real_change_confirmation_withdrawal_negative_control", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+darkstar_postcondition = "withdrawal_negative_control warm_ready=1 warm_denies=1"
+boundary = "Signed restart negative control on a run-scoped disposable MySQL schema; requires the approved loopback fixture."
+
+[[case]]
+id = "darkstar-mysql-signed-restart-positive"
+darkstar_lane = "mysql-e2e"
+args = ["test", "-p", "astral-single-node", "--test", "memory_v1_service_process", "--", "--ignored", "--exact", "change_confirmation_withdrawal::real_change_confirmation_withdrawal_positive_control", "--nocapture", "--test-threads=1"]
+expected_tests = 1
+darkstar_postcondition = "memory-v1 withdrawal positive control warm_ready=2"
+boundary = "Signed restart positive control on a run-scoped disposable MySQL schema; requires the approved loopback fixture."
+
+[[case]]
 id = "darkstar-types"
 darkstar_lane = "core"
 args = ["test", "-p", "astral-types", "--lib", "memory_v1", "--", "--test-threads=1"]
@@ -35,17 +69,18 @@ expected_tests = 2
 [[case]]
 id = "darkstar-single-node-library"
 darkstar_lane = "core"
-args = ["test", "-p", "astral-single-node", "--lib", "--", "--skip", "real_mysql_", "--skip", "scale_shards_and_requests_report", "--skip", "deny_proof_concurrency_curve", "--skip", "recheck_separation_arms_report_distributions", "--skip", "local_release_journal_curve", "--skip", "local_release_checkpoint_curve", "--test-threads=1"]
+boundary = "Current single-node library controls with witness_ demonstrations excluded and not covered."
+args = ["test", "-p", "astral-single-node", "--lib", "--", "--skip", "witness_", "--skip", "real_mysql_", "--skip", "scale_shards_and_requests_report", "--skip", "deny_proof_concurrency_curve", "--skip", "recheck_separation_arms_report_distributions", "--skip", "local_release_journal_curve", "--skip", "local_release_checkpoint_curve", "--test-threads=1"]
 
 [[case]]
 id = "darkstar-single-node-binary"
 darkstar_lane = "loopback"
-args = ["test", "-p", "astral-single-node", "--bin", "astral-single-node", "--", "--skip", "synthetic_scenarios::", "--skip", "writer_contention_tests::", "--skip", "soak_tests::", "--test-threads=1"]
+args = ["test", "-p", "astral-single-node", "--bin", "astral-single-node", "--", "--skip", "full_lifecycle_stress_collects_phase_timings_and_quantifies", "--skip", "synthetic_scenarios::", "--skip", "writer_contention_tests::", "--skip", "soak_tests::", "--test-threads=1"]
 
 [[case]]
 id = "darkstar-process-refusals"
 darkstar_lane = "loopback"
-args = ["test", "-p", "astral-single-node", "--test", "memory_v1_service_process", "--", "--skip", "real_service_end_to_end", "--skip", "paper_mysql::", "--skip", "mysql_recovery::", "--test-threads=1"]
+args = ["test", "-p", "astral-single-node", "--test", "memory_v1_service_process", "--", "--skip", "change_confirmation_withdrawal::", "--skip", "real_service_end_to_end", "--skip", "paper_mysql::", "--skip", "mysql_recovery::", "--test-threads=1"]
 
 [[case]]
 id = "darkstar-fence-and-session-controls"

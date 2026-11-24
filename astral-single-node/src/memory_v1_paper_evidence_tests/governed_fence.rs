@@ -19,6 +19,9 @@ use uuid::Uuid;
 
 use super::*;
 
+#[path = "withdrawal.rs"]
+mod withdrawal;
+
 const TARGET: [u8; 16] = [5; 16];
 const UNRELATED: [u8; 16] = [15; 16];
 const UNRELATED_CARD: [u8; 16] = [14; 16];

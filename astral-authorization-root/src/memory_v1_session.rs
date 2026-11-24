@@ -6,8 +6,10 @@
 //! selection and revocation. UUID values, JWT claims, Gateway signatures and
 //! candidate relationships are not issuance proof.
 
-use std::sync::{Arc, OnceLock, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::memory_v1_policy_time::{AdmissionClock, PolicyTime};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
+
+use super::memory_v1_session_authority::BoundSessionRecord;
 
 use astral_types::memory_v1::{CandidateIdentity, MemoryId};
 use thiserror::Error;
@@ -34,17 +36,54 @@ pub struct VerifiedSessionFacts {
 /// An internal identity token for one session authority. Its root slot prevents
 /// one authority and its credentials from being reused across installed roots.
 #[derive(Debug)]
-pub(crate) struct SessionAuthorityToken(OnceLock<crate::memory_v1_root::RootInstanceId>);
+pub(crate) struct SessionAuthorityToken {
+    root: OnceLock<crate::memory_v1_root::RootInstanceId>,
+    clock: AdmissionClock,
+    // Invalidations take the exclusive guard after the session table writer.
+    // Final checks take only a nonblocking shared guard, then check the root.
+    pub(super) session_invalidation: RwLock<()>,
+}
 
 impl SessionAuthorityToken {
     // memory—v1: Mint a process-local authority identity.
     pub(crate) fn new() -> Self {
-        Self(OnceLock::new())
+        Self {
+            root: OnceLock::new(),
+            clock: AdmissionClock::default(),
+            session_invalidation: RwLock::new(()),
+        }
+    }
+
+    // memory—v1: Fixture sampling is bound once, before this owner has a root.
+    #[cfg(feature = "test-support")]
+    pub(super) fn with_test_clock(source: super::memory_v1_policy_time::FixtureClock) -> Self {
+        Self {
+            root: OnceLock::new(),
+            clock: AdmissionClock::for_test(source),
+            session_invalidation: RwLock::new(()),
+        }
+    }
+
+    // memory—v1: Identity handoff and request admission share this clock history.
+    pub(super) fn policy_time(&self) -> Option<PolicyTime> {
+        self.clock.sample()
+    }
+
+    // memory—v1: The caller must already hold the session table writer.
+    pub(super) fn lock_session_invalidation(
+        &self,
+    ) -> Result<
+        std::sync::RwLockWriteGuard<'_, ()>,
+        super::memory_v1_session_authority::MemoryV1SessionAuthorityError,
+    > {
+        self.session_invalidation.write().map_err(|_| {
+            super::memory_v1_session_authority::MemoryV1SessionAuthorityError::Unavailable
+        })
     }
 
     // memory—v1: Bind this authority permanently to one installed root instance.
     pub(crate) fn bind_root(&self, root_id: crate::memory_v1_root::RootInstanceId) -> bool {
-        self.0.set(root_id).is_ok() || self.0.get() == Some(&root_id)
+        self.root.set(root_id).is_ok() || self.root.get() == Some(&root_id)
     }
 }
 
@@ -58,6 +97,7 @@ impl SessionAuthorityToken {
 pub(crate) struct SessionAuthorityBinding {
     authority_id: Arc<SessionAuthorityToken>,
     credential_digest: [u8; 32],
+    live_record: BoundSessionRecord,
     verifier: super::memory_v1_session_authority::MemoryV1SessionVerifier,
 }
 
@@ -70,6 +110,11 @@ impl SessionAuthorityBinding {
     // memory—v1: Return the digest identifying the bound credential record.
     pub(crate) fn credential_digest(&self) -> [u8; 32] {
         self.credential_digest
+    }
+
+    // memory—v1: The request never owns the credential record itself.
+    pub(super) fn live_record(&self) -> &BoundSessionRecord {
+        &self.live_record
     }
 }
 
@@ -209,6 +254,7 @@ impl RequestRootExtension {
         facts: VerifiedSessionFacts,
         authority_id: Arc<SessionAuthorityToken>,
         credential_digest: [u8; 32],
+        live_record: BoundSessionRecord,
         verifier: super::memory_v1_session_authority::MemoryV1SessionVerifier,
     ) -> Result<RequestSessionExtension, RequestSessionError> {
         let shared = self.active_shared().map_err(RequestSessionError::Scope)?;
@@ -218,6 +264,7 @@ impl RequestRootExtension {
             authority_binding: Some(SessionAuthorityBinding {
                 authority_id,
                 credential_digest,
+                live_record,
                 verifier,
             }),
         })
@@ -245,6 +292,31 @@ pub struct FinalCheckTimeConstraints<'a> {
     pub winning_windows: &'a [FinalCheckWindow],
 }
 
+impl FinalCheckTimeConstraints<'_> {
+    // memory—v1: The candidate was computed at start_time. Cover every possible
+    // policy tick, not just the estimated center, including future denials.
+    fn contains(&self, facts: &VerifiedSessionFacts, time: PolicyTime) -> bool {
+        let (first, last) = (time.earliest(), time.latest());
+        first >= self.start_time
+            && facts.valid_at(first)
+            && facts.valid_at(last)
+            && self
+                .future_boundaries
+                .iter()
+                .all(|boundary| last < *boundary)
+            && !self.winning_windows.is_empty()
+            && self.winning_windows.iter().all(|window| {
+                [first, last].into_iter().all(|t| {
+                    window_active(
+                        window.entry_validity.and_then(|v| v.from),
+                        window.entry_validity.and_then(|v| v.until),
+                        t,
+                    ) && window_active(window.binding_from, window.binding_until, t)
+                })
+            })
+    }
+}
+
 /// A request-scoped handle for a nonblocking live-record check.
 ///
 /// memory—v1: This borrowed handle is valid only inside the reader callback.
@@ -267,8 +339,7 @@ impl SessionFinalCheck<'_> {
         constraints: &FinalCheckTimeConstraints<'_>,
     ) -> Option<i64> {
         self.try_final_time_with(record, constraints, None, || {
-            let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-            i64::try_from(seconds).ok()
+            self.binding.authority_id.clock.sample()
         })
     }
 
@@ -281,7 +352,7 @@ impl SessionFinalCheck<'_> {
         constraints: &FinalCheckTimeConstraints<'_>,
         clock: impl FnOnce() -> Option<i64>,
     ) -> Option<i64> {
-        self.try_final_time_with(record, constraints, None, clock)
+        self.try_final_time_with(record, constraints, None, || clock().map(PolicyTime::point))
     }
 
     /// memory—v1: Recheck the exact request snapshot and target fence using the
@@ -298,10 +369,7 @@ impl SessionFinalCheck<'_> {
             record,
             constraints,
             Some((metadata, std::slice::from_ref(&target_rule_set))),
-            || {
-                let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-                i64::try_from(seconds).ok()
-            },
+            || self.binding.authority_id.clock.sample(),
         )
     }
 
@@ -320,7 +388,7 @@ impl SessionFinalCheck<'_> {
             record,
             constraints,
             Some((metadata, std::slice::from_ref(&target_rule_set))),
-            clock,
+            || clock().map(PolicyTime::point),
         )
     }
 
@@ -342,10 +410,7 @@ impl SessionFinalCheck<'_> {
             record,
             constraints,
             Some((metadata, target_rule_sets)),
-            || {
-                let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-                i64::try_from(seconds).ok()
-            },
+            || self.binding.authority_id.clock.sample(),
         )
     }
 
@@ -367,7 +432,7 @@ impl SessionFinalCheck<'_> {
             record,
             constraints,
             Some((metadata, target_rule_sets)),
-            clock,
+            || clock().map(PolicyTime::point),
         )
     }
 
@@ -407,8 +472,7 @@ impl SessionFinalCheck<'_> {
             if !valid {
                 return None;
             }
-            let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-            i64::try_from(seconds).ok()
+            self.binding.authority_id.clock.sample()
         })
     }
 
@@ -448,8 +512,7 @@ impl SessionFinalCheck<'_> {
             if !valid {
                 return None;
             }
-            let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-            i64::try_from(seconds).ok()
+            self.binding.authority_id.clock.sample()
         })
     }
 
@@ -481,8 +544,7 @@ impl SessionFinalCheck<'_> {
             if resolved != target {
                 return None;
             }
-            let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-            i64::try_from(seconds).ok()
+            self.binding.authority_id.clock.sample()
         })
     }
 
@@ -492,53 +554,51 @@ impl SessionFinalCheck<'_> {
         record: &DependencyRecord,
         constraints: &FinalCheckTimeConstraints<'_>,
         exact_target: Option<(RootMetadata, &[[u8; 16]])>,
-        clock: impl FnOnce() -> Option<i64>,
+        clock: impl FnOnce() -> Option<PolicyTime>,
     ) -> Option<i64> {
         if record.card_id != self.facts.candidate_identity().user_card_id.into_bytes() {
             return None;
         }
-        self.binding
+        let mut refused = "session_record";
+        let time = self
+            .binding
             .verifier
             .try_with_live_record(self.facts, self.binding, |live_facts| {
+                refused = "root_dependencies";
                 self.reader.try_with_rechecked_dependencies_and_target(
                     record,
                     exact_target,
                     Some(&self.binding.authority_id),
                     || {
-                        let now = clock()?;
-                        if now < constraints.start_time
-                            || !live_facts.valid_at(now)
-                            || constraints
-                                .future_boundaries
-                                .iter()
-                                .any(|boundary| *boundary <= now)
-                            || constraints.winning_windows.is_empty()
-                            || constraints.winning_windows.iter().any(|winning| {
-                                !window_active(
-                                    winning.entry_validity.and_then(|validity| validity.from),
-                                    winning.entry_validity.and_then(|validity| validity.until),
-                                    now,
-                                ) || !window_active(
-                                    winning.binding_from,
-                                    winning.binding_until,
-                                    now,
-                                )
-                            })
-                        {
+                        refused = "final_clock";
+                        let sample = clock()?;
+                        if !constraints.contains(live_facts, sample) {
+                            refused = "final_time_window";
                             return None;
                         }
-                        Some(now)
+                        refused = "root_dependencies";
+                        Some(sample.observed())
                     },
                 )
             })
             .ok()
             .and_then(Result::ok)
             .flatten()
-            .flatten()
+            .flatten();
+        if time.is_none() {
+            tracing::debug!(target: "memory_v1_read_diagnostics", phase = refused, "memory-v1 final recheck refused");
+        }
+        time
     }
 }
 
 impl RequestSessionExtension {
+    /// memory—v1: Read policy time from this request's issuing authority. A
+    /// compatibility binding cannot obtain a clock observation for admission.
+    pub fn policy_time(&self) -> Option<PolicyTime> {
+        self.authority_binding.as_ref()?.authority_id.policy_time()
+    }
+
     /// memory—v1: Borrow the exact request reader and a live-record check handle.
     ///
     /// Scope acquisition completes before the callback can acquire the session

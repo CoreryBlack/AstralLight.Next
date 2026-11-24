@@ -56,11 +56,7 @@ async fn real_change_confirmation_withdrawal_negative_control() {
         protected_before.push((name, inventory(&admin, name).await));
     }
 
-    let database = format!(
-        "{RUN_DATABASE_PREFIX}{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..16]
-    );
-    assert_run_database_name(&database);
+    let database = new_run_database_name();
     sqlx::query(&format!(
         "CREATE DATABASE `{database}` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
     ))
@@ -359,11 +355,7 @@ async fn real_change_confirmation_withdrawal_positive_control() {
         protected_before.push((name, inventory(&admin, name).await));
     }
 
-    let database = format!(
-        "{RUN_DATABASE_PREFIX}{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..16]
-    );
-    assert_run_database_name(&database);
+    let database = new_run_database_name();
     sqlx::query(&format!(
         "CREATE DATABASE `{database}` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
     ))
@@ -666,7 +658,8 @@ async fn assert_current_confirmation_state(
     sibling: [u8; 16],
     expect_withdrawn: bool,
 ) {
-    let rows: Vec<(Vec<u8>, Option<i64>, Option<Vec<u8>>)> = sqlx::query_as(
+    type ConfirmationState = (Vec<u8>, Option<i64>, Option<Vec<u8>>);
+    let rows: Vec<ConfirmationState> = sqlx::query_as(
         "SELECT confirmation_id, revoked_at, revoked_by \
          FROM memory_rule_set_change_confirmation \
          WHERE rule_set_id = ? AND version_bytes = ? ORDER BY confirmation_id",

@@ -1,7 +1,5 @@
 //! memory—v1: Isolated public API tests for same-call evaluation envelopes.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use astral_authorization_root::memory_v1_db_rows::{
     BindingConfirmationRow, BindingLayer, BindingRow, CandidateRows, CurrentSelection,
     IdentityCardRow, RuleSetChangeConfirmationRow, RuleSetRow, RuleSetStatus, RuleSetVersionRow,
@@ -142,14 +140,11 @@ fn envelopes_preserve_exact_call_inputs_and_results() {
         ])
         .unwrap();
     owner.adopt_serving_for_isolated_tests().unwrap();
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = MemoryV1SessionAuthority::with_clock_for_test(|| Some((100_000_000_000, 0)));
     authority.bind_to_root(&owner).unwrap();
     let scope = RequestRootScope::new(owner.handle(), Default::default());
     let root = scope.extension();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = 100;
     let identity = CandidateIdentity {
         user_id: MemoryId::from_bytes(id(1)),
         identity_card_id: MemoryId::from_bytes(id(3)),

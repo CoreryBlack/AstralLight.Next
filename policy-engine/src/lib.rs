@@ -33,6 +33,7 @@ pub mod memory_v1_compound;
 pub mod memory_v1_credentialed;
 /// Typed memory-v1 evaluator, isolated from the legacy formal path.
 pub mod memory_v1_formal;
+mod memory_v1_read_clock;
 /// ORG_SCOPE admission contract and evidence validation.
 pub mod org_admission;
 mod org_compiler;

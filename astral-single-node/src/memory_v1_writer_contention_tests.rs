@@ -21,13 +21,10 @@
 //! * ordinary read control — concurrent ALLOW reads during writer contention
 //!   stay 200 and never journal.
 //!
-//! Refusal shapes are distinguished: a handler-level refusal carries the JSON
-//! PENDING envelope (`AUTHORIZATION_PENDING`, `Retry-After: 3`), while a
-//! pre-owner refusal (the middleware target read refusing a target that a
-//! concurrent writer already published, or an unavailable reader) is a bare 503
-//! with no body. Pre-owner refusals never reach the commit owner, so they
-//! record no commit-phase samples at all; the server view quantifies that gap
-//! through the owner-reached `prepare` count.
+//! Refusals are separated by their wire shape: ordinary PENDING, the exact
+//! guard `AUTHORIZATION_CONTEXT_INVALID` envelope, or an empty response. The
+//! root and reopened journal are checked independently before accepting any
+//! outcome; the client status alone cannot prove an operation did not publish.
 //!
 //! Server view: the commit owner's phase histograms
 //! (`astral_memory_v1_commit_phase_seconds{phase=...}` — including the
@@ -104,8 +101,10 @@ struct WriteOutcome {
     target: [u8; 16],
     ok: bool,
     pending: bool,
-    /// A bare 503 with no body: the middleware refused before the commit owner.
-    pre_owner: bool,
+    status: u16,
+    shape: &'static str,
+    body: serde_json::Value,
+    retry_after: Option<String>,
     root_version: Option<u64>,
     root_digest: Option<String>,
     latency_us: u64,
@@ -164,10 +163,77 @@ fn extract_metric_quantile_us(rendered: &str, phase: &str, quantile: &str) -> u6
         .unwrap_or(0)
 }
 
+// memory—v1: Admit only the correlated success receipt and known refusal envelopes.
+fn classify_write_reply(reply: &super::Reply, operation: &str) -> &'static str {
+    if reply.status == 200 && reply.body["data"]["operationId"].as_str() == Some(operation) {
+        "published"
+    } else if reply.status == 503
+        && reply.header("retry-after") == Some("3")
+        && reply.body
+            == json!({
+                "code": 503, "message": "Authorization pending",
+                "decision": "AUTHORIZATION_PENDING", "reasonCode": "AUTHORIZATION_PENDING"
+            })
+    {
+        "pending"
+    } else if reply.status == 503
+        && reply.body.is_null()
+        && reply.header("content-length") == Some("0")
+        && reply.header("transfer-encoding").is_none()
+    {
+        "bare"
+    } else if reply.status == 503
+        && reply.header("retry-after") == Some("3")
+        && reply.body
+            == json!({
+                "code": 503, "message": "Authorization pending",
+                "decision": "AUTHORIZATION_CONTEXT_INVALID",
+                "reasonCode": "AUTHORIZATION_CONTEXT_INVALID", "requestPath": USER_CARDS
+            })
+    {
+        "context_invalid"
+    } else {
+        "unexpected"
+    }
+}
+
+// memory—v1: Known refusals never become success and malformed variants fail closed.
+#[test]
+fn writer_reply_classification_requires_exact_contract() {
+    let mut reply = super::Reply {
+        status: 503,
+        headers: vec![("retry-after".into(), "3".into())],
+        body: json!({
+            "code": 503, "message": "Authorization pending",
+            "decision": "AUTHORIZATION_CONTEXT_INVALID",
+            "reasonCode": "AUTHORIZATION_CONTEXT_INVALID", "requestPath": USER_CARDS
+        }),
+    };
+    assert_eq!(classify_write_reply(&reply, "op"), "context_invalid");
+    reply.body["requestPath"] = json!("/wrong");
+    assert_eq!(classify_write_reply(&reply, "op"), "unexpected");
+    reply.body = json!({
+        "code": 503, "message": "Authorization pending",
+        "decision": "AUTHORIZATION_PENDING", "reasonCode": "AUTHORIZATION_PENDING"
+    });
+    assert_eq!(classify_write_reply(&reply, "op"), "pending");
+    reply.body["decision"] = json!("ALLOW");
+    assert_eq!(classify_write_reply(&reply, "op"), "unexpected");
+    reply.body = serde_json::Value::Null;
+    reply.headers = vec![("content-length".into(), "0".into())];
+    assert_eq!(classify_write_reply(&reply, "op"), "bare");
+    reply.headers.clear();
+    assert_eq!(classify_write_reply(&reply, "op"), "unexpected");
+    reply.status = 200;
+    reply.body = json!({"data": {"operationId": "different"}});
+    assert_eq!(classify_write_reply(&reply, "op"), "unexpected");
+    reply.body["data"]["operationId"] = json!("op");
+    assert_eq!(classify_write_reply(&reply, "op"), "published");
+}
+
 // memory—v1: Run one write lane: every worker holds a distinct operation id and
-// fires its `user_card:create` at the shared barrier. The only acceptable
-// outcomes are a correlated publish (200) or one of the two fail-closed 503
-// refusal shapes; anything else fails the lane immediately.
+// fires its `user_card:create` at the shared barrier. Keep unknown wire shapes
+// until after reconciliation so an unexpected status cannot hide a publication.
 async fn run_write_lane(
     addr: SocketAddr,
     token: &str,
@@ -199,30 +265,20 @@ async fn run_write_lane(
             )
             .await;
             let latency_us = u64::try_from(started.elapsed().as_micros()).unwrap();
-            let ok = reply.status == 200
-                && reply.body["data"]["operationId"].as_str() == Some(operation.as_str());
-            let handler_pending = reply.status == 503
-                && reply.body["reasonCode"] == "AUTHORIZATION_PENDING"
-                && reply.header("retry-after") == Some("3")
-                && reply.body["data"].is_null();
-            // A bare 503 with no body: the middleware target read refused before
-            // the commit owner was reached (fail-closed, no journal record).
-            let pre_owner_pending = reply.status == 503 && reply.body.is_null();
-            let pending = handler_pending || pre_owner_pending;
-            assert!(
-                ok || pending,
-                "worker {worker} saw an unexpected governance outcome: status={} body={}",
-                reply.status,
-                reply.body
-            );
+            let shape = classify_write_reply(&reply, &operation);
+            let ok = shape == "published";
+            let pending = matches!(shape, "pending" | "bare" | "context_invalid");
             WriteOutcome {
                 operation,
                 target,
                 ok,
                 pending,
-                pre_owner: pre_owner_pending,
+                status: reply.status,
+                shape,
+                retry_after: reply.header("retry-after").map(str::to_owned),
                 root_version: reply.body["data"]["rootVersion"].as_u64(),
                 root_digest: reply.body["data"]["rootDigest"].as_str().map(str::to_owned),
+                body: reply.body,
                 latency_us,
             }
         }));
@@ -317,23 +373,7 @@ async fn writer_contention_scenario(
     .await;
     let same_ok: Vec<&WriteOutcome> = same.iter().filter(|outcome| outcome.ok).collect();
     let same_pending: Vec<&WriteOutcome> = same.iter().filter(|outcome| outcome.pending).collect();
-    assert_eq!(
-        same_ok.len(),
-        1,
-        "exactly one same-target writer may publish: {same:?}"
-    );
-    assert_eq!(same_pending.len(), WRITERS - 1);
-    assert_eq!(
-        same_ok[0].root_version,
-        Some(baseline + 1),
-        "the same-target winner publishes exactly the next root version"
-    );
-    assert_eq!(
-        service.root.metadata().unwrap().version,
-        baseline + 1,
-        "refused writers must not advance the root"
-    );
-    let after_same = baseline + 1;
+    let same_root = service.root.metadata().unwrap();
 
     // ── Lane B: distinct targets plus the overlapping ordinary read control. ──
     let distinct_targets: Vec<[u8; 16]> = (0..WRITERS).map(|i| [0x70 + i as u8; 16]).collect();
@@ -356,6 +396,96 @@ async fn writer_contention_scenario(
     let distinct_ok: Vec<&WriteOutcome> = distinct.iter().filter(|outcome| outcome.ok).collect();
     let distinct_pending: Vec<&WriteOutcome> =
         distinct.iter().filter(|outcome| outcome.pending).collect();
+    // Capture live target facts, then inspect all frames before asserting even
+    // the historical response-shape contract. Same-target losers share a card
+    // with the winner; target presence by itself does not identify its publisher.
+    let final_root = service.root.metadata().unwrap();
+    let reader = service.root.begin_request(uuid::Uuid::new_v4()).unwrap();
+    let target_facts: BTreeMap<_, _> = same_targets
+        .iter()
+        .chain(&distinct_targets)
+        .map(|&target| {
+            let present = reader.user_card_target(target);
+            let creatable = reader.user_card_create_target(target, BOB, TENANT);
+            (target, (present, creatable))
+        })
+        .collect();
+    drop(reader);
+    let dir = service.drain().await;
+    let (journal, _sync) = dir.reopen();
+    let records = journal.recovery_records();
+    let outcomes = || same.iter().chain(&distinct);
+    for out in outcomes() {
+        let frames: Vec<_> = records
+            .iter()
+            .filter(|f| f.operation_id == out.operation)
+            .map(|f| {
+                (
+                    f.kind,
+                    f.journal_sequence,
+                    f.mutation_sequence,
+                    f.message_id.to_string(),
+                )
+            })
+            .collect();
+        let (present, creatable) = &target_facts[&out.target];
+        eprintln!("writer_reconcile op={} target={} status={} shape={} retry_after={:?} body={} root_before={} root_after={} target_present={} target_creatable={} frames={frames:?}", out.operation, MemoryId::from_bytes(out.target), out.status, out.shape, out.retry_after, out.body, baseline, final_root.version, present.is_ok(), creatable.is_ok());
+    }
+    assert_eq!(
+        outcomes()
+            .map(|o| &o.operation)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        2 * WRITERS
+    );
+    for out in outcomes() {
+        assert!(
+            out.ok || out.pending,
+            "unrecognized governance outcome: {out:?}"
+        );
+        let matching = records
+            .iter()
+            .filter(|f| f.operation_id == out.operation)
+            .count();
+        assert_eq!(
+            matching,
+            usize::from(out.ok),
+            "frame/response mismatch for {out:?}"
+        );
+        let (present, creatable) = &target_facts[&out.target];
+        if outcomes().any(|o| o.ok && o.target == out.target) {
+            let facts = present.as_ref().unwrap();
+            assert_eq!(
+                (facts.user_card_id, facts.owner_user_id, facts.tenant_id),
+                (out.target, BOB, TENANT)
+            );
+        } else {
+            assert!(
+                present.is_err(),
+                "unpublished target must be absent: {out:?}"
+            );
+            let facts = creatable
+                .as_ref()
+                .expect("the target can still be created for the same user and tenant");
+            assert_eq!(
+                (facts.user_card_id, facts.owner_user_id, facts.tenant_id),
+                (out.target, BOB, TENANT)
+            );
+        }
+    }
+    assert_eq!(
+        same_ok.len(),
+        1,
+        "exactly one same-target writer may publish: {same:?}"
+    );
+    assert_eq!(same_pending.len(), WRITERS - 1);
+    let after_same = baseline + 1;
+    assert_eq!(same_ok[0].root_version, Some(after_same));
+    assert_eq!(same_root.version, after_same);
+    assert_eq!(
+        same_ok[0].root_digest.as_deref(),
+        Some(hex::encode(same_root.digest).as_str())
+    );
     assert!(
         !distinct_ok.is_empty(),
         "the first distinct-target writer must publish: {distinct:?}"
@@ -388,13 +518,21 @@ async fn writer_contention_scenario(
         );
     }
     assert_eq!(
-        service.root.metadata().unwrap().version,
+        final_root.version,
         after_same + distinct_ok.len() as u64,
         "the root advanced by exactly the published distinct-target mutations"
     );
+    let final_receipt = distinct_ok
+        .iter()
+        .find(|outcome| outcome.root_version == Some(final_root.version))
+        .expect("the final root version has a successful operation receipt");
+    assert_eq!(
+        final_receipt.root_digest.as_deref(),
+        Some(hex::encode(final_root.digest).as_str()),
+        "the final receipt digest matches the captured root"
+    );
 
-    // ── Drain, reopen the retained journal and correlate every outcome. ──
-    let dir = service.drain().await;
+    // Validate the entire prefix, including operations not in the response list.
     let total_published = 1 + distinct_ok.len();
     let mut expected_targets: BTreeMap<String, [u8; 16]> = BTreeMap::new();
     expected_targets.insert(same_ok[0].operation.clone(), SAME_TARGET);
@@ -402,8 +540,6 @@ async fn writer_contention_scenario(
         expected_targets.insert(outcome.operation.clone(), outcome.target);
     }
     {
-        let (journal, _sync) = dir.reopen();
-        let records = journal.recovery_records();
         assert_eq!(
             records.len(),
             total_published,
@@ -427,9 +563,23 @@ async fn writer_contention_scenario(
                 retained_ops.insert(frame.operation_id.clone()),
                 "a recorded operation identity is never written twice"
             );
+            let outcome = outcomes()
+                .find(|outcome| outcome.operation == frame.operation_id)
+                .expect("every retained operation has an HTTP receipt");
+            assert_eq!(outcome.root_version, Some(baseline + sequence));
             let decoded = decode_journal_payload(&frame.payload)
                 .expect("a canonical retained mutation envelope");
             assert_eq!(decoded.operation_id(), frame.operation_id);
+            assert_eq!(decoded.request_fingerprint(), &frame.request_fingerprint);
+            let astral_trustgraph::service::memory_v1_mutation_coordinator::MutationAuditCandidate::Single(audit) = decoded.audit() else { panic!("expected single-card audit") };
+            assert_eq!(
+                audit.target(),
+                astral_types::memory_v1_audit::MemoryV1AuditObject::UserCard(MemoryId::from_bytes(
+                    expected_targets[&frame.operation_id]
+                ))
+            );
+            assert_eq!(audit.context().action().action(), "create");
+            assert_eq!(audit.context().action().resource(), "user_card");
             assert_eq!(decoded.origin_boot_id(), Some(journal_producer_boot_id()));
             match decoded.mutation() {
                 ManagementMutationV2::UserCardCreate { row } => {
@@ -552,14 +702,19 @@ async fn writer_contention_scenario(
     let distinct_ok_q = ok_latency(&distinct_ok);
     let distinct_pending_q = ok_latency(&distinct_pending);
     let reads_q = summarize(&read_samples);
-    let pre_owner =
-        |outcomes: &[&WriteOutcome]| outcomes.iter().filter(|outcome| outcome.pre_owner).count();
+    let count_shape = |outcomes: &[&WriteOutcome], shape| {
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.shape == shape)
+            .count()
+    };
     eprintln!(
-        "writer_contention same_target workers={WRITERS} ok={} pending={} pending_json={} pending_bare_pre_owner={} ok_mean_us={} ok_p50_us={} ok_max_us={} pending_mean_us={} pending_p50_us={} pending_max_us={}",
+        "writer_contention same_target workers={WRITERS} ok={} pending={} pending_json={} pending_bare={} context_invalid={} ok_mean_us={} ok_p50_us={} ok_max_us={} pending_mean_us={} pending_p50_us={} pending_max_us={}",
         same_ok.len(),
         same_pending.len(),
-        same_pending.len() - pre_owner(&same_pending),
-        pre_owner(&same_pending),
+        count_shape(&same_pending, "pending"),
+        count_shape(&same_pending, "bare"),
+        count_shape(&same_pending, "context_invalid"),
         same_ok_q.mean_us,
         same_ok_q.p50_us,
         same_ok_q.max_us,
@@ -568,11 +723,12 @@ async fn writer_contention_scenario(
         same_pending_q.max_us,
     );
     eprintln!(
-        "writer_contention distinct_target workers={WRITERS} ok={} pending={} pending_json={} pending_bare_pre_owner={} ok_mean_us={} ok_p50_us={} ok_max_us={} pending_mean_us={} pending_p50_us={} pending_max_us={}",
+        "writer_contention distinct_target workers={WRITERS} ok={} pending={} pending_json={} pending_bare={} context_invalid={} ok_mean_us={} ok_p50_us={} ok_max_us={} pending_mean_us={} pending_p50_us={} pending_max_us={}",
         distinct_ok.len(),
         distinct_pending.len(),
-        distinct_pending.len() - pre_owner(&distinct_pending),
-        pre_owner(&distinct_pending),
+        count_shape(&distinct_pending, "pending"),
+        count_shape(&distinct_pending, "bare"),
+        count_shape(&distinct_pending, "context_invalid"),
         distinct_ok_q.mean_us,
         distinct_ok_q.p50_us,
         distinct_ok_q.max_us,

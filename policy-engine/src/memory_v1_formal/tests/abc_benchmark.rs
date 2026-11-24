@@ -1,12 +1,15 @@
 //! memory—v1: Isolated ordinary-read comparison. Each arm and repetition starts a fresh process.
-//! Only A/B use the outer reader/writer lock; every changing fixture input obeys it in those arms.
+//! A/B and the retry comparison's F use the fixture gate; all changing inputs obey it in those arms.
 //! The attribution, registry, live sessions and clock are fixed in the timed workload.
+
+mod retry_comparison;
 
 use super::*;
 use astral_authorization_root::memory_v1_db_rows::binding_is_active;
 use astral_authorization_root::memory_v1_fence::FenceDeclaration;
 use astral_authorization_root::memory_v1_root::{
-    measure_abc_lock_for_test as native_timing, RootOwner,
+    measure_abc_lock_for_test as native_timing, with_abc_locked_recheck_for_test,
+    with_abc_whole_root_bracket_for_test, RootOwner,
 };
 use astral_authorization_root::memory_v1_rules::version_digest;
 use std::sync::{Barrier, RwLock};
@@ -25,7 +28,17 @@ enum Arm {
     A,
     B,
     C,
+    D,
+    E,
+    F,
 }
+
+impl Arm {
+    fn uses_fixture_gate(self) -> bool {
+        matches!(self, Self::A | Self::B | Self::F)
+    }
+}
+
 use Arm::*;
 use MemoryV1Decision::{Allow, Deny, Pending};
 
@@ -158,11 +171,12 @@ impl Bench {
             let lock = self.gate.read().unwrap();
             (lock, ns(wait), Instant::now())
         };
-        let result = if arm == A {
-            // The cut precedes A's fresh scope/session and benchmark-gate
-            // acquisition, so the gated indexed reevaluation cannot use a
-            // pre-cut request snapshot or session binding.
+        let result = if matches!(arm, A | F) {
+            // A control can publish under the write gate. Run it before taking the
+            // read gate. F then holds the gate across scope capture and evaluation;
+            // A retains its historical setup and complete evidence construction.
             cut.take().unwrap()();
+            let early = (arm == F).then(|| (Instant::now(), lock_read()));
             let scope = RequestRootScope::new(self.owner.handle(), Default::default());
             let root = scope.extension();
             let session = self
@@ -170,14 +184,8 @@ impl Bench {
                 .verifier()
                 .verify_and_bind(&self.credentials[usize::from(card == 7)], first, &root)
                 .unwrap();
-            // Keep credential verification and request-scope setup outside the
-            // measured final call. A's lock protects the full indexed
-            // reevaluation, but is not charged for setup that B/C also do.
-            let final_call = Instant::now();
-            let (lock, wait, hold_start) = lock_read();
-            // A is the shared indexed evaluator baseline under one gate. It
-            // still builds the evaluator's winning/dependency vectors even
-            // though this path does not consume a final dependency record.
+            let (final_call, (lock, wait, hold_start)) =
+                early.unwrap_or_else(|| (Instant::now(), lock_read()));
             let result = session
                 .with_authoritative_context(&root, |facts, reader, live| {
                     let now = std::hint::black_box(last);
@@ -188,7 +196,12 @@ impl Bench {
                     {
                         return pending();
                     }
-                    match evaluate_card_candidate(facts, reader, req, now, false) {
+                    let outcome = if arm == F {
+                        evaluate_card_candidate_without_evidence(facts, reader, req, now, false)
+                    } else {
+                        evaluate_card_candidate(facts, reader, req, now, false)
+                    };
+                    match outcome {
                         CardOutcome::Deny(reason) => observed_deny(facts, reader, now, req, reason),
                         CardOutcome::Pending(reason) => non_allow(Pending, None, Some(reason)),
                         CardOutcome::Allow {
@@ -246,9 +259,15 @@ impl Bench {
                     // B/C time the entire synchronized final-call callback.
                     // C's native probe below remains an inner root-lock sample.
                     let final_call = Instant::now();
-                    if arm == C {
+                    if !arm.uses_fixture_gate() {
                         let (result, sample) = native_timing(|| {
-                            check.try_final_time_for_test(record, constraints, clock)
+                            let run = || check.try_final_time_for_test(record, constraints, clock);
+                            match arm {
+                                C => with_abc_locked_recheck_for_test(run),
+                                D => with_abc_whole_root_bracket_for_test(run),
+                                E => run(),
+                                A | B | F => unreachable!(),
+                            }
                         });
                         timing = Some(Timing {
                             final_call_wall_ns: ns(final_call),
@@ -386,7 +405,7 @@ fn controls(b: &Bench, arm: Arm) {
                  last,
                  expected,
                  cut: &mut dyn FnMut()| {
-        let (e, _) = b.read(arm, card, req, first, last, || cut());
+        let (e, _) = b.read(arm, card, req, first, last, cut);
         oracle(&e, card, last, expected);
         if expected == Deny && name != "wrong-owner" {
             assert_eq!(e.deny_source, Some(MemoryV1DenySource::RuleDenied));
@@ -399,7 +418,7 @@ fn controls(b: &Bench, arm: Arm) {
     let req = request();
     let mut noop = || {};
     let write = |f: &mut dyn FnMut()| {
-        let _g = (arm != C).then(|| b.gate.write().unwrap());
+        let _g = arm.uses_fixture_gate().then(|| b.gate.write().unwrap());
         f()
     };
     check("positive", 4, &req, 110, 110, Allow, &mut noop);
@@ -434,7 +453,7 @@ fn controls(b: &Bench, arm: Arm) {
         &req,
         119,
         120,
-        if arm == A { Deny } else { Pending },
+        if matches!(arm, A | F) { Deny } else { Pending },
         &mut noop,
     );
     check("rollback", 4, &req, 110, 109, Pending, &mut noop);
@@ -454,7 +473,11 @@ fn controls(b: &Bench, arm: Arm) {
         &req,
         110,
         110,
-        if arm == C { Pending } else { Allow },
+        if arm.uses_fixture_gate() {
+            Allow
+        } else {
+            Pending
+        },
         &mut || {
             write(&mut || {
                 b.open();
@@ -466,13 +489,62 @@ fn controls(b: &Bench, arm: Arm) {
         write(&mut || b.open())
     });
     write(&mut || b.owner.abort_modification_fence([10; 16]).unwrap());
+    if matches!(arm, D | E) {
+        let scope = RequestRootScope::new(b.owner.handle(), Default::default());
+        let root = scope.extension();
+        let session = b
+            .authority
+            .verifier()
+            .verify_and_bind(&b.credentials[0], 110, &root)
+            .unwrap();
+        let before = b.owner.handle().metadata().unwrap();
+        let crossed = evaluate_with_final(
+            &root,
+            &session,
+            &req,
+            || Some(110),
+            || {},
+            |check, record, constraints, _| {
+                let sample = || {
+                    check.try_final_time_for_test(record, constraints, || {
+                        b.publish(&publication(13, 1, OTHER));
+                        b.publish(&publication(13, 2, OTHER));
+                        Some(110)
+                    })
+                };
+                if arm == D {
+                    with_abc_whole_root_bracket_for_test(sample)
+                } else {
+                    sample()
+                }
+            },
+        );
+        assert_eq!(
+            b.owner.handle().metadata().unwrap().version,
+            before.version + 2
+        );
+        let expected = if arm == E { Allow } else { Pending };
+        oracle(&crossed, 4, 110, expected);
+        println!(
+            "ABC_CONTROL arm={arm:?} case=unrelated-publications-in-sample outcome={expected:?}"
+        );
+        check(
+            "fresh-after-sample-race",
+            4,
+            &req,
+            110,
+            110,
+            Allow,
+            &mut noop,
+        );
+    }
     check(
         "same-meaning",
         4,
         &req,
         110,
         110,
-        if arm == A { Allow } else { Pending },
+        if matches!(arm, A | F) { Allow } else { Pending },
         &mut || write(&mut || b.publish(&publication(10, 0, ALLOW))),
     );
     check(
@@ -481,10 +553,37 @@ fn controls(b: &Bench, arm: Arm) {
         &req,
         110,
         110,
-        if arm == A { Deny } else { Pending },
+        if matches!(arm, A | F) { Deny } else { Pending },
         &mut || write(&mut || b.publish(&publication(10, 1, REVOKED))),
     );
     check("fresh-after-deny", 4, &req, 110, 110, Deny, &mut noop);
+    if arm == E {
+        b.publish(&publication(10, 2, ALLOW));
+        let scope = RequestRootScope::new(b.owner.handle(), Default::default());
+        let root = scope.extension();
+        let session = b
+            .authority
+            .verifier()
+            .verify_and_bind(&b.credentials[0], 110, &root)
+            .unwrap();
+        let crossed = evaluate_with_final(
+            &root,
+            &session,
+            &req,
+            || Some(110),
+            || {},
+            |check, record, constraints, _| {
+                check.try_final_time_for_test(record, constraints, || {
+                    b.publish(&publication(10, 3, REVOKED));
+                    b.publish(&publication(10, 4, ALLOW));
+                    Some(110)
+                })
+            },
+        );
+        oracle(&crossed, 4, 110, Pending);
+        println!("ABC_CONTROL arm=E case=related-deny-restore-in-sample outcome=Pending");
+        check("fresh-after-restore", 4, &req, 110, 110, Allow, &mut noop);
+    }
 }
 
 #[derive(Default)]
@@ -545,11 +644,11 @@ fn load(b: &Bench, arm: Arm, mode: &str, ops: usize, rep: usize) {
                             r.final_calls.push(timing.final_call_wall_ns);
                             if e.decision == Allow {
                                 r.admitted_final_calls.push(timing.final_call_wall_ns);
-                                let (_, held) = timing
-                                    .benchmark_gate
-                                    .or(timing.native_root_lock)
-                                    .expect("an admission has a guarded sample");
-                                r.admitted_holds.push(held);
+                                let lock = timing.benchmark_gate.or(timing.native_root_lock);
+                                assert_eq!(lock.is_none(), matches!(arm, D | E));
+                                if let Some((_, held)) = lock {
+                                    r.admitted_holds.push(held);
+                                }
                             }
                             if let Some((w, h)) = timing.benchmark_gate {
                                 r.waits.push(w);
@@ -588,14 +687,14 @@ fn load(b: &Bench, arm: Arm, mode: &str, ops: usize, rep: usize) {
             barrier.wait();
             for m in &plan {
                 let t = Instant::now();
-                let guard = (arm != C).then(|| b.gate.write().unwrap());
+                let guard = arm.uses_fixture_gate().then(|| b.gate.write().unwrap());
                 let waited = ns(t);
                 let held = Instant::now();
                 let (_, measurement) = native_timing(|| b.publish(m));
                 let hold = ns(held);
                 drop(guard);
                 lat.push(ns(t));
-                if arm != C {
+                if arm.uses_fixture_gate() {
                     outer.push((waited, hold));
                 }
                 native.push(measurement.expect("native publication guard"));
@@ -640,7 +739,14 @@ fn load(b: &Bench, arm: Arm, mode: &str, ops: usize, rep: usize) {
         assert_eq!(total.outcomes[2], 0);
     }
     assert_eq!(total.admitted_final_calls.len(), total.legal_allow);
-    assert_eq!(total.admitted_holds.len(), total.legal_allow);
+    assert_eq!(
+        total.admitted_holds.len(),
+        if matches!(arm, D | E) {
+            0
+        } else {
+            total.legal_allow
+        }
+    );
     let final_call_samples = total.final_calls.len();
     let benchmark_gate_samples = total.waits.len();
     let native_root_lock_samples = total.native_waits.len();
@@ -656,7 +762,10 @@ fn load(b: &Bench, arm: Arm, mode: &str, ops: usize, rep: usize) {
 }
 
 #[test]
-#[ignore = "release-only paired ordinary evaluator comparison in isolated child roots"]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "release-only paired ordinary evaluator comparison in isolated child roots"
+)]
 fn ordinary_read_comparison() {
     if let Ok(case) = std::env::var(CHILD) {
         let p: Vec<_> = case.split(':').collect();
@@ -664,6 +773,8 @@ fn ordinary_read_comparison() {
             "A" => A,
             "B" => B,
             "C" => C,
+            "D" => D,
+            "E" => E,
             _ => unreachable!(),
         };
         let b = Bench::new();
@@ -674,7 +785,9 @@ fn ordinary_read_comparison() {
         }
         return;
     }
-    let smoke = std::env::var_os("ASTRAL_ABC_SMOKE").is_some();
+    // Assertion-enabled builds exercise every arm and workload once; their
+    // timings are smoke evidence, not the release performance comparison.
+    let smoke = cfg!(debug_assertions) || std::env::var_os("ASTRAL_ABC_SMOKE").is_some();
     let reps = if smoke { 1 } else { 6 };
     let ops = if smoke { 64 } else { 4096 };
     for rep in 0..reps {
@@ -682,17 +795,16 @@ fn ordinary_read_comparison() {
             if rep > 0 && mode == "control" {
                 continue;
             }
-            for index in 0..3 {
-                let arm = [A, B, C][(rep + index) % 3];
+            for index in 0..5 {
+                let arm = [A, B, C, D, E][(rep + index) % 5];
                 let case = format!("{arm:?}:{mode}:{ops}:{rep}");
-                let out = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        SELECTOR,
-                        "--ignored",
-                        "--nocapture",
-                        "--test-threads=1",
-                    ])
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", SELECTOR]);
+                if !cfg!(debug_assertions) {
+                    command.arg("--ignored");
+                }
+                let out = command
+                    .args(["--nocapture", "--test-threads=1"])
                     .env(CHILD, &case)
                     .output()
                     .unwrap();

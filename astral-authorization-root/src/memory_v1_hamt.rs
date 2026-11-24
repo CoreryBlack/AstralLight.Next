@@ -852,23 +852,6 @@ impl HamtCandidate {
         self.rule_set_dependencies.get(&id).copied()
     }
 
-    // memory—v1 §15.10.3: MAX is an exhausted dependency generation. It may
-    // remain in an immutable snapshot for diagnostics, but it can never prove
-    // freshness for a positive authorization decision.
-    pub(crate) fn card_dependency_exhausted(&self, id: BinaryId) -> bool {
-        self.card_dependencies
-            .get(&id)
-            .is_some_and(|generation| *generation == u64::MAX)
-    }
-
-    // memory—v1 §15.10.3: A rule-set generation at MAX has no successor and
-    // therefore cannot support a fresh authorization dependency.
-    pub(crate) fn rule_set_dependency_exhausted(&self, id: BinaryId) -> bool {
-        self.rule_set_dependencies
-            .get(&id)
-            .is_some_and(|generation| *generation == u64::MAX)
-    }
-
     // memory—v1 §15.10.3: Limit the blast radius to one card and its active
     // rule-set relationships. Historical removed bindings do not make an
     // unrelated card unavailable. A missing or dangling relationship is not

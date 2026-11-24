@@ -794,6 +794,19 @@ fn candidate_ddl_restricts_rule_set_status() {
 }
 
 // memory—v1: Only a generated run-scoped name may ever be created or dropped.
+fn new_run_database_name() -> String {
+    let database = match std::env::var("ASTRAL_MEMORY_V1_E2E_SCHEMA") {
+        Ok(name) => name,
+        Err(std::env::VarError::NotPresent) => format!(
+            "{RUN_DATABASE_PREFIX}{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..16]
+        ),
+        Err(_) => panic!("invalid E2E fixture schema"),
+    };
+    assert_run_database_name(&database);
+    database
+}
+
 fn assert_run_database_name(name: &str) {
     let suffix = name
         .strip_prefix(RUN_DATABASE_PREFIX)
@@ -1249,11 +1262,7 @@ async fn with_run_scoped_mysql_fixture(recovery: bool) {
         protected_before.push((name, inventory(&admin, name).await));
     }
 
-    let database = format!(
-        "{RUN_DATABASE_PREFIX}{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..16]
-    );
-    assert_run_database_name(&database);
+    let database = new_run_database_name();
     sqlx::query(&format!(
         "CREATE DATABASE `{database}` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
     ))

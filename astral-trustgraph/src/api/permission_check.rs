@@ -1948,6 +1948,16 @@ mod tests {
 
     use crate::service::memory_v1_governance_commit::FailClosedMemoryV1DenyProofPort;
 
+    // memory—v1: Route and fence fixtures assume an exact policy time; they
+    // do not certify this machine's synchronization service. Session issuance
+    // still uses the process clock, so keep the fixture in the same epoch.
+    fn exact_route_clock() -> Option<(i128, i128)> {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some((i128::try_from(elapsed.as_nanos()).ok()?, 0))
+    }
+
     // memory—v1: Every test path uses the fail-closed port; a 403 needs the
     // durable owner, which these tests do not assemble.
     fn fail_closed_deny_port() -> FailClosedMemoryV1DenyProofPort {
@@ -2847,7 +2857,7 @@ mod tests {
             }])
             .unwrap();
         owner.adopt_serving_for_isolated_tests().unwrap();
-        let authority = MemoryV1SessionAuthority::new();
+        let authority = MemoryV1SessionAuthority::with_clock_for_test(exact_route_clock);
         authority.bind_to_root(&owner).unwrap();
         (owner, authority)
     }
@@ -3226,7 +3236,7 @@ mod tests {
             }])
             .unwrap();
         owner.adopt_serving_for_isolated_tests().unwrap();
-        let authority = MemoryV1SessionAuthority::new();
+        let authority = MemoryV1SessionAuthority::with_clock_for_test(exact_route_clock);
         authority.bind_to_root(&owner).unwrap();
         let scope = RequestRootScope::new(owner.handle(), uuid::Uuid::new_v4());
         let root = scope.extension();
@@ -3383,7 +3393,7 @@ mod tests {
                     }])
                     .unwrap();
                 owner.adopt_serving_for_isolated_tests().unwrap();
-                let authority = MemoryV1SessionAuthority::new();
+                let authority = MemoryV1SessionAuthority::with_clock_for_test(exact_route_clock);
                 authority.bind_to_root(&owner).unwrap();
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
                 let identity = CandidateIdentity {
@@ -3610,7 +3620,7 @@ mod tests {
                     }])
                     .unwrap();
                 owner.adopt_serving_for_isolated_tests().unwrap();
-                let authority = MemoryV1SessionAuthority::new();
+                let authority = MemoryV1SessionAuthority::with_clock_for_test(exact_route_clock);
                 authority.bind_to_root(&owner).unwrap();
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
                 let scope = RequestRootScope::new(owner.handle(), uuid::Uuid::new_v4());

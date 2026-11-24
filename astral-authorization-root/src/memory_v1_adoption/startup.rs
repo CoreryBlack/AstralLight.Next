@@ -218,6 +218,18 @@ impl AuthenticatedStartupEvidence {
         Ok(())
     }
 
+    /// memory—v1: The whole kernel-reported UTC interval must lie inside
+    /// the signed window before recovery, publication, binding or readiness.
+    pub fn check_current_window(
+        &self,
+    ) -> Result<crate::memory_v1_policy_time::PolicyTime, StartupEvidenceError> {
+        let sample = crate::memory_v1_policy_time::PolicyTime::sample_host()
+            .ok_or(StartupEvidenceError::InvalidWindow)?;
+        self.check_window(sample.earliest())?;
+        self.check_window(sample.latest())?;
+        Ok(sample)
+    }
+
     /// memory—v1: Check the authenticated installation and checkpoint before recovery.
     pub fn check_checkpoint(
         &self,

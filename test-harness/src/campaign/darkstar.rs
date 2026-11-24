@@ -5,6 +5,9 @@ use super::{
     string_array, suite_id, validate_artifact_root, Manifest, Options, SelectedRuntime, TomlValue,
     Value,
 };
+#[path = "darkstar/rq3.rs"]
+mod rq3;
+
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -30,10 +33,10 @@ const ENV_SETTINGS: &[&str] = &[
 const CATALOG: &str = include_str!("darkstar.toml");
 
 pub const DARKSTAR_USAGE: &str = "DarkStar current-source campaign\n\
-Usage: bash scripts/run-darkstar-tests.sh [--list] [--mysql] [--run-id ID] [--artifact-root PATH] [--suite ID]...\n\
+Usage: bash scripts/run-darkstar-tests.sh [--list] [--full] [--mysql] [--run-id ID] [--artifact-root PATH] [--suite ID]...\n\
 Default: all registered offline, loopback and performance checks. --mysql adds the approved\n\
 run-scoped MySQL fixtures, including the binary E2E; never provisions or targets production.\n\
---suite ID repeats to select an explicit subset of the enabled plan; ids are exact and unique,\n\
+--full includes the explicit one-hour soak. --suite ID repeats to select an explicit subset of the enabled plan; ids are exact and unique,\n\
 unknown, duplicate or MySQL ids without --mysql are rejected, and the canonical plan order is\n\
 kept regardless of argument order. --list never dispatches.\n\
 Logs, result.json and a .tar.gz with SHA-256 are written outside the working tree.\n";
@@ -43,6 +46,7 @@ struct Settings {
     artifact_root: PathBuf,
     list: bool,
     mysql: bool,
+    full: bool,
     // Explicit repeated --suite ids; parse-time shape and duplicate checks, with
     // plan membership validated once the enabled plan is built.
     suites: Vec<String>,
@@ -56,6 +60,7 @@ impl Settings {
             artifact_root: common.artifact_root,
             list: false,
             mysql: false,
+            full: false,
             suites: Vec::new(),
         };
         let mut explicit_run = false;
@@ -68,6 +73,7 @@ impl Settings {
             match arg.as_str() {
                 "--list" => settings.list = true,
                 "--mysql" => settings.mysql = true,
+                "--full" => settings.full = true,
                 "--run-id" => {
                     settings.run_id = value()?.clone();
                     explicit_run = true;
@@ -153,6 +159,20 @@ fn provisioned_environment(
     Ok((child_key.to_owned(), raw.to_owned()))
 }
 
+// The provisioner grants each lane its exact, not-yet-created fixture schema.
+// Keep the digest domain and four suffixes in sync with run-darkstar-tests.sh.
+fn e2e_schema(run: &str, suite: &str) -> Option<String> {
+    let suffix = match suite {
+        "darkstar-mysql-binary-e2e" => "binary",
+        "darkstar-mysql-transport-recovery" => "transport",
+        "darkstar-mysql-signed-restart-negative" => "negative",
+        "darkstar-mysql-signed-restart-positive" => "positive",
+        _ => return None,
+    };
+    let digest = format!("{:x}", Sha256::digest(format!("{run}:{suffix}")));
+    Some(format!("astral_rehearsal_mv1_{}", &digest[..16]))
+}
+
 pub(super) fn environment(
     suite: &TomlValue,
     original: &[(OsString, OsString)],
@@ -179,6 +199,13 @@ pub(super) fn environment(
         };
         match provisioned_environment(lane(suite), run, original) {
             Ok((key, value)) => {
+                if lane(suite) == "mysql-e2e" {
+                    let id = suite.get("id").and_then(TomlValue::as_str).unwrap_or("");
+                    let Some(schema) = e2e_schema(run, id) else {
+                        return (child, Some("unregistered E2E fixture schema".into()));
+                    };
+                    child.insert("ASTRAL_MEMORY_V1_E2E_SCHEMA".into(), schema.into());
+                }
                 child.insert(key.into(), value.into());
                 child.insert(REQUIRED.into(), "1".into());
             }
@@ -245,6 +272,17 @@ pub(super) fn check_evidence(suite: &TomlValue, output: &str, result: &Value) ->
         }
     }
     let contract = suite.get("darkstar_evidence")?.as_str()?;
+    if contract == "rq3-five-arm" {
+        let mut result = result.clone();
+        match rq3::audit(output) {
+            Ok(measurement) => result["measurement"] = measurement,
+            Err(reason) => {
+                result["status"] = json!("FAIL");
+                result["reason"] = json!(reason);
+            }
+        }
+        return Some(result);
+    }
     let scenario = match contract {
         "synthetic-paper-warm-governance" => Some("paper-warm-governance"),
         "synthetic-binary-lifecycle" => Some("binary-lifecycle"),
@@ -340,6 +378,7 @@ fn apply_explicit_selection(
         .map(|entries| {
             entries
                 .iter()
+                .filter(|entry| entry["reason"] == "requires --mysql")
                 .filter_map(|entry| entry["id"].as_str())
                 .map(str::to_owned)
                 .collect::<BTreeSet<_>>()
@@ -405,6 +444,7 @@ fn repair_model_build_override(suite: &mut TomlValue) -> Result<(), String> {
 fn selection(
     manifest: &mut Manifest,
     include_mysql: bool,
+    full: bool,
     explicit: &[String],
 ) -> Result<(Vec<TomlValue>, Value), String> {
     let (paper_ids, paper_plan) = paper::all_darkstar_suites(manifest)?;
@@ -421,7 +461,9 @@ fn selection(
                     | "trustgraph-memory-v1-permission-chain"
             )
         {
-            if paper::is_mysql_suite(suite) && !include_mysql {
+            if id == "paper-journal-witnesses" {
+                excluded.push(json!({"id":id,"status":"SKIP","reason":"witness vulnerability demonstrations prohibited; original assertions not rerun"}));
+            } else if paper::is_mysql_suite(suite) && !include_mysql {
                 excluded.push(json!({"id":id,"status":"SKIP","reason":"requires --mysql"}));
             } else {
                 let mut suite = suite.clone();
@@ -456,6 +498,18 @@ fn selection(
                         .and_then(TomlValue::as_array_mut)
                         .ok_or("missing paper control argv")?;
                     argv.extend(["--skip".into(), extra_skip.into()]);
+                }
+                if matches!(
+                    id.as_str(),
+                    "paper-ordinary-admission" | "paper-journal-controls"
+                ) {
+                    let table = suite.as_table_mut().ok_or("invalid paper controls")?;
+                    let argv = table
+                        .get_mut("argv")
+                        .and_then(TomlValue::as_array_mut)
+                        .ok_or("missing paper control argv")?;
+                    argv.extend(["--skip".into(), "witness_".into()]);
+                    table.insert("boundary".into(), "Current controls; witness_ vulnerability demonstrations are excluded and not covered.".into());
                 }
                 if id == "paper-repair-full-bounds" {
                     repair_model_build_override(&mut suite)?;
@@ -565,7 +619,7 @@ fn selection(
         manifest.suites.push(suite.clone());
         if mysql && !include_mysql {
             excluded.push(json!({"id":id,"status":"SKIP","reason":"requires --mysql"}));
-        } else if explicit_only && !explicit.contains(&id) {
+        } else if explicit_only && !full && !explicit.contains(&id) {
             excluded.push(json!({"id":id,"status":"SKIP","reason":"requires explicit --suite"}));
         } else {
             suites.push(suite);
@@ -621,19 +675,26 @@ fn bundle(directory: &Path, run: &str) -> Result<PathBuf, String> {
             .as_str()
             .filter(|id| safe_id(id))
             .ok_or("invalid DarkStar evidence id")?;
-        for stream in ["stdout", "stderr"] {
-            let relative = PathBuf::from("collection").join(format!("{id}.{stream}.log"));
-            let expected = row[format!("{stream}_sha256")].as_str();
-            let path = directory.join(&relative);
-            // A killed drainer may have left unsanitized log files and may still own them.
-            if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file())
-                || expected.is_none()
-                || expected != Some(hash(&path)?.as_str())
-            {
-                withheld.push(relative);
-                continue;
+        let preparation = row
+            .get("paper_preparation")
+            .map(|record| (super::paper_startup::PREPARATION_ID, record));
+        let measured = (row["paper_consumer_dispatched"] != false).then_some((id, row));
+        for (stream_id, record) in preparation.into_iter().chain(measured) {
+            for stream in ["stdout", "stderr"] {
+                let relative =
+                    PathBuf::from("collection").join(format!("{stream_id}.{stream}.log"));
+                let expected = record[format!("{stream}_sha256")].as_str();
+                let path = directory.join(&relative);
+                // Never export an unverified or potentially unsanitized partial stream.
+                if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file())
+                    || expected.is_none()
+                    || expected != Some(hash(&path)?.as_str())
+                {
+                    withheld.push(relative);
+                    continue;
+                }
+                names.push(relative);
             }
-            names.push(relative);
         }
     }
     let inventory = json!({"withheld_unverified_logs":withheld,"included":names});
@@ -701,7 +762,12 @@ pub fn run_darkstar_options(root: &Path, args: &[String]) -> Result<i32, String>
     }
     let settings = Settings::parse(args)?;
     let mut manifest = read_manifest(root)?;
-    let (suites, plan) = selection(&mut manifest, settings.mysql, &settings.suites)?;
+    let (suites, plan) = selection(
+        &mut manifest,
+        settings.mysql,
+        settings.full,
+        &settings.suites,
+    )?;
     if settings.list {
         println!(
             "{}",
@@ -731,6 +797,7 @@ pub fn run_darkstar_options(root: &Path, args: &[String]) -> Result<i32, String>
                     || ![
                         paper::mysql_scope::URL_ENV,
                         paper::mysql_scope::APPROVAL_ENV,
+                        paper::mysql_scope::BUNDLE_ENV,
                         APPROVAL,
                         APPLY_URL,
                         COLD_URL,
@@ -768,6 +835,26 @@ pub fn run_darkstar_options(root: &Path, args: &[String]) -> Result<i32, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn e2e_schemas_are_exact_and_distinct_by_suite_and_run() {
+        let ids = [
+            "darkstar-mysql-binary-e2e",
+            "darkstar-mysql-transport-recovery",
+            "darkstar-mysql-signed-restart-positive",
+            "darkstar-mysql-signed-restart-negative",
+        ];
+        let names: std::collections::BTreeSet<_> = ["dscheck", "dsnext"]
+            .into_iter()
+            .flat_map(|run| ids.map(|id| e2e_schema(run, id).unwrap()))
+            .collect();
+        assert_eq!(names.len(), 8);
+        assert_eq!(
+            e2e_schema("dscheck", ids[0]).as_deref(),
+            Some("astral_rehearsal_mv1_1dddd1533424c188")
+        );
+        assert!(e2e_schema("dscheck", "unregistered-suite").is_none());
+    }
 
     #[test]
     fn cold_fixture_never_reuses_the_apply_schema_or_account() {

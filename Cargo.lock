@@ -221,6 +221,7 @@ name = "astral-authorization-root"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "astral-clock-source",
  "astral-types",
  "hex",
  "im",
@@ -229,7 +230,15 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "tracing",
  "uuid",
+]
+
+[[package]]
+name = "astral-clock-source"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

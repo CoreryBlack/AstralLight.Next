@@ -336,14 +336,34 @@ impl MemoryV1IdentitySession {
         .map(|(issued, _)| issued)
     }
 
-    /// memory—v1: Sample the trusted clock after authentication and card checks,
-    /// immediately before entering the root/session issuance boundary.
+    /// memory—v1: Observe time from the authority that will bind this session.
+    pub(crate) fn policy_time(
+        &self,
+    ) -> Option<astral_authorization_root::memory_v1_policy_time::PolicyTime> {
+        self.adapter.policy_time()
+    }
+
+    /// memory—v1: Sample the caller's issuance clock after authentication and card checks.
     pub(crate) async fn login_with_clock(
         &self,
         authenticator: &MemoryV1CredentialAuthenticator,
         root: &RequestRootExtension,
         request: MemoryV1LoginInput<'_>,
         clock: impl FnOnce() -> Option<i64>,
+    ) -> Result<(MemoryV1IssuedSession, i64), MemoryV1LoginError> {
+        self.login_with_issuance_time(authenticator, root, request, || std::future::ready(clock()))
+            .await
+    }
+
+    /// memory—v1: Wait for issuance time after credential and card verification.
+    /// No reader lease or session record is held across this wait. Issuance still
+    /// rechecks the current card under the root and session locks.
+    pub(crate) async fn login_with_issuance_time<F: std::future::Future<Output = Option<i64>>>(
+        &self,
+        authenticator: &MemoryV1CredentialAuthenticator,
+        root: &RequestRootExtension,
+        request: MemoryV1LoginInput<'_>,
+        clock: impl FnOnce() -> F,
     ) -> Result<(MemoryV1IssuedSession, i64), MemoryV1LoginError> {
         self.validate_login_configuration(authenticator, request.lifetime_seconds)?;
         let credential = authenticator
@@ -364,7 +384,7 @@ impl MemoryV1IdentitySession {
         let identity = root
             .with_reader(|reader| verified_card_identity(reader, user, request.user_card_id))
             .map_err(|_| MemoryV1LoginError::Unavailable)??;
-        let issued_at = clock().ok_or(MemoryV1LoginError::Unavailable)?;
+        let issued_at = clock().await.ok_or(MemoryV1LoginError::Unavailable)?;
         let issued = self
             .issue_verified_session(
                 root,
@@ -372,7 +392,10 @@ impl MemoryV1IdentitySession {
                 issued_at,
                 request.lifetime_seconds,
             )
-            .map_err(|_| MemoryV1LoginError::Unavailable)?;
+            .map_err(|error| {
+                tracing::debug!(target: "memory_v1_login_diagnostics", phase = "session_insert", %error, "memory-v1 login refused");
+                MemoryV1LoginError::Unavailable
+            })?;
         Ok((issued, issued_at))
     }
 }
@@ -684,6 +707,135 @@ mod tests {
             )
             .expect("login fixture root becomes serving");
         owner
+    }
+
+    #[tokio::test]
+    async fn http_login_waits_until_the_session_covers_the_first_policy_interval() {
+        use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+
+        use astral_authorization_root::memory_v1_request::RequestRootScope;
+        use policy_engine::memory_v1_formal::{MemoryV1Decision, MemoryV1Request};
+
+        let test_name = "runtime::memory_v1::tests::http_login_waits_until_the_session_covers_the_first_policy_interval";
+        if std::env::var_os(LOGIN_CHILD_ENV).is_none() {
+            run_isolated(test_name);
+            return;
+        }
+
+        static ISSUED_AT: AtomicI64 = AtomicI64::new(0);
+        static SAMPLES: AtomicUsize = AtomicUsize::new(0);
+        let (rows, selections) = login_fixture();
+        let owner = install_process_root(
+            rows,
+            selections,
+            CandidateBudget {
+                max_table_rows: 32,
+                max_bindings_per_read: 8,
+            },
+        )
+        .unwrap();
+        owner
+            .install_registry(&[RegistryDeclaration {
+                resource: "document".to_owned(),
+                actions: vec!["read".to_owned()],
+            }])
+            .unwrap();
+        owner.adopt_serving_for_isolated_tests().unwrap();
+        let authority = MemoryV1SessionAuthority::with_clock_for_test(|| {
+            let nanos = i128::from(ISSUED_AT.load(Ordering::Relaxed)) * 1_000_000_000;
+            match SAMPLES.fetch_add(1, Ordering::Relaxed) {
+                0 => Some((nanos + 100_000_000, 200_000_000)),
+                1 => Some((nanos + 250_000_000, 200_000_000)),
+                2..=3 => Some((nanos + 500_000_000, 200_000_000)),
+                4..=5 => Some((nanos + 500_000_000, 499_999_999)),
+                _ => None,
+            }
+        });
+        authority.bind_to_root(&owner).unwrap();
+        let session =
+            MemoryV1IdentitySession::from_session_adapter(authority.identity_session_adapter());
+        let authenticator =
+            MemoryV1CredentialAuthenticator::new(Arc::new(FakeCredentialRepository {
+                record: Some(MemoryV1CredentialRecord::new(
+                    MemoryId::from_bytes(id(1)),
+                    crate::auth::hash_password("correct").unwrap(),
+                    MemoryV1CredentialStatus::Active,
+                    1,
+                )),
+                ..Default::default()
+            }));
+        let input = || MemoryV1LoginInput {
+            identifier: "alice",
+            password: "correct",
+            user_card_id: MemoryId::from_bytes(id(4)),
+            lifetime_seconds: 30,
+        };
+        let login_scope = RequestRootScope::new(owner.handle(), Uuid::new_v4());
+        let issued_at = fixture_now();
+        ISSUED_AT.store(issued_at, Ordering::Relaxed);
+        let response = crate::memory_v1_service::login_exchange(
+            &session,
+            &authenticator,
+            &login_scope.extension(),
+            input(),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            SAMPLES.load(Ordering::Relaxed),
+            4,
+            "wait until even a larger error radius cannot reach the previous tick"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["expiresIn"], 29);
+        let credential = json["data"]["accessToken"].as_str().unwrap();
+        assert!(matches!(
+            authority.verifier().verify(credential, issued_at - 1),
+            Err(MemoryV1SessionAuthorityError::Expired)
+        ));
+        let read_scope = RequestRootScope::new(owner.handle(), Uuid::new_v4());
+        let root = read_scope.extension();
+        let bound = authority
+            .verifier()
+            .verify_and_bind(credential, issued_at, &root)
+            .unwrap();
+        let result = policy_engine::PolicyEngine::new().evaluate_memory_v1(
+            &root,
+            &bound,
+            &MemoryV1Request {
+                resource: "document",
+                action: "read",
+                target: None,
+                target_owner: None,
+                target_tenant: None,
+                operation_id: b"first-read-after-http-login",
+                operation_fingerprint: b"document-read",
+            },
+        );
+        assert_eq!(result.decision, MemoryV1Decision::Allow);
+        assert!(result.admission.is_some());
+        assert_eq!(SAMPLES.load(Ordering::Relaxed), 6);
+
+        // Losing the trusted clock cannot return a bearer using only wall time.
+        let unavailable = crate::memory_v1_service::login_exchange(
+            &session,
+            &authenticator,
+            &login_scope.extension(),
+            input(),
+        )
+        .await;
+        assert_eq!(
+            unavailable.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let body = axum::body::to_bytes(unavailable.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["data"].is_null());
     }
 
     // memory—v1: Historical removed bindings must not exhaust a current

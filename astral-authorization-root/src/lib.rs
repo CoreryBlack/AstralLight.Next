@@ -17,6 +17,7 @@ pub mod memory_v1_hamt;
 pub mod memory_v1_hamt_runtime;
 pub mod memory_v1_mutation_digest;
 pub mod memory_v1_mutation_wire;
+pub mod memory_v1_policy_time;
 pub mod memory_v1_registry;
 pub mod memory_v1_request;
 pub mod memory_v1_root;

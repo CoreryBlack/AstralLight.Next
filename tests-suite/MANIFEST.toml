@@ -1350,8 +1350,8 @@ scope = "integration"
 selection_policy = "explicit-suite"
 paper_track = "usenix"
 paper_lane = "mysql"
-boundary = "Dedicated, pre-provisioned and approved MySQL 8.0 schema; exact nine-table synthetic facts, real binary cold boot, private DB link cutoff, independent and revoking root publications, source rows unchanged. No provisioning, DDL, cleanup, MySQL replay or deployed object mediation."
-sources = ["tests-suite/src/paper_mysql_scope.rs", "astral-single-node/tests/memory_v1_service_process.rs", "astral-single-node/tests/memory_v1_service_process/paper_mysql.rs", "astral-single-node/tests/memory_v1_service_process/paper_mysql/expected.rs", "astral-single-node/tests/memory_v1_service_process/paper_mysql/relay.rs", "Docs/memory-v1/数据库结构候选.sql", "astral-db/src/memory_v1_candidate_loader.rs"]
+boundary = "Approved MySQL 8.0 fixture: separate provisioning seeds 23 rows in nine fact tables and binds the signed test startup bundle to a retained journal and matching recovery progress (four apply tables). Real cold boot, private DB link cutoff, independent and revoking warm publications, unchanged source facts. No DDL, database replay, production signer or deployed object mediation in the measured test."
+sources = ["tests-suite/src/paper_mysql_scope.rs", "astral-single-node/tests/memory_v1_service_process.rs", "astral-single-node/tests/memory_v1_service_process/paper_mysql.rs", "astral-single-node/tests/memory_v1_service_process/paper_mysql/expected.rs", "astral-single-node/tests/memory_v1_service_process/paper_mysql/relay.rs", "astral-single-node/tests/memory_v1_service_process/paper_mysql/fixture.rs", "test-harness/src/campaign/paper_startup.rs", "Docs/sql/memory-v1-apply-candidate.sql", "Docs/memory-v1/数据库结构候选.sql", "astral-db/src/memory_v1_candidate_loader.rs"]
 argv = ["cargo", "test", "--locked", "--offline", "-p", "astral-single-node", "--test", "memory_v1_service_process", "--", "--ignored", "--exact", "paper_mysql::cold_snapshot_and_warm_governance", "--nocapture", "--test-threads=1"]
 acceptance = "rust"
 expected_tests = 1

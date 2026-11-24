@@ -135,18 +135,23 @@ struct Sample {
     pending: bool,
     status: u16,
     reason: String,
+    // The existing report keeps the microsecond floor for output compatibility.
     rtt_us: u64,
+    // Raw duration from the same Instant measurement, without the microsecond floor.
+    rtt_ns: u64,
 }
 
 /// Owned aggregate of one lane (or one window of one lane): completed count,
 /// matched count, fail-closed pending count, RTT samples and the classified
-/// unexpected outcomes.
+/// unexpected outcomes. `rtt_ns` is a complete lossless frequency distribution
+/// for recomputing quantiles without the legacy microsecond truncation.
 #[derive(Default)]
 struct LaneStat {
     completed: u64,
     matched: u64,
     pending: u64,
     rtts: Vec<u64>,
+    rtt_ns: BTreeMap<u64, u64>,
     pending_reasons: BTreeMap<String, usize>,
     unexpected: BTreeMap<(u16, String), usize>,
 }
@@ -155,6 +160,7 @@ impl LaneStat {
     fn record(&mut self, sample: &Sample) {
         self.completed += 1;
         self.rtts.push(sample.rtt_us);
+        *self.rtt_ns.entry(sample.rtt_ns).or_default() += 1;
         if sample.matched {
             self.matched += 1;
         } else if sample.pending {
@@ -269,6 +275,7 @@ async fn session_login(
     book.issue(OpClass::Session);
     let began = Instant::now();
     let token = login(addr, identifier, password, card).await;
+    let elapsed = began.elapsed();
     book.record(Sample {
         window,
         class: OpClass::Session,
@@ -276,7 +283,8 @@ async fn session_login(
         pending: false,
         status: 200,
         reason: "login".to_owned(),
-        rtt_us: began.elapsed().as_micros() as u64,
+        rtt_us: elapsed.as_micros() as u64,
+        rtt_ns: elapsed.as_nanos() as u64,
     });
     token
 }
@@ -286,6 +294,7 @@ async fn session_logout(addr: std::net::SocketAddr, book: &Book, window: usize, 
     book.issue(OpClass::Session);
     let began = Instant::now();
     let reply = http(addr, "POST", LOGOUT, Some(token), None, &[]).await;
+    let elapsed = began.elapsed();
     book.record(Sample {
         window,
         class: OpClass::Session,
@@ -293,7 +302,8 @@ async fn session_logout(addr: std::net::SocketAddr, book: &Book, window: usize, 
         pending: false,
         status: reply.status,
         reason: refusal_reason(&reply.body),
-        rtt_us: began.elapsed().as_micros() as u64,
+        rtt_us: elapsed.as_micros() as u64,
+        rtt_ns: elapsed.as_nanos() as u64,
     });
 }
 
@@ -346,6 +356,7 @@ async fn run_soak(config: SoakConfig) {
                 book.issue(OpClass::Read);
                 let began = Instant::now();
                 let reply = http(addr, "GET", REGISTRY, Some(&token), None, &[]).await;
+                let elapsed = began.elapsed();
                 let matched = reply.status == 200 && !reply.body["data"].is_null();
                 let reason = refusal_reason(&reply.body);
                 let pending = reply.status == 503
@@ -362,7 +373,8 @@ async fn run_soak(config: SoakConfig) {
                     pending,
                     status: reply.status,
                     reason,
-                    rtt_us: began.elapsed().as_micros() as u64,
+                    rtt_us: elapsed.as_micros() as u64,
+                    rtt_ns: elapsed.as_nanos() as u64,
                 });
                 if refreshed_at.elapsed() >= TOKEN_REFRESH_INTERVAL {
                     let window = window_of(start, config.window, windows);
@@ -410,6 +422,7 @@ async fn run_soak(config: SoakConfig) {
                 book.issue(OpClass::Deny);
                 let began = Instant::now();
                 let reply = http(addr, "GET", REGISTRY, Some(&token), None, &[]).await;
+                let elapsed = began.elapsed();
                 // A deny whose proof races a concurrent mutation cannot prove
                 // its authorization-state prefix and fails closed to the
                 // retryable 503; that is a defined outcome, not a failure. The
@@ -434,7 +447,8 @@ async fn run_soak(config: SoakConfig) {
                     pending,
                     status: reply.status,
                     reason: refusal_reason(&reply.body),
-                    rtt_us: began.elapsed().as_micros() as u64,
+                    rtt_us: elapsed.as_micros() as u64,
+                    rtt_ns: elapsed.as_nanos() as u64,
                 });
                 if refreshed_at.elapsed() >= TOKEN_REFRESH_INTERVAL {
                     let window = window_of(start, config.window, windows);
@@ -480,6 +494,7 @@ async fn run_soak(config: SoakConfig) {
                     &[("x-request-id", operation.as_str())],
                 )
                 .await;
+                let elapsed = began.elapsed();
                 let matched =
                     reply.status == 200 && reply.body["data"]["operationId"] == json!(operation);
                 book.record(Sample {
@@ -489,7 +504,8 @@ async fn run_soak(config: SoakConfig) {
                     pending: false,
                     status: reply.status,
                     reason: refusal_reason(&reply.body),
-                    rtt_us: began.elapsed().as_micros() as u64,
+                    rtt_us: elapsed.as_micros() as u64,
+                    rtt_ns: elapsed.as_nanos() as u64,
                 });
                 if refreshed_at.elapsed() >= TOKEN_REFRESH_INTERVAL {
                     let window = window_of(start, config.window, windows);
@@ -605,6 +621,35 @@ async fn run_soak(config: SoakConfig) {
             max_us,
             lane.pending_reasons,
             lane.unexpected,
+        );
+        let raw_frequency: Vec<[u64; 2]> = lane
+            .rtt_ns
+            .iter()
+            .map(|(&rtt_ns, &count)| [rtt_ns, count])
+            .collect();
+        let raw_count: u64 = raw_frequency.iter().map(|pair| pair[1]).sum();
+        assert_eq!(
+            raw_count,
+            lane.completed,
+            "lane {} raw RTT frequency must cover every completed request",
+            class.label()
+        );
+        // The existing p99_us/max_us report intentionally retains its
+        // microsecond floor. This compact JSON line is the lossless source for
+        // recomputing quantiles from nanosecond RTT frequencies.
+        eprintln!(
+            "soak_raw_rtt {}",
+            json!({
+                "scenario": config.scenario,
+                "lane": class.label(),
+                "issued": issued,
+                "completed": lane.completed,
+                "sample_count": raw_count,
+                "rtt_unit": "ns",
+                "frequency_ns": raw_frequency,
+                "legacy_report_rtt_unit": "us",
+                "legacy_report_conversion": "floor(duration_ns / 1000)",
+            })
         );
         assert_eq!(
             issued,

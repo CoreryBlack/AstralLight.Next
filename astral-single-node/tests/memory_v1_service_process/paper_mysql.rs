@@ -2,6 +2,9 @@
 
 #[path = "paper_mysql/expected.rs"]
 mod expected;
+#[cfg(unix)]
+#[path = "paper_mysql/fixture.rs"]
+mod fixture;
 #[path = "paper_mysql/relay.rs"]
 mod relay;
 #[path = "../../../tests-suite/src/paper_mysql_scope.rs"]
@@ -118,8 +121,28 @@ async fn check_sql_scope(conn: &mut MySqlConnection, schema: &str, user: &str) {
     // Trigger visibility is privilege-dependent: the operator must also certify no triggers.
     assert_eq!(
         (tables, triggers, cross_schema),
-        (9, 0, 0),
-        "fixture metadata outside the allowlist"
+        (13, 0, 0),
+        "fixture must contain exactly the nine candidate and four recovery tables"
+    );
+}
+
+// memory—v1: Refuse the obsolete nine-table-only fixture before inserting any
+// facts. Formal startup needs independently provisioned recovery state; observing
+// the nine candidate tables does not establish an applied journal prefix.
+async fn check_recovery_schema(conn: &mut MySqlConnection) {
+    let recovery_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() \
+         AND TABLE_NAME IN ('mv1_apply_fence', 'mv1_apply_receipt', \
+         'mv1_apply_progress', 'mv1_apply_audit_event') AND TABLE_TYPE = 'BASE TABLE'",
+    )
+    .fetch_one(conn)
+    .await
+    .unwrap_or_else(|_| panic!("inspect the pre-provisioned recovery schema"));
+    assert_eq!(
+        recovery_tables, 4,
+        "paper fixture is blocked: formal startup needs the four independently provisioned \
+         mv1_apply recovery tables and matching retained journal/checkpoint, applied progress, \
+         and independently signed startup evidence; the old nine-table fixture cannot provide these"
     );
 }
 
@@ -161,6 +184,21 @@ async fn seed(options: &MySqlConnectOptions, schema: &str) {
         .await
         .unwrap_or_else(|_| panic!("open dedicated fixture writer"));
     check_sql_scope(&mut conn, schema, options.get_username()).await;
+    check_recovery_schema(&mut conn).await;
+    let recovery_rows: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM mv1_apply_fence), \
+         (SELECT COUNT(*) FROM mv1_apply_receipt), \
+         (SELECT COUNT(*) FROM mv1_apply_progress), \
+         (SELECT COUNT(*) FROM mv1_apply_audit_event)",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap_or_else(|_| panic!("check the empty recovery fixture"));
+    assert_eq!(
+        recovery_rows,
+        (0, 0, 0, 0),
+        "recovery fixture must be empty"
+    );
     let lock: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, 0)")
         .bind(schema)
         .fetch_one(&mut conn)
@@ -341,11 +379,20 @@ async fn warm_governance(run: &str, addr: SocketAddr, initial_version: u64) {
     println!("paper-mysql: warm_publications create={create} root={created} revoke={revoke} root={removed}");
 }
 
+#[cfg(unix)]
 async fn scenario(run: &str, schema: &str, mut url: Url) {
     let start_time = Instant::now();
     let direct = options(&url, schema, scope::PORT);
-    seed(&direct, schema).await;
     let expected = expected::expected_rows();
+    let mut scope_connection = MySqlConnection::connect_with(&direct)
+        .await
+        .unwrap_or_else(|_| panic!("open dedicated fixture observer"));
+    check_sql_scope(&mut scope_connection, schema, direct.get_username()).await;
+    check_recovery_schema(&mut scope_connection).await;
+    scope_connection
+        .close()
+        .await
+        .expect("close fixture observer");
     let observer = pool(&direct).await;
     let before = capture(&observer, &expected, expected::COUNTS).await;
     observer.close().await;
@@ -361,7 +408,7 @@ async fn scenario(run: &str, schema: &str, mut url: Url) {
     let files = TempDir::new("paper-mysql-credentials");
     let credentials = write_credentials(files.path(), 0o600);
     let cwd = TempDir::new("paper-mysql-cwd");
-    let (env, _journal) = service_env(url.as_str(), &credentials);
+    let env = fixture::service_environment(run, url.as_str(), &credentials);
     let mut running = start(&env, cwd.path());
     let (addr, version) = ready(&mut running).await;
     let (cutoff, closed) = relay.cut().await;
@@ -387,6 +434,23 @@ async fn scenario(run: &str, schema: &str, mut url: Url) {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "requires an approved empty run-scoped MySQL fixture and private startup bundle"]
+async fn prepare_signed_synthetic_cold_start() {
+    let (run, schema, url) = fixture();
+    if timeout(
+        Duration::from_secs(300),
+        fixture::prepare(&run, &schema, &url),
+    )
+    .await
+    .is_err()
+    {
+        unknown("paper synthetic provisioning deadline expired");
+    }
+}
+
+#[cfg(unix)]
 #[tokio::test]
 #[ignore = "production adoption gate: needs independent evidence, reconciled bootstrap and an operator-approved pre-provisioned MySQL fixture"]
 async fn cold_snapshot_and_warm_governance() {

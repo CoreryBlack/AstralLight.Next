@@ -5,7 +5,7 @@
 //! root and structural confirmation do not establish production adoption,
 //! resource ownership, confirmer authority, or durable audit evidence.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::memory_v1_read_clock::ReadClock;
 
 use astral_authorization_root::memory_v1_db_rows::{
     binding_is_active, RuleSetStatus, UserCardStatus,
@@ -18,7 +18,7 @@ use astral_authorization_root::memory_v1_root::{
 };
 use astral_authorization_root::memory_v1_rules::{
     window_active, BindingConfirmationState, ChangeConfirmationState, MemoryV1OwnerScope,
-    MemoryV1RuleEffect, MemoryV1TenantScope, MemoryV1Validity,
+    MemoryV1RuleEffect, MemoryV1TenantScope,
 };
 use astral_authorization_root::memory_v1_session::{
     FinalCheckTimeConstraints, FinalCheckWindow, RequestSessionExtension, SessionFinalCheck,
@@ -475,6 +475,7 @@ impl MemoryV1ActionDraft {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemoryV1DenyTarget {
     Request,
     AffectedBinding {
@@ -562,10 +563,16 @@ fn observed_deny(
     result
 }
 
-// memory—v1: Obtain process time without accepting clock errors or overflow.
-fn trusted_now() -> Option<i64> {
-    let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    i64::try_from(seconds).ok()
+// memory—v1: Only a definite negative observation may reach the denial journal.
+fn validate_deny_time(result: MemoryV1Evaluation, clock: &ReadClock) -> MemoryV1Evaluation {
+    if result.decision == MemoryV1Decision::Deny && !clock.supports_deny() {
+        return non_allow(
+            MemoryV1Decision::Pending,
+            None,
+            Some(MemoryV1PendingSource::ContextInvalid),
+        );
+    }
+    result
 }
 
 /// memory—v1: Evaluate exact rules using the session and its request-local reader.
@@ -581,14 +588,35 @@ pub(crate) fn evaluate_memory_v1(
     session: &RequestSessionExtension,
     request: &MemoryV1Request<'_>,
 ) -> MemoryV1Evaluation {
-    evaluate_with_final(
+    let clock = ReadClock::default();
+    let result = evaluate_with_final(
         root,
         session,
         request,
-        trusted_now,
+        || clock.start(session),
         || {},
         |check, record, constraints, _| check.try_final_time(record, constraints),
-    )
+    );
+    // memory—v1: A stable ordinary DENY need not become PENDING just because
+    // time straddles a second. Check the only other possible integer tick
+    // against the same request snapshot. Never use this check to issue ALLOW
+    // or to stand in for a compound rule-set impact evaluation.
+    if result.decision == MemoryV1Decision::Deny
+        && !(request.resource == "rule_set" && request.action == "confirm-change")
+    {
+        if let Some(last) = clock.second_tick() {
+            let same_denial = session.with_authoritative_context(root, |facts, reader, check| {
+                check.is_some()
+                    && facts.valid_at(last)
+                    && matches!(evaluate_card_candidate(facts, reader, request, last, false),
+                        CardOutcome::Deny(source) if Some(source) == result.deny_source)
+            });
+            if matches!(same_denial, Ok(true)) {
+                return result;
+            }
+        }
+    }
+    validate_deny_time(result, &clock)
 }
 
 /// memory—v1: Evaluate one explicit rule-set confirmation against its full
@@ -599,17 +627,19 @@ pub(crate) fn evaluate_memory_v1_rule_set_change(
     request: &MemoryV1Request<'_>,
     intent: MemoryV1RuleSetChangeIntent,
 ) -> MemoryV1Evaluation {
-    evaluate_rule_set_change_with(
+    let clock = ReadClock::default();
+    let result = evaluate_rule_set_change_with(
         root,
         session,
         request,
         intent,
-        trusted_now,
+        || clock.start(session),
         || {},
         |check, record, constraints, metadata, target, _| {
             check.try_final_time_exact_root(record, constraints, metadata, target)
         },
-    )
+    );
+    validate_deny_time(result, &clock)
 }
 
 // memory—v1: The request's intent is explicit; no caller supplies beneficiaries.
@@ -783,7 +813,7 @@ fn evaluate_rule_set_change_with(
                     }
                     CardOutcome::Allow {
                         dependencies,
-                        winning_allows,
+                        winning_windows,
                         future_boundaries,
                         owner_scope: owner,
                         tenant_scope: scope,
@@ -807,11 +837,7 @@ fn evaluate_rule_set_change_with(
                         owner_scope = strictest_owner_scope(owner_scope, owner);
                         tenant_scope = strictest_tenant_scope(tenant_scope, scope);
                         boundaries.extend(future_boundaries);
-                        windows.extend(winning_allows.into_iter().map(|winner| FinalCheckWindow {
-                            entry_validity: winner.entry_validity,
-                            binding_from: winner.binding_from,
-                            binding_until: winner.binding_until,
-                        }));
+                        windows.extend(winning_windows);
                     }
                 }
             }
@@ -991,23 +1017,13 @@ pub(crate) enum CardOutcome {
     Pending(MemoryV1PendingSource),
     Allow {
         dependencies: Vec<EvaluationDependency>,
-        winning_allows: Vec<WinningAllow>,
+        winning_windows: Vec<FinalCheckWindow>,
         future_boundaries: Vec<i64>,
         owner_scope: MemoryV1OwnerScope,
         tenant_scope: MemoryV1TenantScope,
         tree_version: u64,
         registry_version: u64,
     },
-}
-
-// memory—v1 §4.4: one winning ALLOW rule whose window and scope must still
-// hold at the final trusted-time observation.
-pub(crate) struct WinningAllow {
-    pub(crate) entry_validity: Option<MemoryV1Validity>,
-    pub(crate) binding_from: Option<i64>,
-    pub(crate) binding_until: Option<i64>,
-    owner_scope: MemoryV1OwnerScope,
-    tenant_scope: MemoryV1TenantScope,
 }
 
 // memory—v1 §4.10: the effective owner scope is the strictest of the layers.
@@ -1048,7 +1064,7 @@ fn draft_from_card_outcome(
 ) -> MemoryV1DraftResult {
     let CardOutcome::Allow {
         dependencies,
-        winning_allows,
+        winning_windows,
         future_boundaries,
         owner_scope,
         tenant_scope,
@@ -1064,7 +1080,7 @@ fn draft_from_card_outcome(
             CardOutcome::Allow { .. } => unreachable!(),
         };
     };
-    if winning_allows.is_empty() {
+    if winning_windows.is_empty() {
         return MemoryV1DraftResult::Pending(MemoryV1PendingSource::ContextInvalid);
     }
     let Some(target_rule_sets) = target_rule_sets.filter(|targets| {
@@ -1099,14 +1115,7 @@ fn draft_from_card_outcome(
             registry_version,
         },
         future_boundaries,
-        winning_windows: winning_allows
-            .into_iter()
-            .map(|winning| FinalCheckWindow {
-                entry_validity: winning.entry_validity,
-                binding_from: winning.binding_from,
-                binding_until: winning.binding_until,
-            })
-            .collect(),
+        winning_windows,
         target_rule_sets,
     }))
 }
@@ -1300,7 +1309,7 @@ pub(crate) fn plan_memory_v1_rule_set_change_reader(
             CardOutcome::Pending(source) => return MemoryV1DraftResult::Pending(source),
             CardOutcome::Allow {
                 dependencies,
-                winning_allows,
+                winning_windows,
                 future_boundaries,
                 owner_scope: action_owner_scope,
                 tenant_scope: action_tenant_scope,
@@ -1324,11 +1333,7 @@ pub(crate) fn plan_memory_v1_rule_set_change_reader(
                 owner_scope = strictest_owner_scope(owner_scope, action_owner_scope);
                 tenant_scope = strictest_tenant_scope(tenant_scope, action_tenant_scope);
                 boundaries.extend(future_boundaries);
-                windows.extend(winning_allows.into_iter().map(|winning| FinalCheckWindow {
-                    entry_validity: winning.entry_validity,
-                    binding_from: winning.binding_from,
-                    binding_until: winning.binding_until,
-                }));
+                windows.extend(winning_windows);
             }
         }
     }
@@ -1600,6 +1605,42 @@ pub(crate) fn evaluate_card_candidate(
     start_time: i64,
     ownerless_governance_target: bool,
 ) -> CardOutcome {
+    evaluate_card_candidate_with_evidence::<true>(
+        facts,
+        reader,
+        request,
+        start_time,
+        ownerless_governance_target,
+    )
+}
+
+// memory—v1: The ordinary production evaluator always retains complete evidence;
+// this test-only specialization keeps the same predicates while omitting evidence
+// that the benchmark's lock baseline does not consume.
+#[cfg(test)]
+fn evaluate_card_candidate_without_evidence(
+    facts: &VerifiedSessionFacts,
+    reader: &RequestRootReader,
+    request: &MemoryV1Request<'_>,
+    start_time: i64,
+    ownerless_governance_target: bool,
+) -> CardOutcome {
+    evaluate_card_candidate_with_evidence::<false>(
+        facts,
+        reader,
+        request,
+        start_time,
+        ownerless_governance_target,
+    )
+}
+
+fn evaluate_card_candidate_with_evidence<const COLLECT_EVIDENCE: bool>(
+    facts: &VerifiedSessionFacts,
+    reader: &RequestRootReader,
+    request: &MemoryV1Request<'_>,
+    start_time: i64,
+    ownerless_governance_target: bool,
+) -> CardOutcome {
     // memory—v1 §4.9 A-3.4: a proven missing or inactive entry is a
     // structural denial; an unavailable registry cannot establish that fact.
     let registry_version =
@@ -1668,8 +1709,10 @@ pub(crate) fn evaluate_card_candidate(
                 Err(_) => return CardOutcome::Pending(MemoryV1PendingSource::RootUnavailable),
             };
             let mut dependencies: Vec<EvaluationDependency> = Vec::new();
-            let mut winning_allows: Vec<WinningAllow> = Vec::new();
+            let mut winning_windows = Vec::new();
             let mut future_boundaries = Vec::new();
+            let mut owner_scope = MemoryV1OwnerScope::AllUsers;
+            let mut tenant_scope = MemoryV1TenantScope::SelfAndDescendants;
             let mut allow = false;
             let mut deny = false;
             let mut scope_denied = false;
@@ -1757,15 +1800,20 @@ pub(crate) fn evaluate_card_candidate(
                         continue;
                     }
                 }
-                dependencies.push(EvaluationDependency {
-                    binding_id: binding.binding.binding_id,
-                    rule_set_id: binding.binding.rule_set_id,
-                    version_bytes: version.version_bytes.clone(),
-                });
+                if COLLECT_EVIDENCE {
+                    dependencies.push(EvaluationDependency {
+                        binding_id: binding.binding.binding_id,
+                        rule_set_id: binding.binding.rule_set_id,
+                        version_bytes: version.version_bytes.clone(),
+                    });
+                }
                 // Any later transition can change the aggregate, including a DENY
                 // whose binding or entry window has not opened yet.
-                if let Some(from) = binding.binding.valid_from.filter(|from| *from > start_time) {
-                    future_boundaries.push(from);
+                if COLLECT_EVIDENCE {
+                    if let Some(from) = binding.binding.valid_from.filter(|from| *from > start_time)
+                    {
+                        future_boundaries.push(from);
+                    }
                 }
                 if !window_active(
                     binding.binding.valid_from,
@@ -1775,9 +1823,11 @@ pub(crate) fn evaluate_card_candidate(
                     continue;
                 }
                 for hit in content.rule_hits(request.resource, request.action) {
-                    if let Some(from) = hit.validity.and_then(|validity| validity.from) {
-                        if from > start_time {
-                            future_boundaries.push(from);
+                    if COLLECT_EVIDENCE {
+                        if let Some(from) = hit.validity.and_then(|validity| validity.from) {
+                            if from > start_time {
+                                future_boundaries.push(from);
+                            }
                         }
                     }
                     // memory—v1 §4.4: the entry-level window.
@@ -1870,19 +1920,24 @@ pub(crate) fn evaluate_card_candidate(
                         MemoryV1RuleEffect::Deny => deny = true,
                         MemoryV1RuleEffect::Allow => {
                             allow = true;
-                            winning_allows.push(WinningAllow {
-                                entry_validity: hit.validity.copied(),
-                                binding_from: binding.binding.valid_from,
-                                binding_until: binding.binding.valid_until,
-                                owner_scope: strictest_owner_scope(
-                                    hit.owner_scope,
-                                    binding.binding.owner_scope,
-                                ),
-                                tenant_scope: strictest_tenant_scope(
+                            if COLLECT_EVIDENCE {
+                                winning_windows.push(FinalCheckWindow {
+                                    entry_validity: hit.validity.copied(),
+                                    binding_from: binding.binding.valid_from,
+                                    binding_until: binding.binding.valid_until,
+                                });
+                            }
+                            owner_scope = strictest_owner_scope(
+                                owner_scope,
+                                strictest_owner_scope(hit.owner_scope, binding.binding.owner_scope),
+                            );
+                            tenant_scope = strictest_tenant_scope(
+                                tenant_scope,
+                                strictest_tenant_scope(
                                     hit.tenant_scope,
                                     binding.binding.tenant_scope,
                                 ),
-                            });
+                            );
                         }
                     }
                 }
@@ -1895,15 +1950,9 @@ pub(crate) fn evaluate_card_candidate(
             } else if let Some(pending) = pending {
                 CardOutcome::Pending(pending)
             } else if allow {
-                let mut owner_scope = MemoryV1OwnerScope::AllUsers;
-                let mut tenant_scope = MemoryV1TenantScope::SelfAndDescendants;
-                for winning in &winning_allows {
-                    owner_scope = strictest_owner_scope(owner_scope, winning.owner_scope);
-                    tenant_scope = strictest_tenant_scope(tenant_scope, winning.tenant_scope);
-                }
                 CardOutcome::Allow {
                     dependencies,
-                    winning_allows,
+                    winning_windows,
                     future_boundaries,
                     owner_scope,
                     tenant_scope,
@@ -1937,6 +1986,7 @@ fn evaluate_reader_single(
 ) -> MemoryV1Evaluation {
     let metadata = reader.metadata();
     let Some(start_time) = clock() else {
+        tracing::debug!(target: "memory_v1_read_diagnostics", phase = "initial_clock", "memory-v1 ordinary read refused");
         return non_allow(
             MemoryV1Decision::Pending,
             None,
@@ -1944,6 +1994,7 @@ fn evaluate_reader_single(
         );
     };
     if metadata.status != RootStatus::Serving || !facts.valid_at(start_time) {
+        tracing::debug!(target: "memory_v1_read_diagnostics", phase = "initial_context", "memory-v1 ordinary read refused");
         return non_allow(
             MemoryV1Decision::Pending,
             None,
@@ -1957,7 +2008,7 @@ fn evaluate_reader_single(
         CardOutcome::Pending(source) => non_allow(MemoryV1Decision::Pending, None, Some(source)),
         CardOutcome::Allow {
             dependencies,
-            winning_allows,
+            winning_windows,
             future_boundaries,
             owner_scope,
             tenant_scope,
@@ -1974,18 +2025,10 @@ fn evaluate_reader_single(
             };
             // memory—v1: The root crate samples the final clock only while the
             // live session, root, registry and complete fence table are stable.
-            let windows: Vec<_> = winning_allows
-                .iter()
-                .map(|winning| FinalCheckWindow {
-                    entry_validity: winning.entry_validity,
-                    binding_from: winning.binding_from,
-                    binding_until: winning.binding_until,
-                })
-                .collect();
             let constraints = FinalCheckTimeConstraints {
                 start_time,
                 future_boundaries: &future_boundaries,
-                winning_windows: &windows,
+                winning_windows: &winning_windows,
             };
             let final_time = final_check
                 .as_ref()
@@ -4195,7 +4238,7 @@ mod tests {
             assert_eq!(result.decision, MemoryV1Decision::Pending);
             assert!(result.admission.is_none());
         };
-        // memory—v1: Probe the guards and fence writer at final clock sampling.
+        // Root publication is bracketed; the live session and registry are locked.
         let protected = root
             .with_reader(|reader| {
                 evaluate_with_final(
@@ -4209,7 +4252,7 @@ mod tests {
                             assert!(!authority.write_available_for_test());
                             assert_eq!(
                                 reader.final_check_locks_available_for_test().unwrap(),
-                                [false, false, true]
+                                [true, false, true]
                             );
                             Some(114)
                         })
@@ -4398,17 +4441,16 @@ mod tests {
         owner.abort_modification_fence([13; 16]).unwrap();
     }
 
-    // memory—v1 §4.7: Guarded final-clock sampling and overlap semantics on a
-    // read phase whose dependency set was never fenced, so the Allow baseline
-    // holds and only the injected contention fails closed.
+    // memory—v1: Writer contention without publication is not a root change.
+    // Session and registry contention still make final evidence unavailable.
     #[test]
-    fn final_check_lock_contention_fail_closed() {
+    fn final_check_lock_contention_preserves_required_witnesses() {
         const CHILD: &str = "ASTRAL_MEMORY_V1_LOCK_CONTENTION_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "memory_v1_formal::tests::final_check_lock_contention_fail_closed",
+                    "memory_v1_formal::tests::final_check_lock_contention_preserves_required_witnesses",
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
@@ -4509,7 +4551,12 @@ mod tests {
                     })
                 },
             );
-            assert_pending(result);
+            if lock == "root" {
+                assert_eq!(result.decision, MemoryV1Decision::Allow);
+                assert!(result.admission.is_some());
+            } else {
+                assert_pending(result);
+            }
         }
         // memory—v1: Two final readers may overlap, but revocation cannot
         // linearize until both guarded clock observations have finished.

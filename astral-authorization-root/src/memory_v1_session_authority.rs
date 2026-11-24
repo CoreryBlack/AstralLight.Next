@@ -7,6 +7,7 @@
 //! runtime; Gateway receives only the verifier capability.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,16 +30,43 @@ use cleanup::{CleanupHint, CleanupPlan};
 const CREDENTIAL_PREFIX: &str = "m1.";
 const MAX_ACTIVE_SESSIONS: usize = 100_000;
 
-#[derive(Clone)]
 struct SessionRecord {
     credential_digest: [u8; 32],
     facts: VerifiedSessionFacts,
-    revocation_generation: u64,
-    revoked: bool,
+    // Mutated only with both the table writer and the invalidation writer.
+    // Readers hold either the table guard or the invalidation guard.
+    revocation_generation: AtomicU64,
+    revoked: AtomicBool,
 }
 
+impl SessionRecord {
+    fn generation(&self) -> u64 {
+        self.revocation_generation.load(Ordering::Relaxed)
+    }
+
+    fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Relaxed)
+    }
+
+    // memory—v1: Set the terminal flag even when the generation is exhausted.
+    fn revoke(&self) -> Result<(), MemoryV1SessionAuthorityError> {
+        let next = self.generation().checked_add(1);
+        if let Some(next) = next {
+            self.revocation_generation.store(next, Ordering::Relaxed);
+        }
+        self.revoked.store(true, Ordering::Relaxed);
+        next.map(|_| ())
+            .ok_or(MemoryV1SessionAuthorityError::RevocationGenerationExhausted)
+    }
+}
+
+// memory—v1: Only the table owns the record. A final check upgrades this
+// reference while holding the invalidation guard, which also protects removal.
+#[derive(Clone)]
+pub(super) struct BoundSessionRecord(Weak<SessionRecord>);
+
 struct SessionState {
-    records: HashMap<[u8; 32], SessionRecord>,
+    records: HashMap<[u8; 32], Arc<SessionRecord>>,
     max_records: usize,
     last_issue_clock: Option<i64>,
     cleanup: CleanupHint,
@@ -188,6 +216,19 @@ impl MemoryV1SessionAuthority {
     /// Create an empty authority. No session exists until trusted Identity
     /// verification supplies a proof to the issuer.
     pub fn new() -> Self {
+        Self::from_token(SessionAuthorityToken::new())
+    }
+
+    /// memory—v1: Supply kernel-style nanoseconds and an error radius only to
+    /// an isolated fixture. It cannot replace the clock on an existing owner.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_clock_for_test(source: fn() -> Option<(i128, i128)>) -> Self {
+        Self::from_token(SessionAuthorityToken::with_test_clock(source))
+    }
+
+    // memory—v1: Each authority owns one time history shared by all requests.
+    fn from_token(token: SessionAuthorityToken) -> Self {
         Self {
             state: Arc::new(RwLock::new(SessionState {
                 records: HashMap::new(),
@@ -196,7 +237,7 @@ impl MemoryV1SessionAuthority {
                 cleanup: CleanupHint::default(),
             })),
             identity_proof_state: Arc::new(IdentityProofState),
-            authority_id: Arc::new(SessionAuthorityToken::new()),
+            authority_id: Arc::new(token),
         }
     }
 
@@ -212,19 +253,23 @@ impl MemoryV1SessionAuthority {
         }
     }
 
-    /// memory—v1: Hold the authority writer only in isolated contention tests.
+    /// memory—v1: Hold the invalidation writer only in isolated contention tests.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn with_write_lock_for_test<T>(&self, f: impl FnOnce() -> T) -> T {
-        let _guard = self.state.write().expect("test session lock poisoned");
+        let _guard = self
+            .authority_id
+            .session_invalidation
+            .write()
+            .expect("test invalidation lock poisoned");
         f()
     }
 
-    /// memory—v1: Probe write availability without waiting in isolated tests.
+    /// memory—v1: Probe invalidation write availability in isolated tests.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
     pub fn write_available_for_test(&self) -> bool {
-        self.state.try_write().is_ok()
+        self.authority_id.session_invalidation.try_write().is_ok()
     }
 
     /// Return the narrow capability retained by the trusted Identity adapter.
@@ -262,7 +307,7 @@ impl MemoryV1SessionAuthority {
 
     // memory—v1: Refuse an already-poisoned authority before journaling a disable.
     pub(crate) fn can_coordinate_disable(&self) -> bool {
-        !self.state.is_poisoned()
+        !self.state.is_poisoned() && !self.authority_id.session_invalidation.is_poisoned()
     }
 
     // memory—v1: Exclude live session checks and issuance during the root CAS
@@ -277,14 +322,18 @@ impl MemoryV1SessionAuthority {
             .state
             .write()
             .map_err(|_| MutationError::CardDisableRequiresSessionCoordinator)?;
+        let _invalidation = self
+            .authority_id
+            .lock_session_invalidation()
+            .map_err(|_| MutationError::CardDisableRequiresSessionCoordinator)?;
         let result = publish()?;
         let mut revoked = false;
-        for record in state.records.values_mut() {
-            if !record.revoked
+        for record in state.records.values() {
+            if !record.is_revoked()
                 && record.facts.candidate_identity().user_card_id.into_bytes() == user_card_id
             {
-                record.revocation_generation = record.revocation_generation.saturating_add(1);
-                record.revoked = true;
+                // The card is already disabled; generation exhaustion cannot keep its sessions live.
+                let _ = record.revoke();
                 revoked = true;
             }
         }
@@ -323,11 +372,14 @@ impl MemoryV1SessionAuthority {
             .state
             .write()
             .map_err(|_| MemoryV1SessionAuthorityError::Unavailable)?;
+        let _invalidation = self.authority_id.lock_session_invalidation()?;
         let mut count = 0_usize;
         let mut exhausted = false;
         for record in state.records.values() {
-            if !record.revoked && record.facts.candidate_identity().user_card_id == user_card_id {
-                exhausted |= record.revocation_generation == u64::MAX;
+            if !record.is_revoked()
+                && record.facts.candidate_identity().user_card_id == user_card_id
+            {
+                exhausted |= record.generation() == u64::MAX;
                 count = count
                     .checked_add(1)
                     .ok_or(MemoryV1SessionAuthorityError::CapacityExhausted)?;
@@ -335,13 +387,11 @@ impl MemoryV1SessionAuthority {
         }
         if exhausted {
             state.cleanup.note_revocation();
-            for record in state.records.values_mut() {
-                if !record.revoked && record.facts.candidate_identity().user_card_id == user_card_id
+            for record in state.records.values() {
+                if !record.is_revoked()
+                    && record.facts.candidate_identity().user_card_id == user_card_id
                 {
-                    if let Some(next) = record.revocation_generation.checked_add(1) {
-                        record.revocation_generation = next;
-                    }
-                    record.revoked = true;
+                    let _ = record.revoke();
                 }
             }
             return Err(MemoryV1SessionAuthorityError::RevocationGenerationExhausted.into());
@@ -354,13 +404,12 @@ impl MemoryV1SessionAuthority {
                 if count != 0 {
                     state.cleanup.note_revocation();
                 }
-                for record in state.records.values_mut() {
-                    if !record.revoked
+                for record in state.records.values() {
+                    if !record.is_revoked()
                         && record.facts.candidate_identity().user_card_id == user_card_id
                     {
                         // The same writer is still held and every addition was checked.
-                        record.revocation_generation = record.revocation_generation.wrapping_add(1);
-                        record.revoked = true;
+                        let _ = record.revoke();
                     }
                 }
             },
@@ -387,6 +436,11 @@ impl MemoryV1IdentityProofIssuer {
 }
 
 impl MemoryV1IdentitySessionAdapter {
+    /// memory—v1: Observe the same time history used by this authority's admissions.
+    pub fn policy_time(&self) -> Option<crate::memory_v1_policy_time::PolicyTime> {
+        self.session_issuer.authority_id.policy_time()
+    }
+
     /// memory—v1: The original entry point cannot prove that a card remains
     /// active in the current root, so it fails closed. Identity callers must
     /// migrate to [`Self::issue_verified_session_in_root`].
@@ -477,6 +531,7 @@ impl MemoryV1SessionIssuer {
             .write()
             .map_err(|_| MemoryV1SessionAuthorityError::Unavailable)?;
         if let Some(cleanup) = CleanupPlan::prepare(&state, now_unix_seconds)? {
+            let _invalidation = self.authority_id.lock_session_invalidation()?;
             cleanup.apply(&mut state, None);
         }
         Self::reserve_issued(&mut state, digest, None)?;
@@ -517,6 +572,12 @@ impl MemoryV1SessionIssuer {
             }
             let cleanup = CleanupPlan::prepare(&state, now_unix_seconds)?;
             Self::reserve_issued(&mut state, digest, cleanup.as_ref())?;
+            // Only issuance that removes records crosses the invalidation boundary.
+            let _invalidation = cleanup
+                .as_ref()
+                .filter(|plan| plan.len() != 0)
+                .map(|_| self.authority_id.lock_session_invalidation())
+                .transpose()?;
             let expiry = record.facts.expires_at_unix_seconds();
             let issued = reader
                 .try_with_current_login_card(identity, &self.authority_id, || {
@@ -551,7 +612,7 @@ impl MemoryV1SessionIssuer {
         proof: MemoryV1IdentityProof,
         now_unix_seconds: i64,
         lifetime_seconds: i64,
-    ) -> Result<([u8; 32], SessionRecord, MemoryV1IssuedSession), MemoryV1SessionAuthorityError>
+    ) -> Result<([u8; 32], Arc<SessionRecord>, MemoryV1IssuedSession), MemoryV1SessionAuthorityError>
     {
         if !proof
             .state
@@ -583,12 +644,12 @@ impl MemoryV1SessionIssuer {
         .map_err(|_| MemoryV1SessionAuthorityError::InvalidValidityWindow)?;
         let credential = format!("{CREDENTIAL_PREFIX}{}", Uuid::new_v4());
         let digest = digest_credential(&credential);
-        let record = SessionRecord {
+        let record = Arc::new(SessionRecord {
             credential_digest: digest,
             facts,
-            revocation_generation: 0,
-            revoked: false,
-        };
+            revocation_generation: AtomicU64::new(0),
+            revoked: AtomicBool::new(false),
+        });
         Ok((digest, record, MemoryV1IssuedSession { credential }))
     }
 
@@ -611,7 +672,7 @@ impl MemoryV1SessionIssuer {
     }
 
     // memory—v1: Capacity was reserved while the same session writer was held.
-    fn insert_prepared(state: &mut SessionState, digest: [u8; 32], record: SessionRecord) {
+    fn insert_prepared(state: &mut SessionState, digest: [u8; 32], record: Arc<SessionRecord>) {
         state.records.insert(digest, record);
     }
 
@@ -628,20 +689,22 @@ impl MemoryV1SessionIssuer {
             .state
             .write()
             .map_err(|_| MemoryV1SessionAuthorityError::Unavailable)?;
+        let _invalidation = self.authority_id.lock_session_invalidation()?;
         let mut count = 0;
         let mut exhausted = false;
         for record in state.records.values() {
-            if !record.revoked && record.facts.candidate_identity().user_card_id == user_card_id {
+            if !record.is_revoked()
+                && record.facts.candidate_identity().user_card_id == user_card_id
+            {
                 count += 1;
-                exhausted |= record.revocation_generation == u64::MAX;
+                exhausted |= record.generation() == u64::MAX;
             }
         }
-        for record in state.records.values_mut() {
-            if !record.revoked && record.facts.candidate_identity().user_card_id == user_card_id {
-                if let Some(next) = record.revocation_generation.checked_add(1) {
-                    record.revocation_generation = next;
-                }
-                record.revoked = true;
+        for record in state.records.values() {
+            if !record.is_revoked()
+                && record.facts.candidate_identity().user_card_id == user_card_id
+            {
+                let _ = record.revoke();
             }
         }
         if count != 0 {
@@ -664,19 +727,13 @@ impl MemoryV1SessionIssuer {
             .map_err(|_| MemoryV1SessionAuthorityError::Unavailable)?;
         let record = state
             .records
-            .get_mut(&digest)
+            .get(&digest)
             .ok_or(MemoryV1SessionAuthorityError::InvalidCredential)?;
-        if record.revoked {
+        if record.is_revoked() {
             return Ok(());
         }
-        let result = match record.revocation_generation.checked_add(1) {
-            Some(generation) => {
-                record.revocation_generation = generation;
-                Ok(())
-            }
-            None => Err(MemoryV1SessionAuthorityError::RevocationGenerationExhausted),
-        };
-        record.revoked = true;
+        let _invalidation = self.authority_id.lock_session_invalidation()?;
+        let result = record.revoke();
         state.cleanup.note_revocation();
         result
     }
@@ -710,7 +767,9 @@ impl MemoryV1SessionVerifier {
             .state
             .read()
             .map_err(|_| MemoryV1SessionAuthorityError::Unavailable)?;
-        verify_record(&state, digest, now_unix_seconds)
+        verify_record(&state, digest, now_unix_seconds).map(|record| MemoryV1AuthenticatedSession {
+            facts: record.facts.clone(),
+        })
     }
 
     /// Verify and bind while retaining the authority read lock through binding.
@@ -727,14 +786,31 @@ impl MemoryV1SessionVerifier {
             .state
             .read()
             .map_err(|_| MemoryV1SessionAuthorityError::Unavailable)?;
-        let authenticated = verify_record(&state, digest, now_unix_seconds)?;
+        let record = verify_record(&state, digest, now_unix_seconds)?;
         let matches_root = root
             .has_session_authority(&self.authority_id)
             .map_err(|_| MemoryV1SessionAuthorityError::Unavailable)?;
         if !matches_root {
             return Err(MemoryV1SessionAuthorityError::InvalidCredential);
         }
-        authenticated.bind_to(root, self.clone(), digest)
+        self.bind_verified_record(root, digest, record)
+    }
+
+    // memory—v1: The caller verifies the authority and holds the table guard.
+    fn bind_verified_record(
+        &self,
+        root: &RequestRootExtension,
+        digest: [u8; 32],
+        record: &Arc<SessionRecord>,
+    ) -> Result<RequestSessionExtension, MemoryV1SessionAuthorityError> {
+        root.bind_authoritative_session(
+            record.facts.clone(),
+            Arc::clone(&self.authority_id),
+            digest,
+            BoundSessionRecord(Arc::downgrade(record)),
+            self.clone(),
+        )
+        .map_err(MemoryV1SessionAuthorityError::Scope)
     }
 
     // memory—v1: Keep the matching live record stable through the caller's
@@ -749,26 +825,34 @@ impl MemoryV1SessionVerifier {
         if !binding.is_from(&self.authority_id) {
             return Err(MemoryV1SessionAuthorityError::InvalidCredential);
         }
-        let state = self
-            .state
-            .try_read()
-            .map_err(|_| MemoryV1SessionAuthorityError::Unavailable)?;
+        if self.state.is_poisoned() {
+            return Err(MemoryV1SessionAuthorityError::Unavailable);
+        }
+        let _invalidation = self.authority_id.session_invalidation.try_read().map_err(|error| {
+            tracing::debug!(target: "memory_v1_read_diagnostics", phase = "session_invalidation_guard", busy = matches!(error, std::sync::TryLockError::WouldBlock), "memory-v1 final recheck refused");
+            MemoryV1SessionAuthorityError::Unavailable
+        })?;
+        // Drop the temporary strong reference before releasing the guard so
+        // cleanup cannot leave a removed credential usable through a binding.
         let digest = binding.credential_digest();
-        let record = state
-            .records
-            .get(&digest)
+        let record = binding
+            .live_record()
+            .0
+            .upgrade()
             .ok_or(MemoryV1SessionAuthorityError::InvalidCredential)?;
         if record.credential_digest != digest {
             return Err(MemoryV1SessionAuthorityError::InvalidCredential);
         }
-        if record.revoked {
+        if record.is_revoked() {
             return Err(MemoryV1SessionAuthorityError::Revoked);
         }
-        if record.facts != *facts || record.revocation_generation != facts.revocation_generation() {
+        if record.facts != *facts || record.generation() != facts.revocation_generation() {
             return Err(MemoryV1SessionAuthorityError::InvalidCredential);
         }
         let result = f(&record.facts);
-        drop(state);
+        if self.state.is_poisoned() {
+            return Err(MemoryV1SessionAuthorityError::Unavailable);
+        }
         Ok(result)
     }
 
@@ -804,16 +888,18 @@ impl MemoryV1SessionVerifier {
             .records
             .get(&binding.credential_digest())
             .ok_or(MemoryV1SessionAuthorityError::InvalidCredential)?;
-        if record.credential_digest != binding.credential_digest() {
+        if record.credential_digest != binding.credential_digest()
+            || !Weak::ptr_eq(&binding.live_record().0, &Arc::downgrade(record))
+        {
             return Err(MemoryV1SessionAuthorityError::InvalidCredential);
         }
-        if record.revoked {
+        if record.is_revoked() {
             return Err(MemoryV1SessionAuthorityError::Revoked);
         }
         if record.facts != facts
             || record.facts.session_id() != facts.session_id()
             || record.facts.session_version() != facts.session_version()
-            || record.revocation_generation != facts.revocation_generation()
+            || record.generation() != facts.revocation_generation()
         {
             return Err(MemoryV1SessionAuthorityError::InvalidCredential);
         }
@@ -833,26 +919,6 @@ impl MemoryV1SessionVerifier {
 }
 
 impl MemoryV1AuthenticatedSession {
-    /// memory—v1: Bind authority-verified facts to one exact request root scope.
-    ///
-    /// This remains private to the authority module's verified flow; callers
-    /// should use `MemoryV1SessionVerifier::verify_and_bind` so revocation is
-    /// checked immediately before binding.
-    fn bind_to(
-        &self,
-        root: &RequestRootExtension,
-        verifier: MemoryV1SessionVerifier,
-        credential_digest: [u8; 32],
-    ) -> Result<RequestSessionExtension, MemoryV1SessionAuthorityError> {
-        root.bind_authoritative_session(
-            self.facts.clone(),
-            Arc::clone(&verifier.authority_id),
-            credential_digest,
-            verifier,
-        )
-        .map_err(MemoryV1SessionAuthorityError::Scope)
-    }
-
     /// Return a non-authorizing diagnostic copy for trusted observability.
     pub fn session_id(&self) -> MemoryId {
         self.facts.session_id()
@@ -891,7 +957,7 @@ fn verify_record(
     state: &SessionState,
     digest: [u8; 32],
     now_unix_seconds: i64,
-) -> Result<MemoryV1AuthenticatedSession, MemoryV1SessionAuthorityError> {
+) -> Result<&Arc<SessionRecord>, MemoryV1SessionAuthorityError> {
     let record = state
         .records
         .get(&digest)
@@ -899,15 +965,13 @@ fn verify_record(
     if record.credential_digest != digest {
         return Err(MemoryV1SessionAuthorityError::InvalidCredential);
     }
-    if record.revoked {
+    if record.is_revoked() {
         return Err(MemoryV1SessionAuthorityError::Revoked);
     }
     if !record.facts.valid_at(now_unix_seconds) {
         return Err(MemoryV1SessionAuthorityError::Expired);
     }
-    Ok(MemoryV1AuthenticatedSession {
-        facts: record.facts.clone(),
-    })
+    Ok(record)
 }
 
 fn digest_credential(credential: &str) -> [u8; 32] {
@@ -1256,17 +1320,16 @@ mod tests {
                 .verify_and_bind(fake.credential(), 100, &root),
             Err(MemoryV1SessionAuthorityError::InvalidCredential)
         ));
-        // Bypass the verifier gate only here to exercise both downstream checks.
-        let fake_session = foreign
-            .verifier()
-            .verify(fake.credential(), 100)
-            .unwrap()
-            .bind_to(
-                &root,
-                foreign.verifier(),
-                digest_credential(fake.credential()),
-            )
-            .unwrap();
+        // Verify that downstream root checks still reject a foreign authority.
+        let fake_session = {
+            let state = foreign.state.read().unwrap();
+            let digest = digest_credential(fake.credential());
+            let record = verify_record(&state, digest, 100).unwrap();
+            foreign
+                .verifier()
+                .bind_verified_record(&root, digest, record)
+                .unwrap()
+        };
         let windows = [FinalCheckWindow {
             entry_validity: None,
             binding_from: None,
@@ -1771,7 +1834,8 @@ mod tests {
             .records
             .get_mut(&exhausted_digest)
             .unwrap()
-            .revocation_generation = u64::MAX;
+            .revocation_generation
+            .store(u64::MAX, Ordering::Relaxed);
         let before = owner.handle().metadata().unwrap();
         assert!(matches!(
             authority.disable_card_with_sessions_for_isolated_tests(
@@ -1809,7 +1873,7 @@ mod tests {
                 .records
                 .get(&exhausted_digest)
                 .unwrap()
-                .revocation_generation,
+                .generation(),
             u64::MAX
         );
         let fresh = issue_at(&adapter, &root, identity(), 110, 300).unwrap();
@@ -2024,12 +2088,14 @@ mod tests {
                 .records
                 .get_mut(&digest_credential(first.credential()))
                 .unwrap()
-                .revocation_generation = u64::MAX - 1;
+                .revocation_generation
+                .store(u64::MAX - 1, Ordering::Relaxed);
             state
                 .records
                 .get_mut(&digest_credential(second.credential()))
                 .unwrap()
-                .revocation_generation = u64::MAX;
+                .revocation_generation
+                .store(u64::MAX, Ordering::Relaxed);
         }
 
         assert_eq!(
@@ -2059,7 +2125,7 @@ mod tests {
                 .records
                 .get(&digest_credential(first.credential()))
                 .unwrap()
-                .revocation_generation,
+                .generation(),
             u64::MAX
         );
         assert_eq!(
@@ -2067,7 +2133,7 @@ mod tests {
                 .records
                 .get(&digest_credential(second.credential()))
                 .unwrap()
-                .revocation_generation,
+                .generation(),
             u64::MAX
         );
     }
@@ -2136,7 +2202,8 @@ mod tests {
             .records
             .get_mut(&digest_credential(issued.credential()))
             .unwrap()
-            .revocation_generation = u64::MAX;
+            .revocation_generation
+            .store(u64::MAX, Ordering::Relaxed);
         assert_eq!(
             adapter.revoke(issued.credential()),
             Err(MemoryV1SessionAuthorityError::RevocationGenerationExhausted)
@@ -2374,7 +2441,7 @@ mod tests {
                 .values()
                 .next()
                 .unwrap()
-                .revocation_generation,
+                .generation(),
             1
         );
         adapter.revoke(first.credential()).unwrap();
@@ -2387,7 +2454,7 @@ mod tests {
                 .values()
                 .next()
                 .unwrap()
-                .revocation_generation,
+                .generation(),
             1
         );
     }

@@ -344,7 +344,11 @@ fn fixture_with_create_target_facts(
             .adopt_serving_for_isolated_tests()
             .expect("compound fixture becomes serving");
     }
-    let authority = MemoryV1SessionAuthority::new();
+    // This fixture isolates governance semantics from host clock uncertainty.
+    // Adjacent-tick behavior has its own bounded-clock evaluator regression.
+    let authority = MemoryV1SessionAuthority::with_clock_for_test(|| {
+        Some((i128::from(now()) * 1_000_000_000, 0))
+    });
     authority
         .bind_to_root(&owner)
         .expect("session authority binds to fixture root");

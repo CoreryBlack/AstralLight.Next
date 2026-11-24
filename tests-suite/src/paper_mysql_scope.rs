@@ -3,6 +3,8 @@
 pub const URL_ENV: &str = "ASTRAL_PAPER_MYSQL_URL";
 pub const APPROVAL_ENV: &str = "ASTRAL_PAPER_MYSQL_APPROVED_RUN";
 pub const RUN_ENV: &str = "ASTRAL_PAPER_MYSQL_RUN_ID";
+pub const BUNDLE_ENV: &str = "ASTRAL_PAPER_STARTUP_BUNDLE_DIR";
+pub const PREPARE_ENV: &str = "ASTRAL_PAPER_PREPARE_APPROVED_RUN";
 pub const PORT: u16 = 3308;
 
 pub fn schema_name(run: &str) -> Result<String, &'static str> {

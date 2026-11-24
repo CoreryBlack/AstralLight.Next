@@ -480,6 +480,28 @@ mod tests {
         use axum::routing::post;
         use std::sync::{Arc, Mutex};
 
+        // The process root and Identity breaker must not inherit another route test's state.
+        const CHILD: &str = "ASTRAL_GATEWAY_PUBLIC_ROUTE_SCOPE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime::tests::in_process_gateway_dispatches_public_route_and_ends_reader_scope",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let owner = install_process_root(
             CandidateRows::default(),
             vec![],

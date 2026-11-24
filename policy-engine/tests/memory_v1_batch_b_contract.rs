@@ -86,6 +86,12 @@ fn now() -> i64 {
     .expect("test clock fits in i64")
 }
 
+// This suite checks governance contracts, not uncertain host clock behavior.
+// Keep issuance and evaluation on the same integer clock for exact DENY checks.
+fn exact_clock_authority() -> MemoryV1SessionAuthority {
+    MemoryV1SessionAuthority::with_clock_for_test(|| Some((i128::from(now()) * 1_000_000_000, 0)))
+}
+
 fn version(rule_set: u8, content: &[u8]) -> RuleSetVersionRow {
     let version_bytes = vec![1];
     let timestamp_bytes = vec![2];
@@ -315,7 +321,7 @@ fn batch_b_base_allow_overlay_deny_then_revoke_restores_base() {
 
     let (rows, selections) = overlay_fixture();
     let owner = serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("session authority binds to the fixture root");
@@ -439,7 +445,7 @@ fn batch_b_revoke_change_confirmation_closes_version() {
         .retain(|row| row.rule_set_id == id(10));
     selections.retain(|selection| selection.rule_set_id == id(10));
     let owner = serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority.bind_to_root(&owner).unwrap();
     let scope = RequestRootScope::new(owner.handle(), Default::default());
     let root = scope.extension();
@@ -524,7 +530,7 @@ fn batch_b_binding_history_does_not_exhaust_authorization_budget() {
     }
 
     let owner = serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority.bind_to_root(&owner).unwrap();
     let scope = RequestRootScope::new(owner.handle(), Default::default());
     let root = scope.extension();
@@ -685,7 +691,7 @@ fn batch_b_entry_and_binding_scopes_intersect_and_missing_targets_fail_closed() 
 
     let (rows, selections) = scoped_fixture();
     let owner = serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("session authority binds to the fixture root");
@@ -893,7 +899,7 @@ fn batch_b_scope_filtering_preserves_deny_wins_and_pending() {
     }
 
     let owner = serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("session authority binds to the fixture root");
@@ -1139,7 +1145,7 @@ fn batch_b_change_confirmation_derives_beneficiaries_and_fails_closed() {
     owner
         .adopt_serving_for_isolated_tests()
         .expect("fixture adopts");
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("session authority binds to the fixture root");
@@ -1422,7 +1428,7 @@ fn change_confirmation_deny_preserves_rule_set_and_affected_binding() {
         }])
         .unwrap();
     owner.adopt_serving_for_isolated_tests().unwrap();
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority.bind_to_root(&owner).unwrap();
     let scope = RequestRootScope::new(owner.handle(), Default::default());
     let root = scope.extension();
@@ -1661,7 +1667,7 @@ fn batch_b_inactive_sibling_resource_makes_binding_pending() {
         .adopt_serving_for_isolated_tests()
         .expect("both rule references are initially active");
 
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("session authority binds to the fixture root");
@@ -1728,7 +1734,7 @@ fn batch_b_allow_binding_cannot_hide_inactive_resource_in_another_binding() {
         .adopt_serving_for_isolated_tests()
         .expect("both active bindings are initially serving-ready");
 
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("session authority binds to the fixture root");
@@ -1873,7 +1879,7 @@ fn batch_b_confirmation_batch_changes_both_cards_or_neither() {
     rows.rule_set_change_confirmations
         .push(change_confirmation(220, 10, vec![1], None));
     let owner = serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("authority binds to root");
@@ -1978,7 +1984,7 @@ fn batch_b_one_change_confirmation_covers_all_existing_bindings() {
     rows.rule_set_change_confirmations
         .push(change_confirmation(220, 10, vec![1], None));
     let owner = serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("session authority binds to the fixture root");
@@ -2481,7 +2487,7 @@ fn batch_b_confirmation_evaluator_allows_ordered_multi_target_batch() {
 
     let (rows, selections) = confirmation_batch_fixture();
     let owner = confirmation_serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("batch authority binds to root");
@@ -2539,7 +2545,7 @@ fn batch_b_confirmation_evaluator_denies_when_one_target_lacks_qualification() {
 
     let (rows, selections) = confirmation_batch_fixture();
     let owner = confirmation_serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("batch authority binds to root");
@@ -2601,7 +2607,7 @@ fn batch_b_qualification_denial_precedes_resolved_invalid_targets_in_both_orders
     active.revoked_at = None;
     active.revoked_by = None;
     let owner = confirmation_serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("authority binds to root");
@@ -2694,7 +2700,7 @@ fn batch_b_invalid_target_and_incomplete_qualification_remain_pending() {
     owner
         .adopt_serving_for_isolated_tests()
         .expect("fixture adopts");
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("authority binds to root");
@@ -2741,7 +2747,7 @@ fn batch_b_confirmation_evaluator_denies_any_self_signed_target() {
 
     let (rows, selections) = confirmation_batch_fixture();
     let owner = confirmation_serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("batch authority binds to root");
@@ -2787,7 +2793,7 @@ fn batch_b_self_confirmation_precedes_resolved_invalid_targets_in_both_orders() 
     active.revoked_at = None;
     active.revoked_by = None;
     let owner = confirmation_serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("authority binds to root");
@@ -2947,7 +2953,7 @@ fn batch_b_confirmation_evaluator_pending_for_unavailable_targets() {
             other => panic!("unknown target scenario: {other}"),
         }
         let owner = confirmation_serving_owner(rows, selections);
-        let authority = MemoryV1SessionAuthority::new();
+        let authority = exact_clock_authority();
         authority
             .bind_to_root(&owner)
             .expect("batch authority binds to root");
@@ -3031,7 +3037,7 @@ fn batch_b_confirmation_evaluator_rejects_order_duplicates_and_oversize() {
 
     let (rows, selections) = confirmation_batch_fixture();
     let owner = confirmation_serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("batch authority binds to root");
@@ -3121,7 +3127,7 @@ fn batch_b_confirmation_evaluator_respects_target_rule_set_fence() {
 
     let (rows, selections) = confirmation_batch_fixture();
     let owner = confirmation_serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("batch authority binds to root");
@@ -3186,7 +3192,7 @@ fn batch_b_confirmation_evaluator_validates_correlation_shape() {
 
     let (rows, selections) = confirmation_batch_fixture();
     let owner = confirmation_serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("authority binds to root");
@@ -3280,7 +3286,7 @@ fn batch_b_confirmation_evaluator_rechecks_revoked_session() {
     }
     let (rows, selections) = confirmation_batch_fixture();
     let owner = confirmation_serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("authority binds to root");
@@ -3328,7 +3334,7 @@ fn batch_b_confirmation_evaluator_rechecks_target_after_root_change() {
     }
     let (rows, selections) = confirmation_batch_fixture();
     let owner = confirmation_serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("authority binds to root");
@@ -3388,7 +3394,7 @@ fn batch_b_confirmation_evaluator_rechecks_retired_registry() {
     }
     let (rows, selections) = confirmation_batch_fixture();
     let owner = confirmation_serving_owner(rows, selections);
-    let authority = MemoryV1SessionAuthority::new();
+    let authority = exact_clock_authority();
     authority
         .bind_to_root(&owner)
         .expect("authority binds to root");

@@ -7,7 +7,7 @@
 //! admissions with the same trusted time. The result is an authorization
 //! observation, never a mutation, replay, audit, or commit capability.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::memory_v1_read_clock::ReadClock;
 
 use astral_authorization_root::memory_v1_db_rows::{
     binding_is_active, BinaryId, RuleSetStatus, UserCardStatus,
@@ -17,7 +17,7 @@ use astral_authorization_root::memory_v1_root::{
     DependencyRecord, GovernanceTargetFacts, RequestRootReader, RootStatus,
 };
 use astral_authorization_root::memory_v1_session::{
-    FinalCheckTimeConstraints, RequestSessionExtension,
+    FinalCheckTimeConstraints, RequestSessionExtension, VerifiedSessionFacts,
 };
 
 use crate::memory_v1_formal::{
@@ -129,11 +129,6 @@ fn non_allow(
         admissions: Vec::new(),
         deny_observation: None,
     }
-}
-
-fn trusted_now() -> Option<i64> {
-    let seconds = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    i64::try_from(seconds).ok()
 }
 
 fn valid_target_fences(targets: &[BinaryId]) -> bool {
@@ -389,6 +384,76 @@ fn normalize_targets(targets: &mut Vec<BinaryId>) -> bool {
     valid_target_fences(targets)
 }
 
+// memory—v1: Both ticks must use the same planner, including rule-set impact,
+// target attribution and separation of duties.
+fn plan_compound_action(
+    facts: &VerifiedSessionFacts,
+    reader: &RequestRootReader,
+    action: &MemoryV1CompoundAction<'_>,
+    targets: &[BinaryId],
+    time: i64,
+) -> MemoryV1DraftResult {
+    match action.change_intent {
+        Some(intent) => {
+            plan_memory_v1_rule_set_change_reader(facts, reader, &action.request, intent, time)
+        }
+        None => plan_memory_v1_action_reader(
+            facts,
+            reader,
+            &action.request,
+            time,
+            targets,
+            action.request.resource == "rule_set"
+                && matches!(
+                    action.request.action,
+                    "create" | "version-publish" | "retire"
+                )
+                && action.target_facts.owner_user_id == [0; 16],
+        ),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CompoundDenial {
+    index: usize,
+    source: MemoryV1DenySource,
+    target: MemoryV1DenyTarget,
+}
+
+// memory—v1: Prove the same ordered, attributable denial on the second tick.
+// This pass cannot create an admission or cross an active target fence.
+fn compound_denial_at(
+    facts: &VerifiedSessionFacts,
+    reader: &RequestRootReader,
+    actions: &[MemoryV1CompoundAction<'_>],
+    targets: &[Option<Vec<BinaryId>>],
+    time: i64,
+) -> Option<CompoundDenial> {
+    if !facts.valid_at(time)
+        || targets
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|target| !matches!(reader.is_fenced(*target), Ok(false)))
+    {
+        return None;
+    }
+    actions
+        .iter()
+        .zip(targets)
+        .enumerate()
+        .find_map(|(index, (action, targets))| {
+            match plan_compound_action(facts, reader, action, targets.as_deref()?, time) {
+                MemoryV1DraftResult::Deny(source, target) => Some(CompoundDenial {
+                    index,
+                    source,
+                    target,
+                }),
+                _ => None,
+            }
+        })
+}
+
 /// memory—v1: Evaluate all actions in one root phase and perform one final check.
 ///
 /// Each action retains its own rule, scope, SoD, impact, dependency and winning
@@ -467,7 +532,8 @@ pub(crate) fn evaluate_memory_v1_compound(
                     Some(MemoryV1PendingSource::ContextInvalid),
                 );
             };
-            let Some(start_time) = trusted_now() else {
+            let clock = ReadClock::default();
+            let Some(start_time) = clock.start(session) else {
                 return non_allow(
                     MemoryV1Decision::Pending,
                     None,
@@ -520,39 +586,21 @@ pub(crate) fn evaluate_memory_v1_compound(
             let mut future_boundaries = Vec::new();
             let mut winning_windows = Vec::new();
             let mut target_rule_sets = Vec::new();
-            for (action, action_targets) in request.actions.iter().zip(resolved_targets) {
-                let Some(action_targets) = action_targets else {
+            for (index, (action, action_targets)) in
+                request.actions.iter().zip(&resolved_targets).enumerate()
+            {
+                let Some(action_targets) = action_targets.as_deref() else {
                     pending_source.get_or_insert(MemoryV1PendingSource::ContextInvalid);
                     continue;
                 };
-                target_rule_sets.extend_from_slice(&action_targets);
-                let planned = match action.change_intent {
-                    Some(intent) => plan_memory_v1_rule_set_change_reader(
-                        facts,
-                        reader,
-                        &action.request,
-                        intent,
-                        start_time,
-                    ),
-                    None => plan_memory_v1_action_reader(
-                        facts,
-                        reader,
-                        &action.request,
-                        start_time,
-                        &action_targets,
-                        action.request.resource == "rule_set"
-                            && matches!(
-                                action.request.action,
-                                "create" | "version-publish" | "retire"
-                            )
-                            && action.target_facts.owner_user_id == [0; 16],
-                    ),
-                };
+                target_rule_sets.extend_from_slice(action_targets);
+                let planned =
+                    plan_compound_action(facts, reader, action, action_targets, start_time);
                 match planned {
                     MemoryV1DraftResult::Allow(draft) => {
                         if draft.root() != metadata
                             || draft.identity() != facts.candidate_identity()
-                            || draft.target_rule_sets() != action_targets.as_slice()
+                            || draft.target_rule_sets() != action_targets
                         {
                             pending_source.get_or_insert(MemoryV1PendingSource::ContextInvalid);
                             continue;
@@ -566,23 +614,49 @@ pub(crate) fn evaluate_memory_v1_compound(
                         drafts.push(draft);
                     }
                     MemoryV1DraftResult::Deny(source, target) => {
-                        if deny_source.is_none() {
-                            deny_source = Some((source, action.request, target));
-                        }
+                        deny_source.get_or_insert(CompoundDenial {
+                            index,
+                            source,
+                            target,
+                        });
                     }
                     MemoryV1DraftResult::Pending(source) => {
                         pending_source.get_or_insert(source);
                     }
                 }
             }
-            if let Some((source, action_request, target)) = deny_source {
+            if let Some(denial) = deny_source {
+                let CompoundDenial {
+                    index,
+                    source,
+                    target,
+                } = denial;
+                if !clock.supports_deny()
+                    && !(target != MemoryV1DenyTarget::Unavailable
+                        && clock.second_tick().is_some_and(|time| {
+                            compound_denial_at(
+                                facts,
+                                reader,
+                                request.actions,
+                                &resolved_targets,
+                                time,
+                            ) == Some(denial)
+                        }))
+                {
+                    return non_allow(
+                        MemoryV1Decision::Pending,
+                        None,
+                        Some(MemoryV1PendingSource::ContextInvalid),
+                    );
+                }
+                let action_request = &request.actions[index].request;
                 let mut result = non_allow(MemoryV1Decision::Deny, Some(source), None);
                 result.deny_observation = match target {
                     MemoryV1DenyTarget::Request => Some(capture_deny_observation(
                         metadata,
                         facts,
                         start_time,
-                        &action_request,
+                        action_request,
                         source,
                         None,
                     )),
@@ -593,7 +667,7 @@ pub(crate) fn evaluate_memory_v1_compound(
                         metadata,
                         facts,
                         start_time,
-                        &action_request,
+                        action_request,
                         source,
                         binding_id,
                         target_facts,
@@ -774,7 +848,11 @@ mod tests {
         }
         assert_eq!(std::env::var(DRIFT_CHILD).as_deref(), Ok(scenario));
 
-        let content = br#"{"rules":[{"ruleId":"create","resource":"binding","action":"create","effect":"ALLOW","ownerScope":"all","tenantScope":"self"},{"ruleId":"confirm","resource":"binding","action":"confirm","effect":"ALLOW","ownerScope":"all","tenantScope":"self"},{"ruleId":"disable","resource":"user_card","action":"disable","effect":"ALLOW","ownerScope":"all","tenantScope":"self"},{"ruleId":"enable","resource":"user_card","action":"enable","effect":"ALLOW","ownerScope":"all","tenantScope":"self"},{"ruleId":"create-card","resource":"user_card","action":"create","effect":"ALLOW","ownerScope":"all","tenantScope":"self"},{"ruleId":"retire","resource":"rule_set","action":"retire","effect":"ALLOW","ownerScope":"all","tenantScope":"self"}]}"#;
+        let content = if scenario == "deny-time" {
+            br#"{"rules":[{"ruleId":"create","resource":"binding","action":"create","effect":"ALLOW","ownerScope":"all","tenantScope":"self"},{"ruleId":"confirm","resource":"binding","action":"confirm","effect":"ALLOW","ownerScope":"all","tenantScope":"self","validity":{"from":120}}]}"#.as_slice()
+        } else {
+            br#"{"rules":[{"ruleId":"create","resource":"binding","action":"create","effect":"ALLOW","ownerScope":"all","tenantScope":"self"},{"ruleId":"confirm","resource":"binding","action":"confirm","effect":"ALLOW","ownerScope":"all","tenantScope":"self"},{"ruleId":"disable","resource":"user_card","action":"disable","effect":"ALLOW","ownerScope":"all","tenantScope":"self"},{"ruleId":"enable","resource":"user_card","action":"enable","effect":"ALLOW","ownerScope":"all","tenantScope":"self"},{"ruleId":"create-card","resource":"user_card","action":"create","effect":"ALLOW","ownerScope":"all","tenantScope":"self"},{"ruleId":"retire","resource":"rule_set","action":"retire","effect":"ALLOW","ownerScope":"all","tenantScope":"self"}]}"#.as_slice()
+        };
         let without_retire = br#"{"rules":[{"ruleId":"update","resource":"rule_set","action":"update","effect":"ALLOW","ownerScope":"all","tenantScope":"self"}]}"#;
         let rows = CandidateRows {
             users: vec![
@@ -1074,7 +1152,10 @@ mod tests {
         owner
             .adopt_serving_for_isolated_tests()
             .expect("adopt test root");
-        let authority = MemoryV1SessionAuthority::new();
+        thread_local! {
+            static SAMPLE: Cell<(i128, i128)> = const { Cell::new((110_000_000_000, 0)) };
+        }
+        let authority = MemoryV1SessionAuthority::with_clock_for_test(|| Some(SAMPLE.get()));
         authority
             .bind_to_root(&owner)
             .expect("bind session authority");
@@ -1086,7 +1167,7 @@ mod tests {
             user_card_id: MemoryId::from_bytes(id(20)),
             tenant_id: MemoryId::from_bytes(id(10)),
         };
-        let now = trusted_now().expect("trusted clock");
+        let now = 110;
         let issued = authority
             .identity_session_adapter()
             .issue_unchecked_for_test(identity, now - 60, 3_600)
@@ -1118,6 +1199,34 @@ mod tests {
             target_kind: MemoryV1CompoundTargetKind::BindingCreate,
         };
         let actions = [action("create"), action("confirm")];
+        if scenario == "deny-time" {
+            let request = MemoryV1CompoundRequest { actions: &actions };
+            let engine = crate::PolicyEngine::new();
+            for sample in [(110_000_000_000, 0), (111_100_000_000, 200_000_000)] {
+                SAMPLE.set(sample);
+                let result = engine.evaluate_memory_v1_compound(&root, &session, &request);
+                assert_eq!(result.decision, MemoryV1Decision::Deny);
+                assert_eq!(result.deny_source, Some(MemoryV1DenySource::NoMatch));
+                assert!(result.deny_observation.is_some());
+                assert!(result.admissions.is_empty());
+            }
+            // The confirm permission begins at tick 120; DENY is not proved at
+            // both ticks and the second pass may never issue an admission.
+            SAMPLE.set((120_100_000_000, 200_000_000));
+            let result = engine.evaluate_memory_v1_compound(&root, &session, &request);
+            assert_eq!(result.decision, MemoryV1Decision::Pending);
+            assert_eq!(
+                result.pending_source,
+                Some(MemoryV1PendingSource::ContextInvalid)
+            );
+            assert!(result.deny_observation.is_none());
+            assert!(result.admissions.is_empty());
+            SAMPLE.set((120_300_000_000, 200_000_000));
+            let result = engine.evaluate_memory_v1_compound(&root, &session, &request);
+            assert_eq!(result.decision, MemoryV1Decision::Allow);
+            assert_eq!(result.admissions.len(), 2);
+            return;
+        }
         let card_target = id(21);
         let card_facts = root
             .with_reader(|reader| reader.user_card_target(card_target))
@@ -1757,6 +1866,14 @@ mod tests {
         post_planning_drift(
             "card-create-root",
             "memory_v1_compound::tests::card_create_root_drift_is_pending",
+        );
+    }
+
+    #[test]
+    fn adjacent_ticks_require_the_same_attributable_compound_denial() {
+        post_planning_drift(
+            "deny-time",
+            "memory_v1_compound::tests::adjacent_ticks_require_the_same_attributable_compound_denial",
         );
     }
 

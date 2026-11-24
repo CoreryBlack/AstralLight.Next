@@ -463,11 +463,42 @@ pub(super) fn mysql_environment(
     let raw = lookup(mysql_scope::URL_ENV).ok_or("missing dedicated paper MySQL fixture URL")?;
     let url = url::Url::parse(raw).map_err(|_| "invalid dedicated paper MySQL fixture URL")?;
     mysql_scope::validate(&url, run, approved)?;
-    Ok(BTreeMap::from([
+    let bundle =
+        Path::new(lookup(mysql_scope::BUNDLE_ENV).ok_or("missing prepared paper startup bundle")?);
+    let expected = format!("paper-startup-{run}");
+    if !bundle.is_absolute()
+        || bundle.file_name().and_then(|name| name.to_str()) != Some(&expected)
+        || bundle.canonicalize().ok().as_deref() != Some(bundle)
+        || !bundle.is_dir()
+    {
+        return Err("paper startup bundle must be the exact canonical run directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(bundle)
+            .map_err(|_| "unavailable paper startup bundle")?
+            .permissions()
+            .mode()
+            & 0o7777
+            != 0o700
+        {
+            return Err("paper startup bundle must be private (0700)".into());
+        }
+    }
+    let mut result = BTreeMap::from([
+        (mysql_scope::BUNDLE_ENV.into(), bundle.as_os_str().into()),
         (mysql_scope::URL_ENV.into(), raw.into()),
         (mysql_scope::APPROVAL_ENV.into(), approved.into()),
         (mysql_scope::RUN_ENV.into(), run.into()),
-    ]))
+    ]);
+    if let Some(prepare) = lookup(mysql_scope::PREPARE_ENV) {
+        if prepare != run {
+            return Err("paper preparation approval must match this run".into());
+        }
+        result.insert(mysql_scope::PREPARE_ENV.into(), prepare.into());
+    }
+    Ok(result)
 }
 
 pub(super) fn fixture_settings(

@@ -2432,7 +2432,10 @@ mod tests {
             .unwrap();
         // The isolated fixture exercises compound admission without claiming provenance.
         owner.adopt_serving_for_isolated_tests().unwrap();
-        let authority = MemoryV1SessionAuthority::new();
+        // Self-confirmation requires a definite denial; host clock uncertainty is a separate case.
+        let authority = MemoryV1SessionAuthority::with_clock_for_test(|| {
+            Some((i128::from(now_unix_seconds().ok()?) * 1_000_000_000, 0))
+        });
         authority.bind_to_root(&owner).unwrap();
         let scope = RequestRootScope::new(owner.handle(), uuid::Uuid::new_v4());
         let root = scope.extension();

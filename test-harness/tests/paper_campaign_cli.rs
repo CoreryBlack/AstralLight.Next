@@ -330,6 +330,11 @@ fn mysql_result_requires_ordered_postconditions_in_addition_to_libtest_pass() {
         (mysql_scope::URL_ENV.into(), "ambient URL".into()),
         (mysql_scope::APPROVAL_ENV.into(), "ambient approval".into()),
         (mysql_scope::RUN_ENV.into(), "ambient run".into()),
+        (mysql_scope::BUNDLE_ENV.into(), "ambient directory".into()),
+        (
+            mysql_scope::PREPARE_ENV.into(),
+            "ambient preparation".into(),
+        ),
     ];
     for suite in [suite, &manifest.suites[0]] {
         let (env, _) = prepare_environment(suite, &supplied);
@@ -337,6 +342,8 @@ fn mysql_result_requires_ordered_postconditions_in_addition_to_libtest_pass() {
             mysql_scope::URL_ENV,
             mysql_scope::APPROVAL_ENV,
             mysql_scope::RUN_ENV,
+            mysql_scope::BUNDLE_ENV,
+            mysql_scope::PREPARE_ENV,
         ] {
             assert!(!env.contains_key(std::ffi::OsStr::new(name)));
         }

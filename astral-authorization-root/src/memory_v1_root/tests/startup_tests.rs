@@ -52,7 +52,9 @@ fn signed_startup_adopts_only_the_exact_process_candidate() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    facts.captured_at_unix_seconds = now;
+    // Keep the subject-binding control away from the current uncertain tick.
+    // The capture-time refusal is asserted separately below.
+    facts.captured_at_unix_seconds = now - 2;
     let install = MemoryId::from_bytes([1; 16]);
     let epoch = MemoryId::from_bytes([2; 16]);
     let stream = MemoryId::from_bytes([3; 16]);
@@ -118,6 +120,14 @@ fn signed_startup_adopts_only_the_exact_process_candidate() {
         Err(RootError::AdoptionEvidence(AdoptionEvidenceError::Startup(
             StartupEvidenceError::SubjectMismatch
         )))
+    ));
+    let mut future_capture = facts;
+    future_capture.captured_at_unix_seconds = now + 60;
+    assert!(matches!(
+        owner.adopt_with_signed_startup(&future_capture, context(scope)),
+        Err(RootError::AdoptionEvidence(
+            AdoptionEvidenceError::InvalidTrustedTime
+        ))
     ));
     let mut wrong_counts = facts;
     wrong_counts.scanned_counts.users += 1;

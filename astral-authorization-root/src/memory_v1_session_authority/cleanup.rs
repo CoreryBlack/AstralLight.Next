@@ -48,7 +48,7 @@ impl CleanupPlan {
         };
         for (digest, record) in &state.records {
             let expiry = record.facts.expires_at_unix_seconds();
-            if record.revoked || expiry <= cutoff {
+            if record.is_revoked() || expiry <= cutoff {
                 plan.remove
                     .try_reserve(1)
                     .map_err(|_| MemoryV1SessionAuthorityError::CapacityExhausted)?;

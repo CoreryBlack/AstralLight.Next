@@ -1,7 +1,5 @@
 //! memory—v1: Bind independent startup evidence to the root publication boundary.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::memory_v1_adoption::{
     startup::{
         active_registry_digest, AuthenticatedStartupEvidence, StartupEvidenceContext,
@@ -28,23 +26,15 @@ impl StartupPublicationCheck<'_> {
         if registry_version != self.registry_version {
             return Err(RootError::AdoptionSnapshotChanged);
         }
-        let now = unix_now()?;
-        if now < self.verified_at {
+        let sample = self
+            .evidence
+            .check_current_window()
+            .map_err(AdoptionEvidenceError::from)?;
+        if sample.earliest() < self.verified_at {
             return Err(AdoptionEvidenceError::InvalidTrustedTime.into());
         }
-        self.evidence
-            .check_window(now)
-            .map_err(AdoptionEvidenceError::from)?;
         Ok(())
     }
-}
-
-fn unix_now() -> Result<i64, AdoptionEvidenceError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
-        .ok_or(AdoptionEvidenceError::InvalidTrustedTime)
 }
 
 impl RootOwner {
@@ -97,7 +87,11 @@ impl RootOwner {
             context.epoch,
             context.checkpoint_tail,
         )?;
-        let now = unix_now()?;
+        let now = context
+            .evidence
+            .check_current_window()
+            .map_err(AdoptionEvidenceError::from)?
+            .earliest();
         if now < facts.captured_at_unix_seconds || facts.captured_at_unix_seconds <= 0 {
             return Err(AdoptionEvidenceError::InvalidTrustedTime.into());
         }

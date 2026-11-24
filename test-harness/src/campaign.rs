@@ -23,6 +23,8 @@ use url::Url;
 mod darkstar;
 #[path = "campaign/paper.rs"]
 mod paper;
+#[path = "campaign/paper_startup.rs"]
+mod paper_startup;
 #[path = "campaign/process_group.rs"]
 mod process_group;
 
@@ -33,7 +35,9 @@ use process_group::{wait_child, OwnedProcess};
 pub const STATUSES: [&str; 6] = ["FAIL", "UNKNOWN", "BLOCKED", "PENDING", "SKIP", "PASS"];
 const LOG_LIMIT: u64 = 64 * 1024 * 1024;
 const DEFAULT_PROFILES: [&str; 3] = ["native-kernel", "offline-validation", "performance-kernel"];
-const CLEAR_ENV: [&str; 26] = [
+const CLEAR_ENV: [&str; 28] = [
+    paper::mysql_scope::PREPARE_ENV,
+    paper::mysql_scope::BUNDLE_ENV,
     paper::mysql_scope::URL_ENV,
     paper::mysql_scope::APPROVAL_ENV,
     paper::mysql_scope::RUN_ENV,
@@ -1004,6 +1008,11 @@ pub fn execute(
     root: &Path,
     directory: &Path,
 ) -> Result<Value, String> {
+    if paper::is_mysql_suite(suite)
+        && env.contains_key(std::ffi::OsStr::new(paper::mysql_scope::PREPARE_ENV))
+    {
+        return paper_startup::prepare_then_measure(suite, env, root, directory);
+    }
     execute_native(suite, env, root, directory, LOG_LIMIT)
 }
 

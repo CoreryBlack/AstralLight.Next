@@ -14,7 +14,9 @@ use std::process::{Command, Output};
 const MYSQL_PAPER_SUITE: &str = "paper-usenix-mysql";
 
 /// Catalog cases gated behind the approved run-scoped MySQL fixture.
-const MYSQL_CASES: [&str; 5] = [
+const MYSQL_CASES: [&str; 7] = [
+    "darkstar-mysql-signed-restart-negative",
+    "darkstar-mysql-signed-restart-positive",
     "darkstar-mysql-apply",
     "darkstar-mysql-cold-install",
     "darkstar-mysql-recovery-curve",
@@ -24,7 +26,9 @@ const MYSQL_CASES: [&str; 5] = [
 const HOUR_SOAK: &str = "darkstar-synthetic-soak-hour";
 
 /// Offline catalog cases: core smoke plus performance and loopback opt-ins.
-const OFFLINE_CASES: [&str; 26] = [
+const OFFLINE_CASES: [&str; 28] = [
+    "darkstar-rq3-five-arm-1",
+    "darkstar-rq3-five-arm-2",
     "darkstar-types",
     "darkstar-database-offline",
     "darkstar-identity",
@@ -54,10 +58,9 @@ const OFFLINE_CASES: [&str; 26] = [
 ];
 
 /// Paper-cut suites the offline plan must keep disclosing.
-const PAPER_DISCLOSURE: [&str; 8] = [
+const PAPER_DISCLOSURE: [&str; 7] = [
     "paper-admission-depth2",
     "paper-composed-mediation",
-    "paper-journal-witnesses",
     "paper-runner-contracts",
     "scale-memory-v1-500k",
     "paper-current-root-controls",
@@ -149,7 +152,7 @@ fn offline_plan_lists_all_smoke_paper_and_opt_in_cases_without_mysql() {
         .contains("DarkStar current-source Rust suites"));
     let items = plan["items"].as_array().unwrap();
     let ids = item_ids(&plan);
-    assert_eq!(ids.len(), 54, "offline plan item count drifted");
+    assert_eq!(ids.len(), 55, "offline plan item count drifted");
 
     // Every offline catalog case is listed: core smoke plus the performance
     // and loopback opt-ins, including the bench lane.
@@ -221,7 +224,10 @@ fn offline_plan_lists_all_smoke_paper_and_opt_in_cases_without_mysql() {
     for entry in excluded(&plan) {
         let id = entry["id"].as_str().unwrap();
         assert!(
-            id == MYSQL_PAPER_SUITE || MYSQL_CASES.contains(&id) || id == HOUR_SOAK,
+            id == MYSQL_PAPER_SUITE
+                || MYSQL_CASES.contains(&id)
+                || id == HOUR_SOAK
+                || id == "paper-journal-witnesses",
             "unexpected offline exclusion {id}"
         );
     }
@@ -236,6 +242,50 @@ fn offline_plan_lists_all_smoke_paper_and_opt_in_cases_without_mysql() {
     // The scope disclosure names what is not part of the current campaign.
     assert!(!plan["not_current_darkstar"].as_array().unwrap().is_empty());
     assert!(plan["historical_boundaries"].is_array());
+}
+
+#[test]
+fn evaluator_controls_keep_the_original_cut_and_release_benchmark_selection() {
+    let plan = list(&["--list"]);
+    let items = plan["items"].as_array().unwrap();
+    let controls = items
+        .iter()
+        .find(|item| item["id"] == "paper-current-evaluator-controls")
+        .unwrap();
+    assert_eq!(
+        controls["argv"].as_array().unwrap(),
+        &[
+            "cargo",
+            "test",
+            "--locked",
+            "--offline",
+            "-p",
+            "policy-engine",
+            "--lib",
+            "--",
+            "--skip",
+            "paper_evidence",
+            "--test-threads=1",
+        ]
+    );
+    for id in ["darkstar-rq3-five-arm-1", "darkstar-rq3-five-arm-2"] {
+        let item = items.iter().find(|item| item["id"] == id).unwrap();
+        let argv = item["argv"].as_array().unwrap();
+        assert!(argv.contains(&Value::from("--release")), "{id}");
+        let separator = argv.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(
+            &argv[separator + 1..],
+            [
+                "--ignored",
+                "--exact",
+                "memory_v1_formal::tests::abc_benchmark::ordinary_read_comparison",
+                "--nocapture",
+                "--test-threads=1",
+            ],
+            "{id}"
+        );
+        assert!(item["boundary"].as_str().unwrap().contains("bounded smoke"));
+    }
 }
 
 #[test]
@@ -287,12 +337,12 @@ fn mysql_opt_in_enumerates_exactly_six_approved_suites() {
     ] {
         let plan = list(&args);
         let items = plan["items"].as_array().unwrap();
-        assert_eq!(item_ids(&plan).len(), 60, "{args:?} item count drifted");
+        assert_eq!(item_ids(&plan).len(), 63, "{args:?} item count drifted");
         let mysql: Vec<&Value> = items.iter().filter(|item| selects_mysql(item)).collect();
         assert_eq!(
             mysql.len(),
-            6,
-            "{args:?} must enumerate exactly six MySQL suites"
+            8,
+            "{args:?} must enumerate exactly eight MySQL suites"
         );
         let mysql_ids: Vec<&str> = mysql
             .iter()
@@ -310,8 +360,11 @@ fn mysql_opt_in_enumerates_exactly_six_approved_suites() {
         for id in OFFLINE_CASES {
             assert!(ids.contains(&id), "{args:?} dropped offline case {id}");
         }
-        assert_eq!(excluded(&plan).len(), 1, "{args:?}");
-        assert_eq!(excluded(&plan)[0]["id"], HOUR_SOAK);
+        assert_eq!(excluded(&plan).len(), 2, "{args:?}");
+        assert!(excluded(&plan).iter().any(|item| item["id"] == HOUR_SOAK));
+        assert!(excluded(&plan)
+            .iter()
+            .any(|item| item["id"] == "paper-journal-witnesses"));
 
         // MySQL fixtures disclose their rehearsal-only boundary and never run
         // before the offline cut; the exploratory model stays absolutely last.
@@ -332,11 +385,11 @@ fn mysql_opt_in_enumerates_exactly_six_approved_suites() {
             }
         }
         assert_eq!(items.last().unwrap()["id"], "paper-repair-full-bounds");
-        let next_to_last: Vec<&str> = items[items.len() - 6..items.len() - 1]
+        let next_to_last: Vec<&str> = items[items.len() - 8..items.len() - 1]
             .iter()
             .map(|item| item["id"].as_str().unwrap())
             .collect();
-        assert_eq!(next_to_last.len(), 5);
+        assert_eq!(next_to_last.len(), 7);
         for id in MYSQL_CASES {
             assert!(
                 next_to_last.contains(&id),
@@ -594,6 +647,48 @@ fn explicit_selection_rejects_unknown_duplicate_and_ungated_mysql_ids() {
 }
 
 #[test]
+fn full_mysql_plan_contains_soak_rq3_and_signed_restart_controls() {
+    let plan = list(&["--list", "--full", "--mysql"]);
+    let ids = item_ids(&plan);
+    assert_eq!(ids.len(), 64);
+    for id in [
+        HOUR_SOAK,
+        "darkstar-rq3-five-arm-1",
+        "darkstar-rq3-five-arm-2",
+        "darkstar-mysql-signed-restart-negative",
+        "darkstar-mysql-signed-restart-positive",
+        "paper-http-default-registry",
+        "paper-http-expanded-registry",
+        "paper-admission-depth3",
+        "paper-repair-full-bounds",
+    ] {
+        assert!(ids.contains(&id), "missing {id}");
+    }
+    assert_eq!(excluded(&plan).len(), 1);
+    assert_eq!(excluded(&plan)[0]["id"], "paper-journal-witnesses");
+    for id in [
+        "paper-journal-controls",
+        "paper-ordinary-admission",
+        "darkstar-single-node-library",
+    ] {
+        let item = plan["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == id)
+            .unwrap();
+        assert!(
+            item["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "witness_"),
+            "{id}"
+        );
+    }
+}
+
+#[test]
 fn mysql_opt_in_selection_lists_exactly_the_approved_suite() {
     for (id, mysql) in [
         ("darkstar-mysql-apply", true),
@@ -615,7 +710,10 @@ fn mysql_opt_in_selection_lists_exactly_the_approved_suite() {
                 "{id} must disclose its MySQL boundary"
             );
         }
-        assert_eq!(excluded(&plan).len(), 1, "{id} with --mysql opt-in");
-        assert_eq!(excluded(&plan)[0]["id"], HOUR_SOAK);
+        assert_eq!(excluded(&plan).len(), 2, "{id} with --mysql opt-in");
+        assert!(excluded(&plan).iter().any(|item| item["id"] == HOUR_SOAK));
+        assert!(excluded(&plan)
+            .iter()
+            .any(|item| item["id"] == "paper-journal-witnesses"));
     }
 }

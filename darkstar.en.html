@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="en" data-zcode-design>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f6f5ef">
+    <meta name="description" content="AstralLight.Next is a Rust authorization project. Explore DarkStar's single-node in-memory authorization, emergency review prototype, and validation scope.">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="AstralLight.Next">
+    <meta property="og:title" content="AstralLight.Next — DarkStar Authorization Research">
+    <meta property="og:description" content="Explore DarkStar's single-node in-memory authorization, emergency review prototype, and validation scope.">
+    <title>AstralLight.Next — DarkStar Authorization Research</title>
+    <link rel="icon" href="assets/astral-mark.png" type="image/png">
+    <link rel="alternate" hreflang="zh-Hans-CN" href="darkstar.html">
+    <link rel="stylesheet" href="overview.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="masthead" id="top">
+      <div class="wrap masthead-inner">
+        <a class="brand" href="#top" aria-label="AstralLight.Next home"><img src="assets/astral-mark.png" width="29" height="28" alt="">AstralLight<span>.Next</span></a>
+        <nav class="site-nav" aria-label="Page navigation">
+          <a href="#panel-problem">Problem</a>
+          <a href="#panel-architecture">Design</a>
+          <a href="#numbers">Evidence</a>
+          <a href="#panel-reserves">Application</a>
+          <a href="#status">Scope</a>
+        </nav>
+        <div class="site-actions">
+          <a href="index.en.html"><span aria-hidden="true">←</span> Project home</a>
+          <a href="darkstar.html" hreflang="zh-Hans-CN" lang="zh-Hans-CN" aria-label="切换到中文">中文</a>
+        </div>
+      </div>
+    </header>
+
+    <main id="main" tabindex="-1">
+      <section class="wrap hero" id="panel-vision" aria-labelledby="title" data-od-id="hero">
+        <div class="hero-copy">
+          <p class="eyebrow"><span class="signal" aria-hidden="true"></span> DarkStar / In-memory authorization</p>
+          <h1 id="title">Policy applies now.<br><span>The proof must close.</span></h1>
+          <p class="intro">DarkStar concentrates authorization decisions in one shared in-memory root, leaving the database as the source for cold start and crash recovery. The trade-off buys a local decision on the read path and raises two propositions: whether the state behind an admission is sufficient, and whether the response leaves recoverable evidence.</p>
+          <div class="hero-actions">
+            <a class="button" href="#panel-problem">Problem definition <span aria-hidden="true">↓</span></a>
+            <a class="text-link" href="#panel-architecture">Architecture</a>
+            <a class="text-link" href="https://github.com/CoreryBlack/AstralLight.Next/tree/DarkStar/Docs/memory-v1">Design specification <span aria-hidden="true">↗</span></a>
+          </div>
+        </div>
+
+        <figure class="trace" aria-labelledby="trace-caption">
+          <figcaption class="trace-head" id="trace-caption"><span>Two propositions</span><span>Design contract</span></figcaption>
+          <ol class="trace-questions">
+            <li>
+              <span class="trace-q">Question one</span>
+              <strong>Is the state at admission sufficient?</strong>
+              <p>The facts in memory must be current. A reader takes one immutable publication, then rechecks under session, root, registry, and fence guards.</p>
+            </li>
+            <li>
+              <span class="trace-q">Question two</span>
+              <strong>Does the response leave recoverable evidence?</strong>
+              <p>Governance success waits for a contiguous local durable prefix. A true refusal needs its audit and proof that the observed state belongs to the same history.</p>
+            </li>
+          </ol>
+          <p class="trace-note">The first question is point-in-time; the second survives a crash. Only both together make memory authoritative.</p>
+        </figure>
+      </section>
+
+      <section class="section" id="panel-problem" aria-labelledby="architecture-title" data-od-id="architecture">
+        <div class="wrap section-grid" id="source-publication">
+          <div class="section-lead" id="failure">
+            <p class="eyebrow">01 / Problem</p>
+            <h2 id="architecture-title">A mirror answers the past,<br>not the present</h2>
+            <p>A memory copy can say what policy allowed when the copy was made. While a reader walks it, an administrator may have revoked that grant, or a scheduled denial may have just become active. The snapshot stays internally consistent while its conclusion expires.</p>
+          </div>
+          <div class="why">
+            <article>
+              <p class="why-label">Too little scope</p>
+              <h3>Checking that the winning rule survived is not enough</h3>
+              <p>The winning rule can survive untouched while another binding introduces an applicable denial. Checking only that the winner remains misses newly added negative evidence.</p>
+            </article>
+            <article>
+              <p class="why-label">Too much scope</p>
+              <h3>Requiring whole-root equality is too expensive</h3>
+              <p>Strict root comparison lets an unrelated card change hold an in-flight read. A version number handles only changes that advance it, not changes unrelated to this request.</p>
+            </article>
+            <article>
+              <p class="why-label">The contract is asymmetric</p>
+              <h3>Allow needs a witness; refusal needs a record</h3>
+              <p>Every admission must point to a moment between invocation and return at which the sequential predicate holds. Otherwise the answer is <code>PENDING</code>. A true refusal must also write its basis into recoverable history.</p>
+            </article>
+            <article>
+              <p class="why-label">The resulting boundary</p>
+              <h3>Only the admission instant is promised</h3>
+              <p>The theorem does not keep policy fixed through the host's application write and gives no progress guarantee under contention. A host that needs durability across that write must add its own contract.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="panel-architecture" aria-labelledby="arch-title" data-od-id="architecture-diagrams">
+        <div class="wrap">
+          <div class="section-head">
+            <p class="eyebrow">02 / Design</p>
+            <h2 id="arch-title">Seven diagrams, one answer</h2>
+            <p>The first five answer question one: how a single call proves that current state supports admission. The last two answer question two: how responses and refusals survive a crash. The first comes from the USENIX Security 2027 manuscript, the second and third from the C&amp;S revision, and the rest follow the <code>Docs/memory-v1</code> target design.</p>
+            <p class="arch-scroll-hint">The diagrams are wide; swipe horizontally to see them in full <span aria-hidden="true">→</span></p>
+          </div>
+
+          <div class="arch">
+            <figure class="diagram">
+              <div class="diagram-head">
+                <span class="diagram-index">FIG. 01</span>
+                <h3>Ordinary positive path</h3>
+                <span class="diagram-tag">USENIX · Read path</span>
+              </div>
+              <div class="diagram-scroll">
+                <svg class="dg" viewBox="0 0 960 330" role="img" aria-labelledby="figU1-title figU1-desc">
+                  <title id="figU1-title">Ordinary positive path from the USENIX Security 2027 manuscript: verify credential and bind request, read one immutable root, match policy and record dependencies, validate live evidence and sample trusted time, return allow</title>
+                  <desc id="figU1-desc">Five sequential stages. The first verifies the credential and binds the request to a session; the second reads one published immutable root; the third matches policy and records dependencies; the fourth validates live evidence under session, root, and registry guards and reads the fence table before and after the clock sample; the fifth returns allow. The published root and controlled publication sit below. When evidence cannot be established the result is PENDING; internal denial and response durability are outside this path.</desc>
+                  <defs>
+                    <marker id="arrU1-m" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrow" d="M0 0 8 4 0 8Z"/></marker>
+                  </defs>
+                  <rect class="box" x="8" y="64" width="172" height="78"/>
+                  <text class="title" x="22" y="88">Verify credential</text>
+                  <text class="sub" x="22" y="108">Bind request and session</text>
+                  <rect class="box" x="202" y="64" width="172" height="78"/>
+                  <text class="title" x="216" y="88">Read one root</text>
+                  <text class="sub" x="216" y="108">Immutable publication</text>
+                  <rect class="box" x="396" y="64" width="172" height="78"/>
+                  <text class="title" x="410" y="88">Match, record</text>
+                  <text class="sub" x="410" y="108">Hits · dependency set</text>
+                  <rect class="box-soft" x="590" y="64" width="172" height="78"/>
+                  <text class="title" x="604" y="88">Validate live</text>
+                  <text class="sub" x="604" y="108">Guards · fences · time</text>
+                  <rect class="box-dark" x="784" y="64" width="168" height="78"/>
+                  <text class="title on-dark" x="798" y="88">Return allow</text>
+                  <text class="sub on-dark" x="798" y="108">Only at a sound cut</text>
+                  <path class="edge" d="M180 103H194" marker-end="url(#arrU1-m)"/>
+                  <path class="edge" d="M374 103H388" marker-end="url(#arrU1-m)"/>
+                  <path class="edge" d="M568 103H582" marker-end="url(#arrU1-m)"/>
+                  <path class="edge" d="M762 103H776" marker-end="url(#arrU1-m)"/>
+                  <rect class="box-soft" x="202" y="196" width="172" height="58"/>
+                  <text class="title" x="216" y="220">Published root</text>
+                  <text class="sub" x="216" y="240">Facts and indexes</text>
+                  <rect class="box-soft" x="396" y="196" width="172" height="58"/>
+                  <text class="title" x="410" y="220">Controlled publication</text>
+                  <text class="sub" x="410" y="240">Or validated load</text>
+                  <path class="edge" d="M288 196V150" marker-end="url(#arrU1-m)"/>
+                  <path class="edge" d="M482 196V150" marker-end="url(#arrU1-m)"/>
+                  <text class="tiny" x="590" y="196">The final stage enumerates binding and fence</text>
+                  <text class="tiny" x="590" y="214">keys and requires no relevant fence at either</text>
+                  <text class="tiny" x="590" y="232">observation around the sample.</text>
+                  <text class="tiny" x="590" y="256">No evidence → PENDING; internal denial and</text>
+                  <text class="tiny" x="590" y="274">response durability are outside this path.</text>
+                  <rect class="box-soft" x="8" y="284" width="944" height="38"/>
+                  <text class="sub" x="26" y="308">The positive path covers admission only; application writes after admission, audit receipts, and denial durability each have their own contract.</text>
+                </svg>
+              </div>
+              <figcaption class="diagram-notes">Corresponds to the ordinary positive path figure in the USENIX Security 2027 manuscript's §3: an immutable root supports the initial evaluation, and the final stage validates the live authority with session, root, and registry guards plus two fence observations. The paper states that internal denial and response durability lie outside this path.</figcaption>
+            </figure>
+
+            <figure class="diagram">
+              <div class="diagram-head">
+                <span class="diagram-index">FIG. 02</span>
+                <h3>Authorization and response components</h3>
+                <span class="diagram-tag">C&amp;S · Components</span>
+              </div>
+              <div class="diagram-scroll">
+                <svg class="dg" viewBox="0 0 960 430" role="img" aria-labelledby="figP1-title figP1-desc">
+                  <title id="figP1-title">Single-node authorization and response components: gateway, policy engine, shared root, commit and denial owner, local journal</title>
+                  <desc id="figP1-desc">The gateway and session binding pass a request to the policy engine. The engine reads and rechecks the shared authorization root and serves ordinary admission. A governance or denial observation goes to the commit and denial owner, which publishes to the shared root, appends to the ordered local file, waits for a file receipt, and returns governance 2xx or a bound refusal. Startup validation and replay take a MySQL candidate snapshot; the dashed edge is the target checkpoint replay. A solid edge rebuilds the root at startup.</desc>
+                  <defs>
+                    <marker id="arrP1-m" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrow" d="M0 0 8 4 0 8Z"/></marker>
+                  </defs>
+                  <rect class="box" x="16" y="34" width="184" height="58"/>
+                  <text class="title" x="30" y="58">Gateway</text>
+                  <text class="sub" x="30" y="78">Session binding · auth context</text>
+                  <rect class="box" x="248" y="34" width="170" height="58"/>
+                  <text class="title" x="262" y="58">Policy engine</text>
+                  <text class="sub" x="262" y="78">evaluate()</text>
+                  <rect class="box" x="466" y="34" width="184" height="58"/>
+                  <text class="title" x="480" y="58">Ordinary admission</text>
+                  <text class="sub" x="480" y="78">This protected operation</text>
+                  <rect class="box-soft" x="248" y="140" width="170" height="58"/>
+                  <text class="title" x="262" y="164">Shared root</text>
+                  <text class="sub" x="262" y="184">Facts · indices · read views</text>
+                  <rect class="box" x="466" y="140" width="184" height="58"/>
+                  <text class="title" x="480" y="164">Commit / denial owner</text>
+                  <text class="sub" x="480" y="184">operationId · bound audit</text>
+                  <rect class="box" x="698" y="140" width="246" height="58"/>
+                  <text class="title" x="712" y="164">Governance 2xx or refusal</text>
+                  <text class="sub" x="712" y="184">503 without proof; execution blocked</text>
+                  <rect class="box" x="466" y="246" width="184" height="58"/>
+                  <text class="title" x="480" y="270">Ordered local file</text>
+                  <text class="sub" x="480" y="290">Sync coordinator · receipts</text>
+                  <rect class="box" x="248" y="246" width="170" height="58"/>
+                  <text class="title" x="262" y="270">Startup verifier</text>
+                  <text class="sub" x="262" y="290">Candidate root · replay</text>
+                  <rect class="box-soft" x="8" y="246" width="176" height="58"/>
+                  <text class="title" x="22" y="270">MySQL</text>
+                  <text class="sub" x="22" y="290">Nine fact tables</text>
+                  <path class="edge" d="M200 63H240" marker-end="url(#arrP1-m)"/>
+                  <path class="edge" d="M418 63H458" marker-end="url(#arrP1-m)"/>
+                  <path class="edge-strong" d="M333 92V132" marker-end="url(#arrP1-m)"/>
+                  <text class="tiny" x="341" y="118">READ AND RECHECK</text>
+                  <path class="edge-strong" d="M418 74H440V155H458" marker-end="url(#arrP1-m)"/>
+                  <text class="tiny" x="448" y="140">GOVERNANCE / DENIAL</text>
+                  <path class="edge" d="M466 169H426" marker-end="url(#arrP1-m)"/>
+                  <rect class="label-bg" x="420" y="150" width="48" height="16"/>
+                  <text class="tiny" x="444" y="162" text-anchor="middle">PUBLISH</text>
+                  <path class="edge" d="M500 198V238" marker-end="url(#arrP1-m)"/>
+                  <text class="tiny" x="508" y="222">APPEND</text>
+                  <path class="edge" d="M600 238V198" marker-end="url(#arrP1-m)"/>
+                  <text class="tiny" x="608" y="222">RECEIPT</text>
+                  <path class="edge" d="M650 169H690" marker-end="url(#arrP1-m)"/>
+                  <path class="edge" d="M466 275H426" marker-end="url(#arrP1-m)"/>
+                  <path class="edge" d="M184 275H244" marker-end="url(#arrP1-m)"/>
+                  <text class="tiny" x="218" y="266" text-anchor="middle">SNAPSHOT</text>
+                  <path class="goal" d="M244 300H184" marker-end="url(#arrP1-m)"/>
+                  <text class="tiny" x="218" y="318" text-anchor="middle">CHECKPOINT (TARGET)</text>
+                  <path class="edge" d="M333 246V206" marker-end="url(#arrP1-m)"/>
+                  <text class="tiny" x="341" y="232">BUILD AT STARTUP</text>
+                  <rect class="box-soft" x="16" y="342" width="928" height="72"/>
+                  <text class="tiny accent-text" x="34" y="366">CURRENT IMPLEMENTATION VS. TARGET</text>
+                  <text class="sub" x="34" y="386">The governance owner appends and syncs before calling the root writer, so the publication-order and</text>
+                  <text class="sub" x="34" y="404">observed-state mappings remain open. Recovery replays the file into an in-memory candidate; it does not load a committed database checkpoint.</text>
+                </svg>
+              </div>
+              <figcaption class="diagram-notes">Corresponds to Fig. 1 of the paper's §4: solid edges are the inspected composition; the dashed edge is the target database catch-up step. The paper states that three mappings are still needed before this composition satisfies the theorem.</figcaption>
+            </figure>
+
+            <figure class="diagram">
+              <div class="diagram-head">
+                <span class="diagram-index">FIG. 03</span>
+                <h3>Ordered history and its three boundaries</h3>
+                <span class="diagram-tag">C&amp;S · Boundaries</span>
+              </div>
+              <div class="diagram-scroll">
+                <svg class="dg" viewBox="0 0 960 330" role="img" aria-labelledby="figP2-title figP2-desc">
+                  <title id="figP2-title">Ordered history and three boundaries: 0 ≤ b ≤ d ≤ w ≤ n</title>
+                  <desc id="figP2-desc">The registered length is n, the written prefix w, the locally confirmed durable prefix d, and the database committed checkpoint b, with 0 ≤ b ≤ d ≤ w ≤ n. Live facts equal R at n and database facts equal R at b. Governance success needs position i within d and published. A true refusal additionally needs the observed prefix h within d and a verified audit membership relation.</desc>
+                  <rect class="box-soft" x="16" y="34" width="928" height="52"/>
+                  <text class="tiny accent-text" x="34" y="56">INVARIANT</text>
+                  <text class="title-mono" x="34" y="76">0 ≤ b ≤ d ≤ w ≤ n</text>
+                  <text class="sub" x="196" y="76">Live facts = R(n); DB facts = R(b)</text>
+                  <text class="tiny" x="196" y="56">REGISTERED n · WRITTEN w · CONFIRMED d · COMMITTED b</text>
+                  <rect class="box" x="16" y="106" width="928" height="26"/>
+                  <rect class="accent-fill" x="16" y="106" width="864" height="26"/>
+                  <text class="tiny" x="34" y="124">n · REGISTERED</text>
+                  <text class="tiny" x="900" y="124" text-anchor="end">n</text>
+                  <rect class="box" x="16" y="142" width="928" height="26"/>
+                  <rect class="accent-fill" x="16" y="142" width="744" height="26"/>
+                  <text class="tiny" x="34" y="160">w · WRITTEN</text>
+                  <text class="tiny" x="780" y="160" text-anchor="end">w</text>
+                  <rect class="box" x="16" y="178" width="928" height="26"/>
+                  <rect class="accent-fill" x="16" y="178" width="600" height="26"/>
+                  <text class="tiny" x="34" y="196">d · CONFIRMED DURABLE</text>
+                  <text class="tiny" x="636" y="196" text-anchor="end">d</text>
+                  <rect class="box" x="16" y="214" width="928" height="26"/>
+                  <rect class="accent-fill" x="16" y="214" width="408" height="26"/>
+                  <text class="tiny" x="34" y="232">b · COMMITTED</text>
+                  <text class="tiny" x="444" y="232" text-anchor="end">b</text>
+                  <text class="tiny" x="34" y="264">Pale regions are frames a boundary does not yet cover; only records within d carry a local durability proof.</text>
+                  <rect class="box-soft" x="16" y="278" width="928" height="40"/>
+                  <text class="sub" x="34" y="303">Governance success: i ≤ d and published. True refusal: i ≤ d, h ≤ d, and audit membership. Without proof the response is 503 and execution stays blocked.</text>
+                </svg>
+              </div>
+              <figcaption class="diagram-notes">Corresponds to the paper's §3: log position (s, e, i), root identity (ρ, v, g) and observed prefix h are three distinct namespaces; equal numbers do not establish a mapping. A confirmation round covers only the w snapshot captured at flush start.</figcaption>
+            </figure>
+
+            <figure class="diagram">
+              <div class="diagram-head">
+                <span class="diagram-index">FIG. 04</span>
+                <h3>One process, one shared root</h3>
+                <span class="diagram-tag">Deployment</span>
+              </div>
+              <div class="diagram-scroll">
+                <svg class="dg" viewBox="0 0 960 420" role="img" aria-labelledby="figA-title figA-desc">
+                  <title id="figA-title">Deployment: a single shared root inside one supervised process</title>
+                  <desc id="figA-desc">MySQL outside the process supplies the cold-start snapshot. Inside, one RootOwner holds the single shared root; Gateway, Identity, TrustGraph, PolicyEngine, and business modules read the same authorization facts through a request-scoped reader. A second serving owner is rejected at the construction boundary.</desc>
+                  <defs>
+                    <marker id="arrA-m" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrow" d="M0 0 8 4 0 8Z"/></marker>
+                  </defs>
+                  <rect class="box-soft" x="24" y="96" width="160" height="88"/>
+                  <text class="title" x="40" y="124">MySQL</text>
+                  <text class="sub" x="40" y="146">Cold-start snapshot</text>
+                  <text class="sub" x="40" y="164">Bounded gap fill</text>
+                  <rect class="boundary" x="232" y="16" width="704" height="376"/>
+                  <text class="tiny" x="252" y="42">ONE SUPERVISED COMPOSED PROCESS</text>
+                  <rect class="box-dark" x="252" y="64" width="286" height="220"/>
+                  <text class="title on-dark" x="270" y="96">RootOwner</text>
+                  <text class="sub on-dark" x="270" y="116">Owns composition and shutdown order</text>
+                  <rect class="box" x="268" y="134" width="254" height="132"/>
+                  <text class="title" x="284" y="160">Current shared root</text>
+                  <text class="sub" x="284" y="184">Users · identity cards · user cards</text>
+                  <text class="sub" x="284" y="204">Tenants · rule-set versions · bindings</text>
+                  <text class="sub" x="284" y="224">Relation indexes · root version · hash</text>
+                  <text class="tiny" x="284" y="248">READ CAPABILITY FROM THE OWNER</text>
+                  <text class="tiny" x="252" y="330">A second serving owner is rejected</text>
+                  <text class="tiny" x="252" y="350">No listener opens without uniqueness proof</text>
+                  <text class="tiny" x="252" y="370">Multi-process sharing is not covered</text>
+                  <path class="edge-strong" d="M184 140H242" marker-end="url(#arrA-m)"/>
+                  <text class="tiny" x="213" y="122" text-anchor="middle">SNAPSHOT</text>
+                  <rect class="box" x="600" y="64" width="300" height="44"/>
+                  <text class="title" x="616" y="83">Gateway</text>
+                  <text class="sub" x="616" y="98">Session auth · trusted context</text>
+                  <rect class="box" x="600" y="118" width="300" height="44"/>
+                  <text class="title" x="616" y="137">Identity</text>
+                  <text class="sub" x="616" y="152">Identity · credentials · active card</text>
+                  <rect class="box" x="600" y="172" width="300" height="44"/>
+                  <text class="title" x="616" y="191">TrustGraph</text>
+                  <text class="sub" x="616" y="206">Governance · approval · restricted writes</text>
+                  <rect class="box-soft" x="600" y="226" width="300" height="52"/>
+                  <text class="title" x="616" y="247">PolicyEngine</text>
+                  <text class="sub" x="616" y="264">evaluate() · sole authorization entry</text>
+                  <rect class="box" x="600" y="290" width="300" height="44"/>
+                  <text class="title" x="616" y="309">Business modules</text>
+                  <text class="sub" x="616" y="324">Act on this decision only</text>
+                  <path class="edge-strong" d="M522 200H566" marker-end="url(#arrA-m)"/>
+                  <path class="edge-strong" d="M572 86V312"/>
+                  <path class="edge" d="M576 86H592" marker-end="url(#arrA-m)"/>
+                  <path class="edge" d="M576 140H592" marker-end="url(#arrA-m)"/>
+                  <path class="edge" d="M576 194H592" marker-end="url(#arrA-m)"/>
+                  <path class="edge" d="M576 252H592" marker-end="url(#arrA-m)"/>
+                  <path class="edge" d="M576 312H592" marker-end="url(#arrA-m)"/>
+                  <text class="tiny" x="600" y="354">REQUEST-SCOPED READERS</text>
+                </svg>
+              </div>
+              <figcaption class="diagram-notes">The root never decides ALLOW on its own: it supplies consistent facts, and only PolicyEngine decides. A module may hold a read handle, but a handle is neither a second root nor an authorization.</figcaption>
+            </figure>
+
+            <figure class="diagram">
+              <div class="diagram-head">
+                <span class="diagram-index">FIG. 05</span>
+                <h3>One protected request</h3>
+                <span class="diagram-tag">Lifecycle</span>
+              </div>
+              <div class="diagram-scroll">
+                <svg class="dg" viewBox="0 0 960 300" role="img" aria-labelledby="figB-title figB-desc">
+                  <title id="figB-title">Request lifecycle: from gateway admission to final recheck and release</title>
+                  <desc id="figB-desc">A request passes through gateway cleaning and authentication, creation of a request-scoped reader, a consistent read decided by PolicyEngine, a final recheck, and the protected operation before the reader is released. Any failure returns PENDING or DENY and runs no protected operation.</desc>
+                  <defs>
+                    <marker id="arrB-m" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrow" d="M0 0 8 4 0 8Z"/></marker>
+                  </defs>
+                  <path class="boundary" d="M202 52H900"/>
+                  <text class="tiny" x="551" y="42" text-anchor="middle">REQUEST-SCOPED READER (FIRST ROOT READ → END / CANCEL)</text>
+                  <rect class="box" x="20" y="80" width="152" height="108"/>
+                  <text class="tiny" x="36" y="106">01</text>
+                  <text class="title" x="36" y="132">Gateway</text>
+                  <text class="sub" x="36" y="154">Strip forged metadata</text>
+                  <text class="sub" x="36" y="172">Verify session and origin</text>
+                  <rect class="box" x="202" y="80" width="152" height="108"/>
+                  <text class="tiny" x="218" y="106">02</text>
+                  <text class="title" x="218" y="132">Reader</text>
+                  <text class="sub" x="218" y="154">Bind root instance · version</text>
+                  <text class="sub" x="218" y="172">hash · state · time</text>
+                  <rect class="box-soft" x="384" y="80" width="152" height="108"/>
+                  <text class="tiny" x="400" y="106">03</text>
+                  <text class="title" x="400" y="132">Consistent read</text>
+                  <text class="sub" x="400" y="154">Cards · tenant · rules</text>
+                  <text class="sub" x="400" y="172">PolicyEngine decides</text>
+                  <rect class="box" x="566" y="80" width="152" height="108"/>
+                  <text class="tiny" x="582" y="106">04</text>
+                  <text class="title" x="582" y="132">Final recheck</text>
+                  <text class="sub" x="582" y="154">Dependency versions</text>
+                  <text class="sub" x="582" y="172">State · trusted time</text>
+                  <rect class="box" x="748" y="80" width="152" height="108"/>
+                  <text class="tiny" x="764" y="106">05</text>
+                  <text class="title" x="764" y="132">Act &amp; release</text>
+                  <text class="sub" x="764" y="154">Protected operation</text>
+                  <text class="sub" x="764" y="172">Release reader on reply</text>
+                  <path class="edge-strong" d="M172 134H194" marker-end="url(#arrB-m)"/>
+                  <path class="edge-strong" d="M354 134H376" marker-end="url(#arrB-m)"/>
+                  <path class="edge-strong" d="M536 134H558" marker-end="url(#arrB-m)"/>
+                  <path class="edge-strong" d="M718 134H740" marker-end="url(#arrB-m)"/>
+                  <rect class="box-soft" x="20" y="216" width="880" height="60"/>
+                  <text class="tiny accent-text" x="40" y="240">FAIL-CLOSED</text>
+                  <text class="sub" x="40" y="260">Any missing, conflicting, timed-out, or unprovable stage → PENDING / DENY, reader released, no protected operation runs.</text>
+                </svg>
+              </div>
+              <figcaption class="diagram-notes">Only when the context is genuinely unloaded may the same request reader perform a bounded database read and move to a new stage; database rows never grant access directly. A revocation after the recheck does not retroactively void this decision; the next request decides again.</figcaption>
+            </figure>
+
+            <figure class="diagram">
+              <div class="diagram-head">
+                <span class="diagram-index">FIG. 06</span>
+                <h3>Identity cards, user cards, and tenants</h3>
+                <span class="diagram-tag">Context</span>
+              </div>
+              <div class="diagram-scroll">
+                <svg class="dg" viewBox="0 0 960 340" role="img" aria-labelledby="figC-title figC-desc">
+                  <title id="figC-title">Identity cards and user cards: authentication facts versus authorization context</title>
+                  <desc id="figC-desc">A user holds one tenant-independent identity card and may hold several user cards in different tenants. Each user card links to shared rule sets through confirmed BASE or OVERLAY bindings. Organizational hierarchy and colleague relationships never create bindings automatically.</desc>
+                  <defs>
+                    <marker id="arrC-m" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrow" d="M0 0 8 4 0 8Z"/></marker>
+                  </defs>
+                  <text class="tiny" x="210" y="32">AUTHENTICATION FACTS</text>
+                  <text class="tiny" x="470" y="32">AUTHORIZATION CONTEXT</text>
+                  <rect class="box-dark" x="20" y="140" width="150" height="64"/>
+                  <text class="title on-dark" x="36" y="167">User A</text>
+                  <text class="sub on-dark" x="36" y="188">Authenticated subject</text>
+                  <rect class="box-soft" x="210" y="40" width="200" height="64"/>
+                  <text class="title" x="226" y="67">Identity card A</text>
+                  <text class="sub" x="226" y="88">One per person · authentication</text>
+                  <rect class="box" x="210" y="130" width="200" height="64"/>
+                  <text class="title" x="226" y="157">User card A1</text>
+                  <text class="sub" x="226" y="178">Tenant T1 · BASE</text>
+                  <rect class="box" x="210" y="230" width="200" height="64"/>
+                  <text class="title" x="226" y="257">User card A2</text>
+                  <text class="sub" x="226" y="278">Tenant T2 · OVERLAY</text>
+                  <rect class="box-soft" x="470" y="120" width="220" height="84"/>
+                  <text class="title" x="486" y="147">Rule set R</text>
+                  <text class="sub" x="486" y="168">Shared object · current version</text>
+                  <text class="tiny" x="486" y="188">NO PER-CARD RULE COPIES</text>
+                  <rect class="box-soft" x="470" y="220" width="220" height="84"/>
+                  <text class="title" x="486" y="247">Rule set O</text>
+                  <text class="sub" x="486" y="268">Shared object · current version</text>
+                  <text class="tiny" x="486" y="288">OVERLAY CONFLICTS PER CONTRACT</text>
+                  <rect class="box" x="720" y="120" width="220" height="184"/>
+                  <text class="tiny" x="736" y="146">NEVER IMPLIED</text>
+                  <text class="sub" x="736" y="172">Hierarchy and colleague</text>
+                  <text class="sub" x="736" y="192">relationships create no binding</text>
+                  <text class="sub" x="736" y="218">Each binding is confirmed</text>
+                  <text class="sub" x="736" y="238">and keeps its own status</text>
+                  <text class="sub" x="736" y="264">Switching cards keeps the subject</text>
+                  <text class="sub" x="736" y="284">and copies no other authority</text>
+                  <path class="edge" d="M170 172H192V72"/>
+                  <path class="edge" d="M170 172H192V262"/>
+                  <path class="edge-strong" d="M192 72H202" marker-end="url(#arrC-m)"/>
+                  <path class="edge-strong" d="M192 162H202" marker-end="url(#arrC-m)"/>
+                  <path class="edge-strong" d="M192 262H202" marker-end="url(#arrC-m)"/>
+                  <path class="edge-strong" d="M410 162H462" marker-end="url(#arrC-m)"/>
+                  <path class="edge-strong" d="M410 262H462" marker-end="url(#arrC-m)"/>
+                  <text class="tiny" x="20" y="316">Arrows mean binding + that binding's own confirmation. The identity card says who you are; a user card says which tenant and which confirmed bindings apply.</text>
+                  <text class="tiny" x="20" y="332">A confirmed change to a shared rule set takes effect atomically in the root and reaches existing valid bindings.</text>
+                </svg>
+              </div>
+              <figcaption class="diagram-notes">Holding a card identifier, passing authentication, or switching cards never grants business permission; every decision still goes through PolicyEngine.</figcaption>
+            </figure>
+
+            <figure class="diagram">
+              <div class="diagram-head">
+                <span class="diagram-index">FIG. 07</span>
+                <h3>Governed change and the durable prefix</h3>
+                <span class="diagram-tag">Write boundary</span>
+              </div>
+              <div class="diagram-scroll">
+                <svg class="dg" viewBox="0 0 960 380" role="img" aria-labelledby="figD-title figD-desc">
+                  <title id="figD-title">Governed change path: decision, restricted commit, and durable prefix</title>
+                  <desc id="figD-desc">A governance request goes through the gateway, TrustGraph builds the intent, PolicyEngine decides the specific action and a final recheck passes. TrustGraph may then use only a restricted write capability bound to that result; the root and pending messages publish atomically, and success waits for a local contiguous durable prefix. Any failed step commits nothing.</desc>
+                  <defs>
+                    <marker id="arrD-m" viewBox="0 0 8 8" refX="8" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrow-strong" d="M0 0 8 4 0 8Z"/></marker>
+                  </defs>
+                  <rect class="box" x="20" y="60" width="190" height="96"/>
+                  <text class="tiny" x="36" y="86">01</text>
+                  <text class="title" x="36" y="112">Gateway</text>
+                  <text class="sub" x="36" y="134">Verifies and rebuilds context</text>
+                  <rect class="box" x="246" y="60" width="190" height="96"/>
+                  <text class="tiny" x="262" y="86">02</text>
+                  <text class="title" x="262" y="112">TrustGraph</text>
+                  <text class="sub" x="262" y="134">Action · target · digest · operationId</text>
+                  <rect class="box-soft" x="472" y="60" width="190" height="96"/>
+                  <text class="tiny" x="488" y="86">03</text>
+                  <text class="title" x="488" y="112">PolicyEngine</text>
+                  <text class="sub" x="488" y="134">evaluate() on the specific action</text>
+                  <rect class="box" x="698" y="60" width="190" height="96"/>
+                  <text class="tiny" x="714" y="86">04</text>
+                  <text class="title" x="714" y="112">Final recheck</text>
+                  <text class="sub" x="714" y="134">Instance · version · time</text>
+                  <path class="edge-strong" d="M210 108H238" marker-end="url(#arrD-m)"/>
+                  <path class="edge-strong" d="M436 108H464" marker-end="url(#arrD-m)"/>
+                  <path class="edge-strong" d="M662 108H690" marker-end="url(#arrD-m)"/>
+                  <path class="edge-strong" d="M793 156V192" marker-end="url(#arrD-m)"/>
+                  <rect class="box" x="698" y="200" width="190" height="100"/>
+                  <text class="tiny" x="714" y="226">05</text>
+                  <text class="title" x="714" y="252">Root + pending messages</text>
+                  <text class="sub" x="714" y="274">One atomic publish</text>
+                  <text class="sub" x="714" y="290">CAS rechecks preconditions</text>
+                  <rect class="box" x="472" y="200" width="190" height="100"/>
+                  <text class="tiny" x="488" y="226">06</text>
+                  <text class="title" x="488" y="252">Contiguous durable prefix</text>
+                  <text class="sub" x="488" y="274">Wait for local proof</text>
+                  <text class="sub" x="488" y="290">An ACK is not durability</text>
+                  <rect class="box-soft" x="246" y="200" width="190" height="100"/>
+                  <text class="tiny" x="262" y="226">07</text>
+                  <text class="title" x="262" y="252">Success reply</text>
+                  <text class="sub" x="262" y="274">Returns operationId</text>
+                  <text class="sub" x="262" y="290">Reconcilable by ID</text>
+                  <path class="edge-strong" d="M690 250H670" marker-end="url(#arrD-m)"/>
+                  <path class="edge-strong" d="M464 250H444" marker-end="url(#arrD-m)"/>
+                  <rect class="box-soft" x="20" y="316" width="868" height="48"/>
+                  <text class="tiny accent-text" x="38" y="336">REFUSAL PATH</text>
+                  <text class="sub" x="38" y="354">A failed decision or recheck, or an unprovable durable prefix: no commit, return PENDING / DENY / 503, never claim success.</text>
+                </svg>
+              </div>
+              <figcaption class="diagram-notes">TrustGraph cannot turn an ordinary business ALLOW, another governance ALLOW, or client-supplied parameters into write authority. An in-memory commit does not prove that messages, MySQL, or audit rows reached disk.</figcaption>
+            </figure>
+          </div>
+
+          <div class="arch-sources">
+            <span class="arch-sources-label">Sources</span>
+            <span class="arch-sources-note">The manuscript lives in a private repository and is not yet public; the links below are the public design documents.</span>
+            <a href="https://github.com/CoreryBlack/AstralLight.Next/blob/DarkStar/Docs/memory-v1/单机唯一共享根设计.md">Single shared root</a>
+            <a href="https://github.com/CoreryBlack/AstralLight.Next/blob/DarkStar/Docs/memory-v1/请求生命周期与共享根读取设计.md">Request lifecycle</a>
+            <a href="https://github.com/CoreryBlack/AstralLight.Next/blob/DarkStar/Docs/memory-v1/网关与物理双卡设计.md">Gateway and cards</a>
+            <a href="https://github.com/CoreryBlack/AstralLight.Next/blob/DarkStar/Docs/memory-v1/权限引擎与规则结构设计.md">Engine and rules</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="numbers" aria-labelledby="numbers-title" data-od-id="numbers">
+        <div class="wrap">
+          <div class="section-head">
+            <p class="eyebrow">03 / Evidence</p>
+            <h2 id="numbers-title">Prove it first,<br>then say how fast</h2>
+            <p>Each figure here answers one question: the model shows the mechanism has no counterexample on a finite graph, latency shows the cost of the path, and throughput shows the difference a combined change makes. None substitutes for another, and none is a production capacity claim.</p>
+          </div>
+
+          <div class="metrics">
+            <div class="metric-block">
+              <div class="metric-head">
+                <h3>Bounded model: live-state witness</h3>
+                <span class="metric-scope">USENIX · RQ1 · abstract edges</span>
+              </div>
+              <div class="metric-grid">
+                <div class="metric"><span class="metric-value">940,896</span><span class="metric-label">distinct states visited by BFS</span></div>
+                <div class="metric"><span class="metric-value">5,117,256</span><span class="metric-label">generated transitions</span></div>
+                <div class="metric"><span class="metric-value">288</span><span class="metric-label">allow edges, all satisfying the reference predicate</span></div>
+                <div class="metric"><span class="metric-value">144</span><span class="metric-label">extra allowed admissions from dependency-granular checking</span></div>
+              </div>
+              <p class="metric-note">On the same graph two validators were scored: 4,608 edges passed the common checks; matching the four request-relevant generations admitted 288; also requiring the fifth, unrelated generation admitted 144. Transition counts include edges whose successor was already visited, so they are not independent trials.</p>
+            </div>
+
+            <div class="metric-block">
+              <div class="metric-head">
+                <h3>In-process read: prepared vs. unprepared</h3>
+                <span class="metric-scope">USENIX · RQ3 · release · one worker</span>
+              </div>
+              <div class="metric-wrap">
+                <table class="metric-table">
+                  <caption>1,000 attempts per round, median of three round P50s; the timer excludes HTTP, password verification and the application handler.</caption>
+                  <thead><tr><th scope="col">Rule count</th><th scope="col">Prepared (µs)</th><th scope="col">Unprepared (µs)</th></tr></thead>
+                  <tbody>
+                    <tr><td>1</td><td class="num">1.75</td><td class="num">2.92</td></tr>
+                    <tr><td>32</td><td class="num">2.71</td><td class="num">20.00</td></tr>
+                    <tr><td>1,024</td><td class="num">6.33</td><td class="num">599.88</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <p class="metric-note">The fixture holds card and target facts fixed while varying rule count. The ratio measures the prepared-rule path as a whole and gives no isolated cost for the final check.</p>
+            </div>
+
+            <div class="metric-block">
+              <div class="metric-head">
+                <h3>Protected HTTP read: A/B</h3>
+                <span class="metric-scope">USENIX · RQ3 · loopback · keep-alive</span>
+              </div>
+              <div class="metric-wrap">
+                <table class="metric-table">
+                  <caption>Entries show baseline → combined change as within-round medians. The combined change adds typed serialization, skips tenant-descendant traversal for objectless requests, and reuses a response buffer.</caption>
+                  <thead><tr><th scope="col">Registry</th><th scope="col">Workers</th><th scope="col">P50 (µs)</th><th scope="col">P99 (µs)</th><th scope="col">200/s</th></tr></thead>
+                  <tbody>
+                    <tr><td>Default</td><td class="num">1</td><td class="num">82 → 80</td><td class="num">170 → 182</td><td class="num">11,591 → 11,804</td></tr>
+                    <tr><td>Default</td><td class="num">4</td><td class="num">199 → 197</td><td class="num">383 → 365</td><td class="num">18,477 → 19,006</td></tr>
+                    <tr><td>Default</td><td class="num">16</td><td class="num">582 → 558</td><td class="num">1,263 → 1,094</td><td class="num">25,763 → 27,271</td></tr>
+                    <tr><td>+128</td><td class="num">1</td><td class="num">155 → 118</td><td class="num">271 → 182</td><td class="num">6,295 → 8,211</td></tr>
+                    <tr><td>+128</td><td class="num">4</td><td class="num">302 → 236</td><td class="num">557 → 435</td><td class="num">11,999 → 15,550</td></tr>
+                    <tr><td>+128</td><td class="num">16</td><td class="num">800 → 669</td><td class="num">1,869 → 1,327</td><td class="num">18,872 → 22,821</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <p class="metric-note">All 96,768 reads per arm returned 200. At 16 workers the combined change lowers P99 by about 13% (Default) and 29% (+128); at one worker the Default P99 rises from 170 to 182 µs, which the paper explicitly declines to call larger than run-to-run variation.</p>
+            </div>
+
+            <div class="metric-block">
+              <div class="metric-head">
+                <h3>Local owner paths and denial batching</h3>
+                <span class="metric-scope">C&amp;S · owner timing · local fixture</span>
+              </div>
+              <div class="metric-grid">
+                <div class="metric"><span class="metric-value">86,512 µs</span><span class="metric-label">governance owner total over 24 completions</span></div>
+                <div class="metric"><span class="metric-value">85,004 µs</span><span class="metric-label">journal I/O and confirmation inside it (≈98.3%)</span></div>
+                <div class="metric"><span class="metric-value">3.31</span><span class="metric-label">audits covered per sync at 8 workers</span></div>
+                <div class="metric"><span class="metric-value">1,216.4/s</span><span class="metric-label">median denial-proof throughput at 8 workers</span></div>
+              </div>
+              <p class="metric-note">Governance averages 3,604 µs per call; denial owner totals 54,335 µs over 16 calls. Throughput ranges overlap from 8 to 16 workers while P99 rises to 29.0 ms, so the paper reports no saturation point. These are inclusive interval means, not device flush time.</p>
+            </div>
+          </div>
+
+          <div class="arch-sources">
+            <span class="arch-sources-label">Scope note</span>
+            <span class="arch-sources-note">These values come from one recorded run or a bounded model. They do not establish production capacity, real tenants, or contention across every path, and they cannot be converted into the test counts of the historical validation archive.</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section case" id="panel-reserves" aria-labelledby="case-title" data-od-id="scenario">
+        <div class="wrap section-grid">
+          <div class="section-lead">
+            <p class="eyebrow">04 / Application</p>
+            <h2 id="case-title">At the incident desk:<br>between proposal and effect</h2>
+            <p>Incident response squeezes all three questions into one click: who proposes the escalation, who may confirm it, and whether the confirmation actually reached disk. The interface below uses mock data and is not connected to the formal emergency API.</p>
+            <a class="text-link" href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/Docs/技术能力与储备清单.md">See the technology roadmap for Mobius and Klein <span aria-hidden="true">↗</span></a>
+          </div>
+          <dl class="case-steps">
+            <div><dt>See what changes</dt><dd>The current L2 and proposed L3 appear side by side. Reviewers inspect the proposed change instead of facing a single approve button.</dd></div>
+            <div><dt>Check who can approve</dt><dd>A read-only card cannot confirm the escalation. Switching to a review card still requires a match on the incident's tenant and the requested action. This is question one.</dd></div>
+            <div><dt>Distinguish denied from pending</dt><dd>Insufficient permission returns <code>DENY</code>; missing authorization facts return <code>PENDING</code>. Neither escalates the incident, so an operator knows whether to find a different reviewer or wait for verification.</dd></div>
+            <div><dt>Leave a record</dt><dd>The confirmed level change and its audit land in the same contiguous durable prefix, and the response carries a stable operation identifier for later reconciliation. This is question two.</dd></div>
+          </dl>
+        </div>
+      </section>
+
+      <section class="section" id="status" aria-labelledby="evidence-title" data-od-id="evidence">
+        <div class="wrap section-grid" id="progress">
+          <div class="section-lead">
+            <p class="eyebrow">05 / Scope</p>
+            <h2 id="evidence-title">What this does not promise</h2>
+            <p>In-memory single-node authority is a precise capability with a precise set of exclusions. Stating them up front is more reliable than leaving them in a footnote.</p>
+          </div>
+          <div class="evidence" id="evidence">
+            <article>
+              <p class="eyebrow">Not covered · Process and deployment</p>
+              <h3>Multi-process sharing and production deployment</h3>
+              <p>The design covers one shared root in a single supervised process. Multi-process sharing, cross-node replication, production capacity, and real tenants are outside the proof; a second serving owner is rejected at the construction boundary.</p>
+              <a class="text-link" href="https://github.com/CoreryBlack/AstralLight.Next/tree/DarkStar/Docs/memory-v1">Design and adoption criteria <span aria-hidden="true">↗</span></a>
+            </article>
+            <article>
+              <p class="eyebrow">Not covered · Time and failure</p>
+              <h3>Malicious clocks, media loss, and manual rollback</h3>
+              <p>The crash model assumes exclusive file ownership, canonical frame encoding, non-reused identities, and a storage stack that honors successful synchronization. Permanent media loss, undetectable rollback, and a malicious database administrator lie outside it.</p>
+            </article>
+            <article>
+              <p class="eyebrow">Recorded · Still open</p>
+              <h3>Three implementation mappings</h3>
+              <p>The paper identifies three mappings still needed to lift the composition to the theorem: authorized publication order, the correspondence between an observed state and its historical prefix, and agreement between a replayed root and a committed database checkpoint. The current code has not closed them.</p>
+            </article>
+            <article>
+              <p class="eyebrow">Historical report · <time datetime="2026-10-07">2026-10-07</time></p>
+              <h3>Distributed authorization validation archive</h3>
+              <p>The archive preserves results, failures, and ignored cases from the earlier distributed design. It does not validate the current DarkStar branch or the emergency prototype.</p>
+              <a class="text-link" href="validation.en.html">Open the validation archive <span aria-hidden="true">↗</span></a>
+            </article>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer" id="panel-community" data-od-id="footer">
+      <div class="wrap footer-inner" id="community">
+        <div>
+          <a class="brand" href="#top"><img src="assets/astral-mark.png" width="25" height="24" alt="">AstralLight<span>.Next</span></a>
+          <p>Authorization research and engineering in Rust</p>
+        </div>
+        <nav aria-label="Project resources">
+          <a href="https://github.com/CoreryBlack/AstralLight.Next/tree/DarkStar">DarkStar source</a>
+          <a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/CONTRIBUTING.md">Contribute</a>
+          <a href="https://github.com/CoreryBlack/AstralLight.Next/blob/main/LICENSE">License</a>
+          <a href="#top">Back to top <span aria-hidden="true">↑</span></a>
+        </nav>
+      </div>
+    </footer>
+  </body>
+</html>
